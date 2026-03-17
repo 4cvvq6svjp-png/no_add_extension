@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "No Add Extension",
+  "description": "Prototype qui détecte et saute en direct les segments de collaboration commerciale sur YouTube.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "114",
+  "permissions": ["storage"],
+  "host_permissions": ["https://www.youtube.com/*"],
+  "background": {
+    "service_worker": "background/serviceWorker.js"
+  },
+  "action": {
+    "default_title": "No Add Extension"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["content/mainContent.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
