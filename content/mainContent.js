@@ -628,6 +628,7 @@
       this.segmentStore = segmentStore;
 
       this.ghostVideo = null;
+      this.ocrSourceTag = "ghost-ocr";
       this.analysisInterval = null;
       this.lastSampleTime = -Infinity;
       this.activeCommercialStart = null;
@@ -643,17 +644,21 @@
         return;
       }
 
-      logInfo("Moteur OCR pour le lecteur fantôme", {
+      logInfo("Moteur OCR (lecteur fantôme ou repli vidéo principale)", {
         backend: this.frameClassifier.getBackendLabel()
       });
 
       const ghost = await this.createGhostVideo();
-      if (!ghost) {
-        logWarn("Lecteur fantôme indisponible.");
-        return;
+      if (ghost) {
+        this.ghostVideo = ghost;
+        this.ocrSourceTag = "ghost-ocr";
+      } else {
+        this.ocrSourceTag = "main-video-ocr";
+        logWarn(
+          "Lecteur fantôme indisponible — OCR sur la vidéo principale (pas d’analyse en avance)."
+        );
       }
 
-      this.ghostVideo = ghost;
       this.analysisInterval = window.setInterval(
         () => void this.tick(),
         CONFIG.analysisPollMs
@@ -672,7 +677,7 @@
         this.segmentStore.addSegment({
           start: this.activeCommercialStart,
           end: end + CONFIG.frameSampleSeconds * 0.7,
-          source: "ghost-ocr",
+          source: this.ocrSourceTag,
           confidence: 0.75
         });
       }
@@ -684,6 +689,7 @@
 
       if (this.ghostVideo) {
         this.ghostVideo.pause();
+        this.ghostVideo.srcObject = null;
         this.ghostVideo.src = "";
         this.ghostVideo.remove();
         this.ghostVideo = null;
@@ -691,54 +697,41 @@
     }
 
     async createGhostVideo() {
-      const sourceSelection = this.selectGhostSource();
-      if (!sourceSelection?.value) {
-        logWarn(
-          "Lecteur fantôme désactivé: aucune source stable exploitable.",
-          {
-            reason: sourceSelection?.reason ?? "unknown",
-            candidates: sourceSelection?.candidates ?? []
-          }
-        );
-        return null;
-      }
-
-      const source = sourceSelection.value;
       const ghost = document.createElement("video");
       ghost.muted = true;
       ghost.playsInline = true;
       ghost.preload = "auto";
       ghost.style.display = "none";
-      ghost.src = source;
       document.body.appendChild(ghost);
 
-      logInfo("Source du lecteur fantôme sélectionnée", {
+      const viaStream = await this.tryGhostFromCaptureStream(ghost);
+      if (viaStream) {
+        return ghost;
+      }
+
+      const sourceSelection = this.selectGhostSource();
+      if (!sourceSelection?.value) {
+        logWarn(
+          "Lecteur fantôme: aucune URL exploitable après échec captureStream.",
+          {
+            reason: sourceSelection?.reason ?? "unknown",
+            candidates: sourceSelection?.candidates ?? []
+          }
+        );
+        ghost.remove();
+        return null;
+      }
+
+      const source = sourceSelection.value;
+      ghost.src = source;
+
+      logInfo("Source du lecteur fantôme (URL)", {
         reason: sourceSelection.reason,
         sourceType: describeSourceType(source),
         sourceLabel: sourceSelection.label
       });
 
-      const loaded = await new Promise((resolve) => {
-        const timeout = window.setTimeout(() => resolve(false), 7000);
-
-        const onLoadedMetadata = () => {
-          window.clearTimeout(timeout);
-          ghost.removeEventListener("error", onError);
-          ghost.removeEventListener("loadedmetadata", onLoadedMetadata);
-          resolve(true);
-        };
-
-        const onError = () => {
-          window.clearTimeout(timeout);
-          ghost.removeEventListener("loadedmetadata", onLoadedMetadata);
-          ghost.removeEventListener("error", onError);
-          resolve(false);
-        };
-
-        ghost.addEventListener("loadedmetadata", onLoadedMetadata);
-        ghost.addEventListener("error", onError);
-      });
-
+      const loaded = await this.waitForGhostReady(ghost, 7000);
       if (!loaded) {
         ghost.remove();
         return null;
@@ -771,6 +764,87 @@
       return ghost;
     }
 
+    async tryGhostFromCaptureStream(ghost) {
+      if (typeof this.mainVideo.captureStream !== "function") {
+        return false;
+      }
+
+      try {
+        const stream = this.mainVideo.captureStream();
+        if (!stream || typeof stream.getTracks !== "function") {
+          return false;
+        }
+
+        ghost.srcObject = stream;
+
+        const ready = await new Promise((resolve) => {
+          const timeout = window.setTimeout(() => resolve(false), 5000);
+
+          const finish = (ok) => {
+            window.clearTimeout(timeout);
+            ghost.removeEventListener("loadedmetadata", onMeta);
+            ghost.removeEventListener("canplay", onPlay);
+            ghost.removeEventListener("error", onError);
+            resolve(ok);
+          };
+
+          const onMeta = () => finish(true);
+          const onPlay = () => finish(true);
+          const onError = () => finish(false);
+
+          ghost.addEventListener("loadedmetadata", onMeta);
+          ghost.addEventListener("canplay", onPlay);
+          ghost.addEventListener("error", onError);
+
+          ghost.play().catch(() => finish(false));
+        });
+
+        if (
+          ready &&
+          ghost.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+        ) {
+          logInfo("Lecteur fantôme branché via captureStream() (même flux que la vidéo principale).");
+          ghost.playbackRate = CONFIG.ghostPlaybackRate;
+          return true;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logWarn("captureStream indisponible ou refusé pour le lecteur fantôme", {
+          message
+        });
+      }
+
+      ghost.srcObject = null;
+      return false;
+    }
+
+    waitForGhostReady(ghost, timeoutMs) {
+      return new Promise((resolve) => {
+        const timeout = window.setTimeout(() => resolve(false), timeoutMs);
+
+        const onLoadedMetadata = () => {
+          window.clearTimeout(timeout);
+          ghost.removeEventListener("error", onError);
+          ghost.removeEventListener("loadedmetadata", onLoadedMetadata);
+          resolve(true);
+        };
+
+        const onError = () => {
+          window.clearTimeout(timeout);
+          ghost.removeEventListener("loadedmetadata", onLoadedMetadata);
+          ghost.removeEventListener("error", onError);
+          resolve(false);
+        };
+
+        ghost.addEventListener("loadedmetadata", onLoadedMetadata);
+        ghost.addEventListener("error", onError);
+      });
+    }
+
+    /**
+     * Ordre : URL non-blob d’abord (les blobs YouTube échouent souvent sur un 2e <video>),
+     * puis URL googlevideo, en dernier recours blob.
+     */
     selectGhostSource() {
       const candidates = [
         { label: "attr:src", value: this.mainVideo.getAttribute("src") },
@@ -807,24 +881,36 @@
         };
       }
 
+      const nonBlobNonGoogle = deduplicated.find(
+        (entry) => !isBlobUrl(entry.value) && !isGoogleVideoPlaybackUrl(entry.value)
+      );
+      if (nonBlobNonGoogle) {
+        return {
+          value: nonBlobNonGoogle.value,
+          label: nonBlobNonGoogle.label,
+          reason: "prefer-nonblob-nongoogle",
+          candidates: compactCandidates
+        };
+      }
+
+      const nonBlobGoogle = deduplicated.find(
+        (entry) => !isBlobUrl(entry.value) && isGoogleVideoPlaybackUrl(entry.value)
+      );
+      if (nonBlobGoogle) {
+        return {
+          value: nonBlobGoogle.value,
+          label: nonBlobGoogle.label,
+          reason: "prefer-nonblob-googlevideo",
+          candidates: compactCandidates
+        };
+      }
+
       const blobCandidate = deduplicated.find((entry) => isBlobUrl(entry.value));
       if (blobCandidate) {
         return {
           value: blobCandidate.value,
           label: blobCandidate.label,
-          reason: "prefer-blob-source",
-          candidates: compactCandidates
-        };
-      }
-
-      const nonGoogleVideo = deduplicated.find(
-        (entry) => !isGoogleVideoPlaybackUrl(entry.value)
-      );
-      if (nonGoogleVideo) {
-        return {
-          value: nonGoogleVideo.value,
-          label: nonGoogleVideo.label,
-          reason: "prefer-non-googlevideo",
+          reason: "fallback-blob-last-resort",
           candidates: compactCandidates
         };
       }
@@ -832,16 +918,17 @@
       return {
         value: null,
         label: null,
-        reason: "only-googlevideo-signed-sources",
+        reason: "no-usable-candidate",
         candidates: compactCandidates
       };
     }
 
     async tick() {
+      const analysisVideo = this.ghostVideo ?? this.mainVideo;
       if (
         this.pendingTick ||
-        !this.ghostVideo ||
-        this.ghostVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
+        !analysisVideo ||
+        analysisVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
       ) {
         return;
       }
@@ -851,14 +938,14 @@
       try {
         this.keepGhostAhead();
 
-        const sampleTime = Number(this.ghostVideo.currentTime ?? 0);
+        const sampleTime = Number(analysisVideo.currentTime ?? 0);
         if (sampleTime - this.lastSampleTime < CONFIG.frameSampleSeconds) {
           return;
         }
 
         this.lastSampleTime = sampleTime;
         const detection = await this.frameClassifier.detectFromVideo(
-          this.ghostVideo,
+          analysisVideo,
           sampleTime
         );
         this.consumeDetection(detection);
@@ -869,6 +956,13 @@
 
     keepGhostAhead() {
       if (!this.ghostVideo) {
+        return;
+      }
+
+      if (this.ghostVideo.srcObject) {
+        if (this.ghostVideo.paused) {
+          this.ghostVideo.play().catch(() => {});
+        }
         return;
       }
 
@@ -932,12 +1026,12 @@
       const added = this.segmentStore.addSegment({
         start,
         end,
-        source: "ghost-ocr",
+        source: this.ocrSourceTag,
         confidence: 0.75
       });
 
       if (added) {
-        logInfo("Segment OCR ajouté", { start, end });
+        logInfo("Segment OCR ajouté", { start, end, source: this.ocrSourceTag });
       }
     }
   }
