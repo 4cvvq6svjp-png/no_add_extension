@@ -227,3 +227,47 @@ Cette V1 met en place la base complète :
 - détection hybride (DOM + image),
 - skip automatique en direct,
 - structure prête pour itérations techniques avancées (perf/réseau).
+
+---
+
+## 11) Troubleshooting (logs fréquents)
+
+### `[NoAddExtension] TextDetector non disponible, OCR fantôme désactivé.`
+
+Signification :
+
+- l’API OCR native `TextDetector` n’est pas disponible dans ton navigateur/profil.
+
+Impact :
+
+- la détection “image/OCR” est désactivée ;
+- seule la détection overlay DOM reste active.
+
+Actions :
+
+- tester en Chrome récent ;
+- éventuellement activer les fonctionnalités web expérimentales du navigateur pour test local ;
+- intégrer un fallback OCR dédié (ex : worker OCR WASM) pour ne plus dépendre de `TextDetector`.
+
+### Erreurs `googlevideo ... 403 (Forbidden)` en boucle
+
+Signification :
+
+- certaines URL vidéo signées YouTube (`googlevideo/videoplayback`) ne sont pas rejouables directement par un second lecteur “fantôme”.
+
+Ce qui a été durci dans le code :
+
+- le lecteur fantôme préfère maintenant les sources `blob:` ;
+- il évite les sources purement `googlevideo` signées pour réduire ces erreurs ;
+- il logue la raison de sélection/refus de source.
+
+### `net::ERR_BLOCKED_BY_CLIENT`
+
+Signification :
+
+- requêtes bloquées par un bloqueur (Brave Shields, uBlock, etc.), pas forcément par `no_add_extension`.
+
+Actions :
+
+- désactiver temporairement les bloqueurs sur YouTube pendant les tests techniques de l’extension ;
+- puis réactiver et comparer le comportement.

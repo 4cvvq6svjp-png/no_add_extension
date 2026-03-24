@@ -30,7 +30,8 @@
     "video sponsorisee",
     "sponsorise par",
     "sponsor",
-    "partenariat remunere"
+    "partenariat remunere",
+    "publicite"
   ];
 
   function logInfo(message, extra) {
@@ -118,6 +119,38 @@
       return url.searchParams.get("v");
     } catch {
       return null;
+    }
+  }
+
+  function isBlobUrl(value) {
+    return typeof value === "string" && value.startsWith("blob:");
+  }
+
+  function isGoogleVideoPlaybackUrl(value) {
+    if (typeof value !== "string" || !value) {
+      return false;
+    }
+
+    return value.includes("googlevideo.com/videoplayback");
+  }
+
+  function describeSourceType(value) {
+    if (!value) {
+      return "none";
+    }
+
+    if (isBlobUrl(value)) {
+      return "blob";
+    }
+
+    if (isGoogleVideoPlaybackUrl(value)) {
+      return "googlevideo-signed";
+    }
+
+    try {
+      return new URL(value).host || "unknown-host";
+    } catch {
+      return "unknown-format";
     }
   }
 
@@ -513,30 +546,52 @@
     }
 
     async createGhostVideo() {
-      const source = this.mainVideo.currentSrc || this.mainVideo.src;
-      if (!source) {
+      const sourceSelection = this.selectGhostSource();
+      if (!sourceSelection?.value) {
+        logWarn(
+          "Lecteur fantôme désactivé: aucune source stable exploitable.",
+          {
+            reason: sourceSelection?.reason ?? "unknown",
+            candidates: sourceSelection?.candidates ?? []
+          }
+        );
         return null;
       }
 
+      const source = sourceSelection.value;
       const ghost = document.createElement("video");
       ghost.muted = true;
       ghost.playsInline = true;
       ghost.preload = "auto";
-      ghost.crossOrigin = "anonymous";
       ghost.style.display = "none";
       ghost.src = source;
       document.body.appendChild(ghost);
+
+      logInfo("Source du lecteur fantôme sélectionnée", {
+        reason: sourceSelection.reason,
+        sourceType: describeSourceType(source),
+        sourceLabel: sourceSelection.label
+      });
 
       const loaded = await new Promise((resolve) => {
         const timeout = window.setTimeout(() => resolve(false), 7000);
 
         const onLoadedMetadata = () => {
           window.clearTimeout(timeout);
+          ghost.removeEventListener("error", onError);
           ghost.removeEventListener("loadedmetadata", onLoadedMetadata);
           resolve(true);
         };
 
+        const onError = () => {
+          window.clearTimeout(timeout);
+          ghost.removeEventListener("loadedmetadata", onLoadedMetadata);
+          ghost.removeEventListener("error", onError);
+          resolve(false);
+        };
+
         ghost.addEventListener("loadedmetadata", onLoadedMetadata);
+        ghost.addEventListener("error", onError);
       });
 
       if (!loaded) {
@@ -569,6 +624,72 @@
       }
 
       return ghost;
+    }
+
+    selectGhostSource() {
+      const candidates = [
+        { label: "attr:src", value: this.mainVideo.getAttribute("src") },
+        { label: "video.src", value: this.mainVideo.src },
+        { label: "video.currentSrc", value: this.mainVideo.currentSrc }
+      ]
+        .filter((entry) => typeof entry.value === "string" && entry.value.trim())
+        .map((entry) => ({
+          label: entry.label,
+          value: entry.value.trim()
+        }));
+
+      const deduplicated = [];
+      const seen = new Set();
+      for (const entry of candidates) {
+        if (seen.has(entry.value)) {
+          continue;
+        }
+        seen.add(entry.value);
+        deduplicated.push(entry);
+      }
+
+      const compactCandidates = deduplicated.map((entry) => ({
+        label: entry.label,
+        type: describeSourceType(entry.value)
+      }));
+
+      if (deduplicated.length === 0) {
+        return {
+          value: null,
+          label: null,
+          reason: "no-video-source",
+          candidates: compactCandidates
+        };
+      }
+
+      const blobCandidate = deduplicated.find((entry) => isBlobUrl(entry.value));
+      if (blobCandidate) {
+        return {
+          value: blobCandidate.value,
+          label: blobCandidate.label,
+          reason: "prefer-blob-source",
+          candidates: compactCandidates
+        };
+      }
+
+      const nonGoogleVideo = deduplicated.find(
+        (entry) => !isGoogleVideoPlaybackUrl(entry.value)
+      );
+      if (nonGoogleVideo) {
+        return {
+          value: nonGoogleVideo.value,
+          label: nonGoogleVideo.label,
+          reason: "prefer-non-googlevideo",
+          candidates: compactCandidates
+        };
+      }
+
+      return {
+        value: null,
+        label: null,
+        reason: "only-googlevideo-signed-sources",
+        candidates: compactCandidates
+      };
     }
 
     async tick() {
