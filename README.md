@@ -27,12 +27,14 @@ Important : cette V1 est un **prototype fonctionnel** orienté architecture et e
 - Recherche de mots-clés commerciaux (ex : `collaboration commerciale`) dans des zones UI du player.
 - Quand un overlay commercial apparaît/disparaît, un segment est créé.
 
-### Détection par “lecteur fantôme” + OCR navigateur
+### Détection par “lecteur fantôme” + OCR
 
 - Création d’un deuxième `<video>` caché (muted, invisible) qui lit la même source quand c’est possible.
 - Ce lecteur fantôme tente de rester en avance sur le lecteur principal.
 - Capture périodique d’une frame (toutes les 5 secondes par défaut).
-- OCR via `TextDetector` (API native Chrome si disponible).
+- OCR dans cet ordre de préférence :
+  1. `TextDetector` (API native Chromium si disponible) ;
+  2. sinon **Tesseract.js** (fichiers embarqués sous `libs/tesseract/`, modèle de langue `fra` téléchargé une première fois depuis `tessdata.projectnaptha.com`).
 - Si des mots-clés commerciaux sont détectés sur plusieurs frames, un segment est constitué.
 
 ### Skip automatique en direct
@@ -52,8 +54,13 @@ no_add_extension/
 ├── README.md
 ├── background/
 │   └── serviceWorker.js
-└── content/
-    └── mainContent.js
+├── content/
+│   └── mainContent.js
+└── libs/
+    └── tesseract/
+        ├── tesseract.min.js
+        ├── worker.min.js
+        └── tesseract-core-simd.wasm.js
 ```
 
 ---
@@ -232,28 +239,25 @@ Cette V1 met en place la base complète :
 
 ## 11) Troubleshooting (logs fréquents)
 
-### `[NoAddExtension] TextDetector non disponible, OCR fantôme désactivé.`
+### Message « aucun moteur OCR » / `TextDetector` absent
 
-Signification :
-
-- l’API OCR native `TextDetector` n’est pas disponible dans ton navigateur/profil.
-
-Impact :
-
-- la détection “image/OCR” est désactivée ;
-- seule la détection overlay DOM reste active.
-
-Actions :
-
-- tester en Chrome récent ;
-- éventuellement activer les fonctionnalités web expérimentales du navigateur pour test local ;
-- intégrer un fallback OCR dédié (ex : worker OCR WASM) pour ne plus dépendre de `TextDetector`.
+- Si `TextDetector` n’est pas dispo, l’extension utilise désormais **Tesseract.js** embarqué (voir `libs/tesseract/`).
+- Tu dois voir un log du type `Moteur OCR pour le lecteur fantôme` avec `backend: "tesseract"` puis, au premier run, `Worker Tesseract prêt`.
+- La **première** analyse peut être longue (téléchargement du modèle `fra` ~ quelques Mo). Il faut une connexion réseau pour ce téléchargement.
+- Si **les deux** échouent, seule la détection overlay DOM reste active.
 
 ### Erreurs `googlevideo ... 403 (Forbidden)` en boucle
 
+Souvent la pile d’appels mentionne `kevlar_base_module` : c’est **le code YouTube**, pas forcément l’extension.
+
 Signification :
 
-- certaines URL vidéo signées YouTube (`googlevideo/videoplayback`) ne sont pas rejouables directement par un second lecteur “fantôme”.
+- certaines requêtes signées vers `googlevideo/videoplayback` sont refusées (jeton expiré, client non autorisé, etc.) ou liées au lecteur interne ;
+- **ce n’est pas** en soi la preuve que “l’OCR de l’extension” échoue.
+
+À part :
+
+- certaines URL vidéo signées YouTube ne sont pas rejouables par un second lecteur “fantôme” créé par l’extension.
 
 Ce qui a été durci dans le code :
 

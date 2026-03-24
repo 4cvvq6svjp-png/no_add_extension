@@ -432,25 +432,119 @@
           logWarn("TextDetector présent mais non initialisable", { message });
         }
       }
+
+      const hasTesseract = typeof self.Tesseract?.createWorker === "function";
+      if (this.textDetector) {
+        this.ocrBackend = "text-detector";
+      } else if (hasTesseract) {
+        this.ocrBackend = "tesseract";
+      } else {
+        this.ocrBackend = null;
+      }
+
+      this.tesseractWorker = null;
+      this.tesseractInitPromise = null;
       this.lastOcrError = null;
     }
 
     isAvailable() {
-      return Boolean(this.ctx && this.textDetector);
+      return Boolean(this.ctx && this.ocrBackend);
+    }
+
+    getBackendLabel() {
+      return this.ocrBackend ?? "none";
+    }
+
+    async ensureTesseractWorker() {
+      if (this.ocrBackend !== "tesseract") {
+        return null;
+      }
+
+      if (this.tesseractWorker) {
+        return this.tesseractWorker;
+      }
+
+      if (!this.tesseractInitPromise) {
+        this.tesseractInitPromise = (async () => {
+          const baseUrl = chrome.runtime.getURL("libs/tesseract/");
+          const worker = await self.Tesseract.createWorker("fra", 1, {
+            workerPath: `${baseUrl}worker.min.js`,
+            corePath: `${baseUrl}tesseract-core-simd.wasm.js`,
+            langPath: "https://tessdata.projectnaptha.com/4.0.0",
+            gzip: true,
+            logger: () => {}
+          });
+
+          await worker.setParameters({
+            tessedit_pageseg_mode: String(self.Tesseract?.PSM?.SINGLE_BLOCK ?? "6")
+          });
+
+          this.tesseractWorker = worker;
+          logInfo("Worker Tesseract prêt (fallback OCR).");
+          return worker;
+        })().catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          logWarn("Échec d’initialisation Tesseract", { message });
+          this.tesseractInitPromise = null;
+          return null;
+        });
+      }
+
+      return this.tesseractInitPromise;
+    }
+
+    async terminate() {
+      if (!this.tesseractWorker) {
+        this.tesseractInitPromise = null;
+        return;
+      }
+
+      try {
+        await this.tesseractWorker.terminate();
+      } catch {
+        // nettoyage best-effort
+      }
+
+      this.tesseractWorker = null;
+      this.tesseractInitPromise = null;
     }
 
     async detectFromVideo(video, sampleTime) {
-      if (!this.isAvailable()) {
+      if (!this.ctx || !this.ocrBackend) {
         return {
           sampleTime,
           hasCommercialKeyword: false,
           matchedKeywords: [],
-          source: "text-detector-unavailable"
+          source: "ocr-unavailable"
         };
       }
 
       try {
         this.ctx.drawImage(video, 0, 0, this.canvas.width, this.canvas.height);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (this.lastOcrError !== message) {
+          this.lastOcrError = message;
+          logWarn("Impossible de copier la frame vidéo sur le canvas", { message });
+        }
+
+        return {
+          sampleTime,
+          hasCommercialKeyword: false,
+          matchedKeywords: [],
+          source: "canvas-draw-error"
+        };
+      }
+
+      if (this.ocrBackend === "text-detector") {
+        return this.detectWithTextDetector(sampleTime);
+      }
+
+      return this.detectWithTesseract(sampleTime);
+    }
+
+    async detectWithTextDetector(sampleTime) {
+      try {
         const blocks = await this.textDetector.detect(this.canvas);
         const extractedText = blocks
           .map((block) => block?.rawValue ?? "")
@@ -469,7 +563,9 @@
         const message = error instanceof Error ? error.message : String(error);
         if (this.lastOcrError !== message) {
           this.lastOcrError = message;
-          logWarn("Impossible d'analyser une frame pour OCR", { message });
+          logWarn("Impossible d'analyser une frame pour OCR (TextDetector)", {
+            message
+          });
         }
 
         return {
@@ -477,6 +573,49 @@
           hasCommercialKeyword: false,
           matchedKeywords: [],
           source: "text-detector-error"
+        };
+      }
+    }
+
+    async detectWithTesseract(sampleTime) {
+      const worker = await this.ensureTesseractWorker();
+      if (!worker) {
+        return {
+          sampleTime,
+          hasCommercialKeyword: false,
+          matchedKeywords: [],
+          source: "tesseract-unavailable"
+        };
+      }
+
+      try {
+        const {
+          data: { text }
+        } = await worker.recognize(this.canvas);
+        const extractedText = text ?? "";
+        const matchedKeywords = extractCommercialKeywords(extractedText);
+
+        return {
+          sampleTime,
+          hasCommercialKeyword: matchedKeywords.length > 0,
+          matchedKeywords,
+          source: "tesseract",
+          extractedText
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (this.lastOcrError !== message) {
+          this.lastOcrError = message;
+          logWarn("Impossible d'analyser une frame pour OCR (Tesseract)", {
+            message
+          });
+        }
+
+        return {
+          sampleTime,
+          hasCommercialKeyword: false,
+          matchedKeywords: [],
+          source: "tesseract-error"
         };
       }
     }
@@ -498,9 +637,15 @@
 
     async start() {
       if (!this.frameClassifier.isAvailable()) {
-        logWarn("TextDetector non disponible, OCR fantôme désactivé.");
+        logWarn(
+          "Aucun moteur OCR (TextDetector + Tesseract), branche lecteur fantôme désactivée."
+        );
         return;
       }
+
+      logInfo("Moteur OCR pour le lecteur fantôme", {
+        backend: this.frameClassifier.getBackendLabel()
+      });
 
       const ghost = await this.createGhostVideo();
       if (!ghost) {
@@ -867,6 +1012,7 @@
       this.notifier = null;
       this.overlayDetector = null;
       this.ghostAnalyzer = null;
+      this.frameClassifier = null;
       this.skipController = null;
       this.urlWatcherInterval = null;
       this.lastKnownUrl = window.location.href;
@@ -944,6 +1090,7 @@
       this.overlayDetector.start();
 
       const frameClassifier = new FrameClassifier();
+      this.frameClassifier = frameClassifier;
       this.ghostAnalyzer = new GhostAnalyzer({
         mainVideo: video,
         frameClassifier,
@@ -973,6 +1120,9 @@
       if (this.ghostAnalyzer) {
         this.ghostAnalyzer.stop();
       }
+      if (this.frameClassifier) {
+        void this.frameClassifier.terminate();
+      }
       if (this.overlayDetector) {
         this.overlayDetector.stop();
       }
@@ -985,6 +1135,7 @@
 
       this.skipController = null;
       this.ghostAnalyzer = null;
+      this.frameClassifier = null;
       this.overlayDetector = null;
       this.notifier = null;
       this.segmentStore = null;
