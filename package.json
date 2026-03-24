@@ -4,6 +4,6 @@
   "private": true,
   "description": "Prototype d'extension Chromium pour sauter les collaborations commerciales sur YouTube en direct.",
   "scripts": {
-    "pack": "zip -r no_add_extension.zip manifest.json background content libs README.md package.json"
+    "pack": "zip -r no_add_extension.zip manifest.json background content libs pages README.md package.json"
   }
 }

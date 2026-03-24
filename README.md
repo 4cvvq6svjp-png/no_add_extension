@@ -56,6 +56,9 @@ no_add_extension/
 │   └── serviceWorker.js
 ├── content/
 │   └── mainContent.js
+├── pages/
+│   ├── ocr-sandbox.html
+│   └── ocr-sandbox.js
 └── libs/
     └── tesseract/
         ├── tesseract.min.js
@@ -241,9 +244,9 @@ Cette V1 met en place la base complète :
 
 ### Tesseract / CSP YouTube (`Creating a worker from 'blob:…' violates … Content Security Policy`)
 
-YouTube impose une **CSP** stricte : les workers créés via une URL **`blob:`** (comportement par défaut de Tesseract.js) sont **refusés** sur `www.youtube.com`.
+YouTube impose une **CSP** stricte sur **l’origine de la page** (`https://www.youtube.com`) : créer un worker Tesseract **depuis le content script** (même avec `workerBlobURL: false`) reste souvent **bloqué**, car les workers ne sont pas autorisés comme le site le veut.
 
-Dans le code, Tesseract est donc configuré avec **`workerBlobURL: false`** : le worker est chargé **directement** depuis `chrome-extension://…/libs/tesseract/worker.min.js`, ce que la CSP de la page n’interdit pas de la même façon.
+**Contournement retenu** : Tesseract tourne dans une **iframe** dont l’URL est **`chrome-extension://…/pages/ocr-sandbox.html`**. Le document de l’iframe est soumis à la **CSP de l’extension**, pas à celle de YouTube : les workers (y compris en `blob:`) peuvent s’y initialiser. Le content script envoie des **`ImageBitmap`** à cette iframe via **`postMessage`** et récupère le texte OCR.
 
 ### Message « aucun moteur OCR » / `TextDetector` absent
 

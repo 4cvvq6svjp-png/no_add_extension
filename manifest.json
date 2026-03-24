@@ -15,7 +15,7 @@
   "content_scripts": [
     {
       "matches": ["https://www.youtube.com/*"],
-      "js": ["libs/tesseract/tesseract.min.js", "content/mainContent.js"],
+      "js": ["content/mainContent.js"],
       "run_at": "document_idle"
     }
   ],

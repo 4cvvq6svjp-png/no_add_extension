@@ -5,6 +5,7 @@
   window.__NO_ADD_EXTENSION_LOADED__ = true;
 
   const EXTENSION_TAG = "[NoAddExtension]";
+  const OCR_MESSAGE_CHANNEL = "no-add-extension-ocr";
 
   const CONFIG = {
     frameSampleSeconds: 5,
@@ -451,17 +452,17 @@
         }
       }
 
-      const hasTesseract = typeof self.Tesseract?.createWorker === "function";
+      const canUseTesseractIframe = Boolean(chrome?.runtime?.getURL);
       if (this.textDetector) {
         this.ocrBackend = "text-detector";
-      } else if (hasTesseract) {
+      } else if (canUseTesseractIframe) {
         this.ocrBackend = "tesseract";
       } else {
         this.ocrBackend = null;
       }
 
-      this.tesseractWorker = null;
-      this.tesseractInitPromise = null;
+      this.ocrIframe = null;
+      this.tesseractBridgePromise = null;
       this.lastOcrError = null;
     }
 
@@ -473,59 +474,142 @@
       return this.ocrBackend ?? "none";
     }
 
-    async ensureTesseractWorker() {
+    async ensureOcrIframe() {
+      if (this.ocrIframe?.isConnected) {
+        return;
+      }
+
+      const readyPromise = new Promise((resolve, reject) => {
+        const timeout = window.setTimeout(
+          () => reject(new Error("sandbox-ready timeout")),
+          25000
+        );
+
+        const onMsg = (event) => {
+          const data = event.data;
+          if (
+            data?.channel !== OCR_MESSAGE_CHANNEL ||
+            data?.type !== "sandbox-ready"
+          ) {
+            return;
+          }
+          window.removeEventListener("message", onMsg);
+          window.clearTimeout(timeout);
+          resolve();
+        };
+
+        window.addEventListener("message", onMsg);
+      });
+
+      const iframe = document.createElement("iframe");
+      iframe.setAttribute("data-no-add-ocr-sandbox", "true");
+      iframe.src = chrome.runtime.getURL("pages/ocr-sandbox.html");
+      iframe.style.cssText =
+        "position:absolute;width:0;height:0;border:0;visibility:hidden;pointer-events:none;";
+      const root = document.documentElement ?? document.body;
+      root.appendChild(iframe);
+
+      await readyPromise;
+      this.ocrIframe = iframe;
+    }
+
+    async iframeOcrRequest(type, payload, transferList) {
+      const win = this.ocrIframe?.contentWindow;
+      if (!win) {
+        throw new Error("iframe OCR indisponible");
+      }
+
+      const reqId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+      return new Promise((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          cleanup();
+          reject(new Error(`OCR iframe timeout (${type})`));
+        }, type === "init" ? 120000 : 90000);
+
+        const onMsg = (event) => {
+          const data = event.data;
+          if (
+            data?.channel !== OCR_MESSAGE_CHANNEL ||
+            data.reqId !== reqId
+          ) {
+            return;
+          }
+
+          cleanup();
+
+          if (
+            data.type === "init-ok" ||
+            data.type === "recognize-ok" ||
+            data.type === "terminate-ok"
+          ) {
+            resolve(data);
+            return;
+          }
+
+          reject(new Error(data.error || data.type || "ocr-iframe-error"));
+        };
+
+        const cleanup = () => {
+          window.clearTimeout(timeout);
+          window.removeEventListener("message", onMsg);
+        };
+
+        window.addEventListener("message", onMsg);
+        win.postMessage(
+          { channel: OCR_MESSAGE_CHANNEL, type, reqId, ...payload },
+          "*",
+          transferList ?? []
+        );
+      });
+    }
+
+    async ensureTesseractBridge() {
       if (this.ocrBackend !== "tesseract") {
         return null;
       }
 
-      if (this.tesseractWorker) {
-        return this.tesseractWorker;
+      if (this.tesseractBridgePromise) {
+        return this.tesseractBridgePromise;
       }
 
-      if (!this.tesseractInitPromise) {
-        this.tesseractInitPromise = (async () => {
-          const baseUrl = chrome.runtime.getURL("libs/tesseract/");
-          const worker = await self.Tesseract.createWorker("fra", 1, {
-            workerPath: `${baseUrl}worker.min.js`,
-            corePath: `${baseUrl}tesseract-core-simd.wasm.js`,
-            langPath: "https://tessdata.projectnaptha.com/4.0.0",
-            gzip: true,
-            workerBlobURL: false,
-            logger: () => {}
-          });
-
-          await worker.setParameters({
-            tessedit_pageseg_mode: String(self.Tesseract?.PSM?.SINGLE_BLOCK ?? "6")
-          });
-
-          this.tesseractWorker = worker;
-          logInfo("Worker Tesseract prêt (fallback OCR).");
-          return worker;
-        })().catch((error) => {
-          const message = formatErrorForLog(error);
-          logWarn("Échec d’initialisation Tesseract", { message, error });
-          this.tesseractInitPromise = null;
-          return null;
+      this.tesseractBridgePromise = (async () => {
+        await this.ensureOcrIframe();
+        await this.iframeOcrRequest("init", {});
+        logInfo("Tesseract prêt (sandbox iframe chrome-extension://).");
+        return true;
+      })().catch((error) => {
+        const message = formatErrorForLog(error);
+        logWarn("Échec d’initialisation Tesseract (iframe)", {
+          message,
+          error
         });
-      }
+        this.tesseractBridgePromise = null;
+        if (this.ocrIframe) {
+          this.ocrIframe.remove();
+          this.ocrIframe = null;
+        }
+        return null;
+      });
 
-      return this.tesseractInitPromise;
+      return this.tesseractBridgePromise;
     }
 
     async terminate() {
-      if (!this.tesseractWorker) {
-        this.tesseractInitPromise = null;
-        return;
+      if (this.ocrBackend === "tesseract" && this.ocrIframe?.contentWindow) {
+        try {
+          await this.iframeOcrRequest("terminate", {});
+        } catch {
+          // best-effort
+        }
       }
 
-      try {
-        await this.tesseractWorker.terminate();
-      } catch {
-        // nettoyage best-effort
+      if (this.ocrIframe) {
+        this.ocrIframe.remove();
+        this.ocrIframe = null;
       }
 
-      this.tesseractWorker = null;
-      this.tesseractInitPromise = null;
+      this.tesseractBridgePromise = null;
     }
 
     async detectFromVideo(video, sampleTime) {
@@ -597,8 +681,8 @@
     }
 
     async detectWithTesseract(sampleTime) {
-      const worker = await this.ensureTesseractWorker();
-      if (!worker) {
+      const bridge = await this.ensureTesseractBridge();
+      if (!bridge) {
         return {
           sampleTime,
           hasCommercialKeyword: false,
@@ -607,11 +691,18 @@
         };
       }
 
+      let bitmap = null;
+
       try {
-        const {
-          data: { text }
-        } = await worker.recognize(this.canvas);
-        const extractedText = text ?? "";
+        bitmap = await createImageBitmap(this.canvas);
+        const result = await this.iframeOcrRequest(
+          "recognize",
+          { imageBitmap: bitmap },
+          [bitmap]
+        );
+        bitmap = null;
+
+        const extractedText = result.text ?? "";
         const matchedKeywords = extractCommercialKeywords(extractedText);
 
         return {
@@ -622,6 +713,14 @@
           extractedText
         };
       } catch (error) {
+        if (bitmap) {
+          try {
+            bitmap.close();
+          } catch {
+            // ignore
+          }
+        }
+
         const message = error instanceof Error ? error.message : String(error);
         if (this.lastOcrError !== message) {
           this.lastOcrError = message;
