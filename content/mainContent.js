@@ -90,6 +90,24 @@
     return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
+  function formatErrorForLog(error) {
+    if (error instanceof Error) {
+      const base = error.message?.trim() || error.name || "Error";
+      return error.stack ? `${base} (${error.stack.split("\n")[0]})` : base;
+    }
+    if (error === undefined || error === null) {
+      return String(error);
+    }
+    if (typeof error === "string") {
+      return error;
+    }
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+
   async function waitForVideoElement(timeoutMs) {
     const startAt = Date.now();
 
@@ -472,6 +490,7 @@
             corePath: `${baseUrl}tesseract-core-simd.wasm.js`,
             langPath: "https://tessdata.projectnaptha.com/4.0.0",
             gzip: true,
+            workerBlobURL: false,
             logger: () => {}
           });
 
@@ -483,8 +502,8 @@
           logInfo("Worker Tesseract prêt (fallback OCR).");
           return worker;
         })().catch((error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          logWarn("Échec d’initialisation Tesseract", { message });
+          const message = formatErrorForLog(error);
+          logWarn("Échec d’initialisation Tesseract", { message, error });
           this.tesseractInitPromise = null;
           return null;
         });

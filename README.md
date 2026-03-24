@@ -239,6 +239,12 @@ Cette V1 met en place la base complète :
 
 ## 11) Troubleshooting (logs fréquents)
 
+### Tesseract / CSP YouTube (`Creating a worker from 'blob:…' violates … Content Security Policy`)
+
+YouTube impose une **CSP** stricte : les workers créés via une URL **`blob:`** (comportement par défaut de Tesseract.js) sont **refusés** sur `www.youtube.com`.
+
+Dans le code, Tesseract est donc configuré avec **`workerBlobURL: false`** : le worker est chargé **directement** depuis `chrome-extension://…/libs/tesseract/worker.min.js`, ce que la CSP de la page n’interdit pas de la même façon.
+
 ### Message « aucun moteur OCR » / `TextDetector` absent
 
 - Si `TextDetector` n’est pas dispo, l’extension utilise désormais **Tesseract.js** embarqué (voir `libs/tesseract/`).
