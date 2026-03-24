@@ -21,7 +21,11 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["libs/tesseract/*"],
+      "resources": [
+        "pages/ocr-sandbox.html",
+        "pages/ocr-sandbox.js",
+        "libs/tesseract/*"
+      ],
       "matches": ["https://www.youtube.com/*"]
     }
   ]
