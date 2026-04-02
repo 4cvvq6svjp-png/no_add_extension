@@ -15,11 +15,9 @@
     skipMarginSeconds: 0.4,
     skipCooldownMs: 900,
     analysisPollMs: 1200,
-    ghostPlaybackRate: 3,
-    ghostTargetLeadSeconds: 35,
-    ghostMinLeadSeconds: 10,
     canvasWidth: 420,
     canvasHeight: 236,
+    ocrRoiTopFraction: 0.25,
     overlayPollMs: 750,
     initTimeoutMs: 20000
   };
@@ -138,38 +136,6 @@
       return url.searchParams.get("v");
     } catch {
       return null;
-    }
-  }
-
-  function isBlobUrl(value) {
-    return typeof value === "string" && value.startsWith("blob:");
-  }
-
-  function isGoogleVideoPlaybackUrl(value) {
-    if (typeof value !== "string" || !value) {
-      return false;
-    }
-
-    return value.includes("googlevideo.com/videoplayback");
-  }
-
-  function describeSourceType(value) {
-    if (!value) {
-      return "none";
-    }
-
-    if (isBlobUrl(value)) {
-      return "blob";
-    }
-
-    if (isGoogleVideoPlaybackUrl(value)) {
-      return "googlevideo-signed";
-    }
-
-    try {
-      return new URL(value).host || "unknown-host";
-    } catch {
-      return "unknown-format";
     }
   }
 
@@ -438,10 +404,18 @@
 
   class FrameClassifier {
     constructor() {
+      // Full-frame canvas for drawing the source
       this.canvas = document.createElement("canvas");
       this.canvas.width = CONFIG.canvasWidth;
       this.canvas.height = CONFIG.canvasHeight;
       this.ctx = this.canvas.getContext("2d", { willReadFrequently: false });
+
+      // ROI canvas: only the top portion where overlay text appears
+      this.roiHeight = Math.round(CONFIG.canvasHeight * CONFIG.ocrRoiTopFraction);
+      this.roiCanvas = document.createElement("canvas");
+      this.roiCanvas.width = CONFIG.canvasWidth;
+      this.roiCanvas.height = this.roiHeight;
+      this.roiCtx = this.roiCanvas.getContext("2d", { willReadFrequently: false });
       this.textDetector = null;
       if ("TextDetector" in window) {
         try {
@@ -646,6 +620,40 @@
       return this.detectWithTesseract(sampleTime);
     }
 
+    async detectFromBitmap(imageBitmap, sampleTime) {
+      if (!this.ctx || !this.ocrBackend) {
+        return {
+          sampleTime,
+          hasCommercialKeyword: false,
+          matchedKeywords: [],
+          source: "ocr-unavailable"
+        };
+      }
+
+      try {
+        this.ctx.drawImage(imageBitmap, 0, 0, this.canvas.width, this.canvas.height);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (this.lastOcrError !== message) {
+          this.lastOcrError = message;
+          logWarn("Impossible de dessiner le bitmap sur le canvas", { message });
+        }
+
+        return {
+          sampleTime,
+          hasCommercialKeyword: false,
+          matchedKeywords: [],
+          source: "bitmap-draw-error"
+        };
+      }
+
+      if (this.ocrBackend === "text-detector") {
+        return this.detectWithTextDetector(sampleTime);
+      }
+
+      return this.detectWithTesseract(sampleTime);
+    }
+
     async detectWithTextDetector(sampleTime) {
       try {
         const blocks = await this.textDetector.detect(this.canvas);
@@ -739,57 +747,97 @@
     }
   }
 
-  class GhostAnalyzer {
+  /* ------------------------------------------------------------------ */
+  /*  AheadScanner — MSE interception + WebCodecs decoder                */
+  /*  Replaces GhostAnalyzer: no ghost <video>, instead we intercept     */
+  /*  the raw fMP4 segments YouTube feeds into MSE, decode keyframes     */
+  /*  via WebCodecs in an iframe sandbox, and OCR the resulting bitmaps. */
+  /* ------------------------------------------------------------------ */
+
+  const MSE_CHANNEL = "no-add-mse-intercept";
+  const DECODER_CHANNEL = "no-add-decoder";
+
+  class AheadScanner {
     constructor({ mainVideo, frameClassifier, segmentStore }) {
       this.mainVideo = mainVideo;
       this.frameClassifier = frameClassifier;
       this.segmentStore = segmentStore;
 
-      this.ghostVideo = null;
-      this.ocrSourceTag = "ghost-ocr";
-      this.analysisInterval = null;
-      this.lastSampleTime = -Infinity;
+      this.ocrSourceTag = "ahead-ocr";
       this.activeCommercialStart = null;
       this.lastPositiveSample = null;
-      this.pendingTick = false;
+
+      // Captured MSE data
+      this.initSegment = null;
+      this.capturedSegments = []; // [{ data, timestampOffset }]
+      this.maxBufferSeconds = 60;
+
+      // Decoder iframe
+      this.decoderIframe = null;
+      this.decoderReady = false;
+      this.decoderConfigured = false;
+      this.decoderBridgePromise = null;
+
+      // Scanning state
+      this.lastScannedTime = -Infinity;
+      this.pendingScan = false;
+      this.scanInterval = null;
+      this.fallbackInterval = null;
+      this.useFallback = false;
+
+      // Bound listener
+      this.boundOnMseMessage = (event) => this.onMseMessage(event);
     }
 
     async start() {
       if (!this.frameClassifier.isAvailable()) {
-        logWarn(
-          "Aucun moteur OCR (TextDetector + Tesseract), branche lecteur fantôme désactivée."
-        );
+        logWarn("Aucun moteur OCR disponible, AheadScanner désactivé.");
         return;
       }
 
-      logInfo("Moteur OCR (lecteur fantôme ou repli vidéo principale)", {
+      logInfo("AheadScanner démarré", {
         backend: this.frameClassifier.getBackendLabel()
       });
 
-      const ghost = await this.createGhostVideo();
-      if (ghost) {
-        this.ghostVideo = ghost;
-        this.ocrSourceTag = "ghost-ocr";
-      } else {
-        this.ocrSourceTag = "main-video-ocr";
-        logWarn(
-          "Lecteur fantôme indisponible — OCR sur la vidéo principale (pas d’analyse en avance)."
-        );
-      }
+      // Listen for MSE intercepted data from MAIN world
+      window.addEventListener("message", this.boundOnMseMessage);
 
-      this.analysisInterval = window.setInterval(
-        () => void this.tick(),
+      // Periodic scan for new segments to process
+      this.scanInterval = window.setInterval(
+        () => void this.scanNext(),
         CONFIG.analysisPollMs
       );
-      void this.tick();
+
+      // Fallback: if no MSE data arrives within 8s, fall back to main video OCR
+      this.fallbackTimeout = window.setTimeout(() => {
+        if (!this.initSegment) {
+          logWarn("Aucun segment MSE reçu — repli OCR sur la vidéo principale.");
+          this.useFallback = true;
+          this.ocrSourceTag = "main-video-ocr";
+          this.startFallbackPolling();
+        }
+      }, 8000);
     }
 
     stop() {
-      if (this.analysisInterval !== null) {
-        window.clearInterval(this.analysisInterval);
-        this.analysisInterval = null;
+      window.removeEventListener("message", this.boundOnMseMessage);
+
+      if (this.scanInterval !== null) {
+        window.clearInterval(this.scanInterval);
+        this.scanInterval = null;
       }
 
+      if (this.fallbackTimeout !== null) {
+        window.clearTimeout(this.fallbackTimeout);
+        this.fallbackTimeout = null;
+      }
+
+      if (this.fallbackInterval !== null) {
+        window.clearInterval(this.fallbackInterval);
+        this.fallbackInterval = null;
+      }
+
+      // Flush pending commercial segment
       if (this.activeCommercialStart !== null) {
         const end = Number(this.lastPositiveSample ?? this.activeCommercialStart);
         this.segmentStore.addSegment({
@@ -802,319 +850,322 @@
 
       this.activeCommercialStart = null;
       this.lastPositiveSample = null;
-      this.lastSampleTime = -Infinity;
-      this.pendingTick = false;
+      this.lastScannedTime = -Infinity;
+      this.pendingScan = false;
+      this.initSegment = null;
+      this.capturedSegments = [];
 
-      if (this.ghostVideo) {
-        this.ghostVideo.pause();
-        this.ghostVideo.srcObject = null;
-        this.ghostVideo.src = "";
-        this.ghostVideo.remove();
-        this.ghostVideo = null;
+      // Destroy decoder iframe
+      if (this.decoderIframe) {
+        try {
+          this.decoderIframe.contentWindow?.postMessage(
+            { channel: DECODER_CHANNEL, type: "terminate", reqId: "teardown" },
+            "*"
+          );
+        } catch { /* best-effort */ }
+        this.decoderIframe.remove();
+        this.decoderIframe = null;
       }
+
+      this.decoderReady = false;
+      this.decoderConfigured = false;
+      this.decoderBridgePromise = null;
     }
 
-    async createGhostVideo() {
-      const ghost = document.createElement("video");
-      ghost.muted = true;
-      ghost.playsInline = true;
-      ghost.preload = "auto";
-      ghost.style.display = "none";
-      document.body.appendChild(ghost);
+    /* ---------------------------------------------------------------- */
+    /*  MSE message handling (from MAIN world interceptor)               */
+    /* ---------------------------------------------------------------- */
 
-      const viaStream = await this.tryGhostFromCaptureStream(ghost);
-      if (viaStream) {
-        return ghost;
-      }
+    onMseMessage(event) {
+      const msg = event.data;
+      if (!msg || msg.channel !== MSE_CHANNEL) return;
 
-      const sourceSelection = this.selectGhostSource();
-      if (!sourceSelection?.value) {
-        logWarn(
-          "Lecteur fantôme: aucune URL exploitable après échec captureStream.",
-          {
-            reason: sourceSelection?.reason ?? "unknown",
-            candidates: sourceSelection?.candidates ?? []
-          }
-        );
-        ghost.remove();
-        return null;
-      }
-
-      const source = sourceSelection.value;
-      ghost.src = source;
-
-      logInfo("Source du lecteur fantôme (URL)", {
-        reason: sourceSelection.reason,
-        sourceType: describeSourceType(source),
-        sourceLabel: sourceSelection.label
-      });
-
-      const loaded = await this.waitForGhostReady(ghost, 7000);
-      if (!loaded) {
-        ghost.remove();
-        return null;
-      }
-
-      if (Number.isFinite(this.mainVideo.currentTime) && this.mainVideo.currentTime > 0) {
-        const target = Math.min(
-          this.mainVideo.currentTime + CONFIG.ghostTargetLeadSeconds,
-          Math.max(0, (ghost.duration || Infinity) - 0.5)
-        );
-
-        if (Number.isFinite(target) && target > 0) {
-          try {
-            ghost.currentTime = target;
-          } catch {
-            // Certains flux empêchent le seek initial.
-          }
-        }
-      }
-
-      ghost.playbackRate = CONFIG.ghostPlaybackRate;
-
-      try {
-        await ghost.play();
-      } catch {
-        ghost.remove();
-        return null;
-      }
-
-      return ghost;
-    }
-
-    async tryGhostFromCaptureStream(ghost) {
-      if (typeof this.mainVideo.captureStream !== "function") {
-        return false;
-      }
-
-      try {
-        const stream = this.mainVideo.captureStream();
-        if (!stream || typeof stream.getTracks !== "function") {
-          return false;
-        }
-
-        ghost.srcObject = stream;
-
-        const ready = await new Promise((resolve) => {
-          const timeout = window.setTimeout(() => resolve(false), 5000);
-
-          const finish = (ok) => {
-            window.clearTimeout(timeout);
-            ghost.removeEventListener("loadedmetadata", onMeta);
-            ghost.removeEventListener("canplay", onPlay);
-            ghost.removeEventListener("error", onError);
-            resolve(ok);
-          };
-
-          const onMeta = () => finish(true);
-          const onPlay = () => finish(true);
-          const onError = () => finish(false);
-
-          ghost.addEventListener("loadedmetadata", onMeta);
-          ghost.addEventListener("canplay", onPlay);
-          ghost.addEventListener("error", onError);
-
-          ghost.play().catch(() => finish(false));
-        });
-
-        if (
-          ready &&
-          ghost.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
-        ) {
-          logInfo("Lecteur fantôme branché via captureStream() (même flux que la vidéo principale).");
-          ghost.playbackRate = CONFIG.ghostPlaybackRate;
-          return true;
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        logWarn("captureStream indisponible ou refusé pour le lecteur fantôme", {
-          message
-        });
-      }
-
-      ghost.srcObject = null;
-      return false;
-    }
-
-    waitForGhostReady(ghost, timeoutMs) {
-      return new Promise((resolve) => {
-        const timeout = window.setTimeout(() => resolve(false), timeoutMs);
-
-        const onLoadedMetadata = () => {
-          window.clearTimeout(timeout);
-          ghost.removeEventListener("error", onError);
-          ghost.removeEventListener("loadedmetadata", onLoadedMetadata);
-          resolve(true);
-        };
-
-        const onError = () => {
-          window.clearTimeout(timeout);
-          ghost.removeEventListener("loadedmetadata", onLoadedMetadata);
-          ghost.removeEventListener("error", onError);
-          resolve(false);
-        };
-
-        ghost.addEventListener("loadedmetadata", onLoadedMetadata);
-        ghost.addEventListener("error", onError);
-      });
-    }
-
-    /**
-     * Ordre : URL non-blob d’abord (les blobs YouTube échouent souvent sur un 2e <video>),
-     * puis URL googlevideo, en dernier recours blob.
-     */
-    selectGhostSource() {
-      const candidates = [
-        { label: "attr:src", value: this.mainVideo.getAttribute("src") },
-        { label: "video.src", value: this.mainVideo.src },
-        { label: "video.currentSrc", value: this.mainVideo.currentSrc }
-      ]
-        .filter((entry) => typeof entry.value === "string" && entry.value.trim())
-        .map((entry) => ({
-          label: entry.label,
-          value: entry.value.trim()
-        }));
-
-      const deduplicated = [];
-      const seen = new Set();
-      for (const entry of candidates) {
-        if (seen.has(entry.value)) {
-          continue;
-        }
-        seen.add(entry.value);
-        deduplicated.push(entry);
-      }
-
-      const compactCandidates = deduplicated.map((entry) => ({
-        label: entry.label,
-        type: describeSourceType(entry.value)
-      }));
-
-      if (deduplicated.length === 0) {
-        return {
-          value: null,
-          label: null,
-          reason: "no-video-source",
-          candidates: compactCandidates
-        };
-      }
-
-      const nonBlobNonGoogle = deduplicated.find(
-        (entry) => !isBlobUrl(entry.value) && !isGoogleVideoPlaybackUrl(entry.value)
-      );
-      if (nonBlobNonGoogle) {
-        return {
-          value: nonBlobNonGoogle.value,
-          label: nonBlobNonGoogle.label,
-          reason: "prefer-nonblob-nongoogle",
-          candidates: compactCandidates
-        };
-      }
-
-      const nonBlobGoogle = deduplicated.find(
-        (entry) => !isBlobUrl(entry.value) && isGoogleVideoPlaybackUrl(entry.value)
-      );
-      if (nonBlobGoogle) {
-        return {
-          value: nonBlobGoogle.value,
-          label: nonBlobGoogle.label,
-          reason: "prefer-nonblob-googlevideo",
-          candidates: compactCandidates
-        };
-      }
-
-      const blobCandidate = deduplicated.find((entry) => isBlobUrl(entry.value));
-      if (blobCandidate) {
-        return {
-          value: blobCandidate.value,
-          label: blobCandidate.label,
-          reason: "fallback-blob-last-resort",
-          candidates: compactCandidates
-        };
-      }
-
-      return {
-        value: null,
-        label: null,
-        reason: "no-usable-candidate",
-        candidates: compactCandidates
-      };
-    }
-
-    async tick() {
-      const analysisVideo = this.ghostVideo ?? this.mainVideo;
-      if (
-        this.pendingTick ||
-        !analysisVideo ||
-        analysisVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
-      ) {
+      if (msg.type === "new-media-source") {
+        // New video — reset state
+        this.initSegment = null;
+        this.capturedSegments = [];
+        this.lastScannedTime = -Infinity;
+        this.decoderConfigured = false;
+        logInfo("AheadScanner: nouveau MediaSource détecté, reset.");
         return;
       }
 
-      this.pendingTick = true;
+      if (msg.type === "init-segment") {
+        this.initSegment = msg.data;
+        this.decoderConfigured = false;
+        this.useFallback = false;
+
+        if (this.fallbackTimeout !== null) {
+          window.clearTimeout(this.fallbackTimeout);
+          this.fallbackTimeout = null;
+        }
+        if (this.fallbackInterval !== null) {
+          window.clearInterval(this.fallbackInterval);
+          this.fallbackInterval = null;
+        }
+
+        this.ocrSourceTag = "ahead-ocr";
+        logInfo("AheadScanner: init segment capturé", {
+          bytes: msg.data?.byteLength,
+          mime: msg.mime
+        });
+        return;
+      }
+
+      if (msg.type === "media-segment") {
+        if (!this.initSegment) return; // Ignore media without init
+
+        this.capturedSegments.push({
+          data: msg.data,
+          timestampOffset: msg.timestampOffset ?? 0,
+          receivedAt: Date.now()
+        });
+
+        // Evict old segments (behind main video position - 10s)
+        this.evictOldSegments();
+        return;
+      }
+    }
+
+    evictOldSegments() {
+      const maxSegments = 30;
+      if (this.capturedSegments.length > maxSegments) {
+        this.capturedSegments = this.capturedSegments.slice(-maxSegments);
+      }
+    }
+
+    /* ---------------------------------------------------------------- */
+    /*  Decoder iframe lifecycle                                         */
+    /* ---------------------------------------------------------------- */
+
+    async ensureDecoderIframe() {
+      if (this.decoderIframe?.isConnected && this.decoderReady) return;
+
+      if (this.decoderBridgePromise) return this.decoderBridgePromise;
+
+      this.decoderBridgePromise = (async () => {
+        const readyPromise = new Promise((resolve, reject) => {
+          const timeout = window.setTimeout(
+            () => reject(new Error("decoder-sandbox-ready timeout")),
+            15000
+          );
+
+          const onMsg = (event) => {
+            const data = event.data;
+            if (data?.channel !== DECODER_CHANNEL || data?.type !== "sandbox-ready") return;
+            window.removeEventListener("message", onMsg);
+            window.clearTimeout(timeout);
+            resolve();
+          };
+          window.addEventListener("message", onMsg);
+        });
+
+        const iframe = document.createElement("iframe");
+        iframe.setAttribute("data-no-add-decoder-sandbox", "true");
+        iframe.src = chrome.runtime.getURL("pages/decoder-sandbox.html");
+        iframe.style.cssText =
+          "position:absolute;width:0;height:0;border:0;visibility:hidden;pointer-events:none;";
+        (document.documentElement ?? document.body).appendChild(iframe);
+
+        await readyPromise;
+        this.decoderIframe = iframe;
+        this.decoderReady = true;
+        logInfo("AheadScanner: decoder sandbox prêt.");
+      })().catch((error) => {
+        logWarn("AheadScanner: échec initialisation decoder sandbox", {
+          error: formatErrorForLog(error)
+        });
+        this.decoderBridgePromise = null;
+        return null;
+      });
+
+      return this.decoderBridgePromise;
+    }
+
+    async decoderRequest(type, payload, transferList) {
+      const win = this.decoderIframe?.contentWindow;
+      if (!win) throw new Error("Decoder iframe indisponible");
+
+      const reqId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+      return new Promise((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          cleanup();
+          reject(new Error(`Decoder timeout (${type})`));
+        }, 30000);
+
+        const onMsg = (event) => {
+          const data = event.data;
+          if (data?.channel !== DECODER_CHANNEL || data.reqId !== reqId) return;
+          cleanup();
+
+          if (data.type.endsWith("-ok")) {
+            resolve(data);
+          } else {
+            reject(new Error(data.error || data.type || "decoder-error"));
+          }
+        };
+
+        const cleanup = () => {
+          window.clearTimeout(timeout);
+          window.removeEventListener("message", onMsg);
+        };
+
+        window.addEventListener("message", onMsg);
+        win.postMessage(
+          { channel: DECODER_CHANNEL, type, reqId, ...payload },
+          "*",
+          transferList ?? []
+        );
+      });
+    }
+
+    async ensureDecoderConfigured() {
+      if (this.decoderConfigured) return true;
+      if (!this.initSegment) return false;
+
+      await this.ensureDecoderIframe();
+      if (!this.decoderIframe) return false;
 
       try {
-        this.keepGhostAhead();
+        await this.decoderRequest("configure", {
+          initSegment: this.initSegment.slice(0)
+        }, [this.initSegment.slice(0)]);
+        this.decoderConfigured = true;
+        logInfo("AheadScanner: decoder configuré.");
+        return true;
+      } catch (error) {
+        logWarn("AheadScanner: échec configuration decoder", {
+          error: formatErrorForLog(error)
+        });
+        return false;
+      }
+    }
 
-        const sampleTime = Number(analysisVideo.currentTime ?? 0);
-        if (sampleTime - this.lastSampleTime < CONFIG.frameSampleSeconds) {
+    /* ---------------------------------------------------------------- */
+    /*  Scanning logic                                                   */
+    /* ---------------------------------------------------------------- */
+
+    async scanNext() {
+      if (this.useFallback) return; // Handled by fallback polling
+      if (this.pendingScan) return;
+      if (!this.initSegment || this.capturedSegments.length === 0) return;
+
+      this.pendingScan = true;
+
+      try {
+        const configured = await this.ensureDecoderConfigured();
+        if (!configured) return;
+
+        // Find the next unscanned segment
+        const segmentEntry = this.capturedSegments.find((entry) => {
+          return !entry.scanned;
+        });
+
+        if (!segmentEntry) return;
+
+        // Parse the media segment to find keyframes
+        let timescale = 90000;
+        try {
+          const mp4 = window.__mp4demux;
+          if (mp4) {
+            timescale = mp4.parseTimescale(this.initSegment);
+          }
+        } catch { /* use default */ }
+
+        const mp4 = window.__mp4demux;
+        if (!mp4) {
+          segmentEntry.scanned = true;
           return;
         }
 
-        this.lastSampleTime = sampleTime;
-        const detection = await this.frameClassifier.detectFromVideo(
-          analysisVideo,
-          sampleTime
-        );
-        this.consumeDetection(detection);
-      } finally {
-        this.pendingTick = false;
-      }
-    }
+        const samples = mp4.parseMediaSegment(segmentEntry.data, { timescale });
+        segmentEntry.scanned = true;
 
-    keepGhostAhead() {
-      if (!this.ghostVideo) {
-        return;
-      }
-
-      if (this.ghostVideo.srcObject) {
-        if (this.ghostVideo.paused) {
-          this.ghostVideo.play().catch(() => {});
-        }
-        return;
-      }
-
-      const mainTime = Number(this.mainVideo.currentTime ?? 0);
-      const ghostTime = Number(this.ghostVideo.currentTime ?? 0);
-      const lead = ghostTime - mainTime;
-
-      if (lead < CONFIG.ghostMinLeadSeconds) {
-        const target = Math.min(
-          mainTime + CONFIG.ghostTargetLeadSeconds,
-          Math.max(0, (this.ghostVideo.duration || Infinity) - 0.5)
+        // Only decode keyframes, and only those we haven’t scanned yet
+        const keyframes = samples.filter((s) =>
+          s.isKeyframe && s.timestamp > this.lastScannedTime + CONFIG.frameSampleSeconds
         );
 
-        if (Number.isFinite(target) && target > ghostTime + 1) {
+        for (const kf of keyframes) {
+          if (this.lastScannedTime >= kf.timestamp) continue;
+
           try {
-            this.ghostVideo.currentTime = target;
-          } catch {
-            // Les flux MSE peuvent refuser certains seeks.
+            const result = await this.decoderRequest("decode", {
+              data: kf.data,
+              timestamp: kf.timestamp,
+              duration: kf.duration,
+              isKeyframe: true
+            }, [kf.data]);
+
+            if (result.imageBitmap) {
+              const detection = await this.frameClassifier.detectFromBitmap(
+                result.imageBitmap,
+                kf.timestamp
+              );
+
+              try { result.imageBitmap.close(); } catch { /* ignore */ }
+
+              this.consumeDetection(detection);
+              this.lastScannedTime = kf.timestamp;
+
+              logInfo("AheadScanner: frame analysée", {
+                time: kf.timestamp.toFixed(1),
+                keyword: detection.hasCommercialKeyword,
+                lead: (kf.timestamp - this.mainVideo.currentTime).toFixed(1) + "s en avance"
+              });
+            }
+          } catch (error) {
+            logWarn("AheadScanner: échec décodage frame", {
+              time: kf.timestamp,
+              error: formatErrorForLog(error)
+            });
           }
         }
-      }
-
-      if (this.ghostVideo.paused) {
-        this.ghostVideo.play().catch(() => {
-          // Pas d'action bloquante dans la boucle d'analyse.
-        });
+      } finally {
+        this.pendingScan = false;
       }
     }
+
+    /* ---------------------------------------------------------------- */
+    /*  Fallback: OCR on main video (no MSE data available)              */
+    /* ---------------------------------------------------------------- */
+
+    startFallbackPolling() {
+      if (this.fallbackInterval !== null) return;
+
+      this.fallbackInterval = window.setInterval(
+        () => void this.fallbackTick(),
+        CONFIG.analysisPollMs
+      );
+    }
+
+    async fallbackTick() {
+      if (this.pendingScan) return;
+
+      const video = this.mainVideo;
+      if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+
+      const sampleTime = Number(video.currentTime ?? 0);
+      if (sampleTime - this.lastScannedTime < CONFIG.frameSampleSeconds) return;
+
+      this.pendingScan = true;
+      try {
+        this.lastScannedTime = sampleTime;
+        const detection = await this.frameClassifier.detectFromVideo(video, sampleTime);
+        this.consumeDetection(detection);
+      } finally {
+        this.pendingScan = false;
+      }
+    }
+
+    /* ---------------------------------------------------------------- */
+    /*  Detection accumulation (same logic as old GhostAnalyzer)         */
+    /* ---------------------------------------------------------------- */
 
     consumeDetection(detection) {
       const t = Number(detection.sampleTime ?? 0);
-      if (!Number.isFinite(t)) {
-        return;
-      }
+      if (!Number.isFinite(t)) return;
 
       if (detection.hasCommercialKeyword) {
         if (this.activeCommercialStart === null) {
@@ -1132,9 +1183,7 @@
       }
 
       const gap = t - this.lastPositiveSample;
-      if (gap < CONFIG.noMatchGraceSeconds) {
-        return;
-      }
+      if (gap < CONFIG.noMatchGraceSeconds) return;
 
       const start = this.activeCommercialStart;
       const end = this.lastPositiveSample + CONFIG.frameSampleSeconds * 0.7;
@@ -1223,7 +1272,7 @@
       this.segmentStore = null;
       this.notifier = null;
       this.overlayDetector = null;
-      this.ghostAnalyzer = null;
+      this.aheadScanner = null;
       this.frameClassifier = null;
       this.skipController = null;
       this.urlWatcherInterval = null;
@@ -1303,12 +1352,12 @@
 
       const frameClassifier = new FrameClassifier();
       this.frameClassifier = frameClassifier;
-      this.ghostAnalyzer = new GhostAnalyzer({
+      this.aheadScanner = new AheadScanner({
         mainVideo: video,
         frameClassifier,
         segmentStore: this.segmentStore
       });
-      await this.ghostAnalyzer.start();
+      await this.aheadScanner.start();
 
       this.skipController = new SkipController({
         video,
@@ -1329,8 +1378,8 @@
       if (this.skipController) {
         this.skipController.stop();
       }
-      if (this.ghostAnalyzer) {
-        this.ghostAnalyzer.stop();
+      if (this.aheadScanner) {
+        this.aheadScanner.stop();
       }
       if (this.frameClassifier) {
         void this.frameClassifier.terminate();
@@ -1346,7 +1395,7 @@
       }
 
       this.skipController = null;
-      this.ghostAnalyzer = null;
+      this.aheadScanner = null;
       this.frameClassifier = null;
       this.overlayDetector = null;
       this.notifier = null;

@@ -15,6 +15,12 @@
   "content_scripts": [
     {
       "matches": ["https://www.youtube.com/*"],
+      "js": ["content/mseInterceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://www.youtube.com/*"],
       "js": ["content/mainContent.js"],
       "run_at": "document_idle"
     }
@@ -24,7 +30,10 @@
       "resources": [
         "pages/ocr-sandbox.html",
         "pages/ocr-sandbox.js",
-        "libs/tesseract/*"
+        "pages/decoder-sandbox.html",
+        "pages/decoder-sandbox.js",
+        "libs/tesseract/*",
+        "libs/mp4demux.js"
       ],
       "matches": ["https://www.youtube.com/*"]
     }

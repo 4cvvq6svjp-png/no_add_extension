@@ -22,7 +22,7 @@
         corePath: `${base}tesseract-core-simd.wasm.js`,
         langPath: "https://tessdata.projectnaptha.com/4.0.0",
         gzip: true,
-        workerBlobURL: true,
+        workerBlobURL: false,
         logger: () => {}
       })
         .then(async (worker) => {
