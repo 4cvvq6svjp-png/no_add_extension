@@ -12,6 +12,9 @@
   "action": {
     "default_title": "No Add Extension"
   },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
   "content_scripts": [
     {
       "matches": ["https://www.youtube.com/*"],
