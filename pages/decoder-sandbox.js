@@ -113,10 +113,19 @@
         const initBuffer = msg.initSegment;
         if (!(initBuffer instanceof ArrayBuffer)) throw new Error("initSegment must be ArrayBuffer");
 
-        const info = mp4.parseInitSegment(initBuffer);
-        if (!info) throw new Error("Failed to parse init segment");
+        const container = msg.container || "mp4";
+        const mime = msg.mime || "";
 
-        const timescale = mp4.parseTimescale(initBuffer);
+        let info, timescale;
+        if (container === "webm") {
+          info = mp4.parseWebMInitSegment(initBuffer, mime);
+          if (!info) throw new Error("Failed to parse WebM init segment");
+          timescale = info.timestampScale; // stored as ns scale
+        } else {
+          info = mp4.parseInitSegment(initBuffer);
+          if (!info) throw new Error("Failed to parse init segment");
+          timescale = mp4.parseTimescale(initBuffer);
+        }
 
         const config = {
           codec: info.codec,
@@ -135,9 +144,9 @@
 
         createDecoder();
         decoder.configure(config);
-        codecInfo = { ...info, timescale };
+        codecInfo = { ...info, timescale, container };
 
-        console.info(TAG, "Decoder configured:", info.codec, `${info.codedWidth}x${info.codedHeight}`, `timescale=${timescale}`);
+        console.info(TAG, "Decoder configured:", info.codec, `${info.codedWidth}x${info.codedHeight}`, container === "webm" ? `timestampScale=${timescale}` : `timescale=${timescale}`);
 
         reply({ type: "configure-ok", reqId, codec: info.codec, width: info.codedWidth, height: info.codedHeight, timescale });
       } catch (err) {
@@ -200,12 +209,17 @@
         const mediaBuffer = msg.mediaSegment;
         if (!(mediaBuffer instanceof ArrayBuffer)) throw new Error("mediaSegment must be ArrayBuffer");
 
-        const samples = mp4.parseMediaSegment(mediaBuffer, {
-          timescale: codecInfo.timescale,
-          defaultSampleDuration: 0,
-          defaultSampleSize: 0,
-          defaultSampleFlags: 0
-        });
+        let samples;
+        if (codecInfo.container === "webm") {
+          samples = mp4.parseWebMClusters(mediaBuffer, { timestampScale: codecInfo.timescale });
+        } else {
+          samples = mp4.parseMediaSegment(mediaBuffer, {
+            timescale: codecInfo.timescale,
+            defaultSampleDuration: 0,
+            defaultSampleSize: 0,
+            defaultSampleFlags: 0
+          });
+        }
 
         const minTime = msg.minTime ?? -Infinity;
         const sampleInterval = msg.sampleInterval ?? 5;

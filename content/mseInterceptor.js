@@ -30,7 +30,20 @@
 
   function isInitSegment(buffer) {
     const type = peekBoxType(buffer);
-    return type === "ftyp" || type === "moov";
+    if (type === "ftyp" || type === "moov") return true;
+    // WebM/Matroska: starts with EBML header magic 0x1A 0x45 0xDF 0xA3
+    if (buffer.byteLength >= 4) {
+      const view = new Uint8Array(buffer instanceof ArrayBuffer ? buffer : buffer.buffer, buffer.byteOffset ?? 0, 4);
+      if (view[0] === 0x1A && view[1] === 0x45 && view[2] === 0xDF && view[3] === 0xA3) return true;
+    }
+    return false;
+  }
+
+  function containerType(mimeOrBuffer) {
+    if (typeof mimeOrBuffer === "string") {
+      return mimeOrBuffer.startsWith("video/webm") ? "webm" : "mp4";
+    }
+    return "mp4";
   }
 
   function isVideoMime(mime) {
@@ -64,6 +77,7 @@
       post("init-segment", {
         data: lastInitSegment.data.slice(0),
         mime: lastInitSegment.mime,
+        container: lastInitSegment.container,
         timestampOffset: lastInitSegment.timestampOffset
       });
     }
@@ -136,11 +150,13 @@
         : new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)).buffer;
 
       if (isInitSegment(copy)) {
-        lastInitSegment = { data: copy, mime: meta.mime, timestampOffset: meta.timestampOffset };
+        const container = containerType(meta.mime);
+        lastInitSegment = { data: copy, mime: meta.mime, timestampOffset: meta.timestampOffset, container };
         pendingMediaSegments.length = 0; // Reset on new init
         post("init-segment", {
           data: copy.slice(0),
           mime: meta.mime,
+          container,
           timestampOffset: meta.timestampOffset
         });
       } else {

@@ -106,8 +106,7 @@
 
     // First sample entry starts at offset 8
     const entryView = new DataView(stsd.buffer, stsd.byteOffset + 8, stsd.byteLength - 8);
-    const entryBox = findBox(entryView, null); // any box type
-    // Actually iterate to get the first box regardless of type
+    // Iterate to get the first box regardless of type
     let sampleEntry = null;
     for (const box of iterateBoxes(entryView)) {
       sampleEntry = box;
@@ -436,15 +435,285 @@
   }
 
   /* ================================================================== */
-  /*  Formatting helpers                                                 */
+  /*  WebM / Matroska / EBML parser                                     */
   /* ================================================================== */
 
-  function hex(n) {
-    return n.toString(16).padStart(2, "0");
+  /**
+   * Read an EBML variable-length ID at `pos` in a Uint8Array.
+   * Returns { id, nextPos } or null on error.
+   */
+  function ebmlReadId(u8, pos) {
+    if (pos >= u8.length) return null;
+    const first = u8[pos];
+    if (first === 0) return null;
+    let width;
+    if      (first & 0x80) { width = 1; }
+    else if (first & 0x40) { width = 2; }
+    else if (first & 0x20) { width = 3; }
+    else if (first & 0x10) { width = 4; }
+    else                   { return null; }
+    if (pos + width > u8.length) return null;
+    let id = 0;
+    for (let i = 0; i < width; i++) id = (id * 256) + u8[pos + i];
+    return { id, nextPos: pos + width };
   }
 
-  function pad2(n) {
-    return String(n).padStart(2, "0");
+  /**
+   * Read an EBML variable-length data size at `pos` in a Uint8Array.
+   * Returns { size, nextPos } or null. size === -1 means "unknown/infinite".
+   */
+  function ebmlReadSize(u8, pos) {
+    if (pos >= u8.length) return null;
+    const first = u8[pos];
+    if (first === 0) return null;
+    let width;
+    let mask;
+    if      (first & 0x80) { width = 1; mask = 0x7F; }
+    else if (first & 0x40) { width = 2; mask = 0x3F; }
+    else if (first & 0x20) { width = 3; mask = 0x1F; }
+    else if (first & 0x10) { width = 4; mask = 0x0F; }
+    else if (first & 0x08) { width = 5; mask = 0x07; }
+    else if (first & 0x04) { width = 6; mask = 0x03; }
+    else if (first & 0x02) { width = 7; mask = 0x01; }
+    else if (first & 0x01) { width = 8; mask = 0x00; }
+    else                   { return null; }
+    if (pos + width > u8.length) return null;
+
+    // All-ones = unknown size
+    let allOnes = (u8[pos] & mask) === mask;
+    for (let i = 1; allOnes && i < width; i++) {
+      if (u8[pos + i] !== 0xFF) allOnes = false;
+    }
+    if (allOnes) return { size: -1, nextPos: pos + width };
+
+    let size = u8[pos] & mask;
+    for (let i = 1; i < width; i++) size = size * 256 + u8[pos + i];
+    return { size, nextPos: pos + width };
+  }
+
+  /**
+   * Read an unsigned integer from u8[pos..pos+len].
+   */
+  function ebmlReadUint(u8, pos, len) {
+    let val = 0;
+    for (let i = 0; i < len; i++) val = val * 256 + u8[pos + i];
+    return val;
+  }
+
+  /**
+   * Iterate top-level EBML elements within u8[start..end].
+   * Yields { id, dataPos, size } (does not recurse).
+   */
+  function* iterateEbml(u8, start, end) {
+    let pos = start;
+    while (pos < end) {
+      const idResult = ebmlReadId(u8, pos);
+      if (!idResult) break;
+      pos = idResult.nextPos;
+
+      const sizeResult = ebmlReadSize(u8, pos);
+      if (!sizeResult) break;
+      pos = sizeResult.nextPos;
+
+      const size = sizeResult.size;
+      const dataPos = pos;
+
+      yield { id: idResult.id, dataPos, size };
+
+      if (size === -1) break; // unknown size — can't skip
+      pos += size;
+    }
+  }
+
+  // Common EBML element IDs (Matroska spec)
+  const EBML_ID = {
+    EBML:          0x1A45DFA3,
+    Segment:       0x18538067,
+    Tracks:        0x1654AE6B,
+    TrackEntry:    0xAE,
+    TrackType:     0x83,
+    Video:         0xE0,
+    PixelWidth:    0xB0,
+    PixelHeight:   0xBA,
+    Info:          0x1549A966,
+    TimestampScale:0x2AD7B1,
+    Cluster:       0x1F43B675,
+    Timestamp:     0xE7,   // inside Cluster
+    SimpleBlock:   0xA3,
+  };
+
+  /**
+   * Parse a WebM init segment (EBML header + Segment + Tracks).
+   * Returns { codec, codedWidth, codedHeight, description: null, timestampScale, container: "webm" }
+   * codec is extracted from the MIME string (most reliable for WebM).
+   */
+  function parseWebMInitSegment(buffer, mimeString) {
+    const u8 = new Uint8Array(buffer);
+    let codedWidth = 0;
+    let codedHeight = 0;
+    let timestampScale = 1000000; // default: 1ms per unit → timestamps in ns/timestampScale
+
+    // Extract codec from MIME string (e.g. 'video/webm; codecs="vp09.00.51.08..."')
+    let codec = "vp8"; // fallback
+    if (mimeString) {
+      const m = mimeString.match(/codecs\s*=\s*"?([^";,]+)/i);
+      if (m) {
+        const c = m[1].trim().toLowerCase();
+        if (c.startsWith("vp09") || c.startsWith("vp9")) codec = c.startsWith("vp09") ? c : "vp09.00.41.08";
+        else if (c.startsWith("vp8"))  codec = "vp8";
+        else if (c.startsWith("av01")) codec = c;
+        else if (c.startsWith("vp0")) codec = c;
+        else codec = c;
+      }
+    }
+
+    // Walk EBML structure to find Segment > Info (TimestampScale) and Tracks (dimensions)
+    let pos = 0;
+    while (pos < u8.length) {
+      const idResult = ebmlReadId(u8, pos);
+      if (!idResult) break;
+      const sizeResult = ebmlReadSize(u8, idResult.nextPos);
+      if (!sizeResult) break;
+      const dataPos = sizeResult.nextPos;
+      const size = sizeResult.size;
+      const end = size === -1 ? u8.length : dataPos + size;
+
+      if (idResult.id === EBML_ID.Segment) {
+        // Inside Segment, look for Info and Tracks
+        for (const el of iterateEbml(u8, dataPos, Math.min(end, u8.length))) {
+          if (el.id === EBML_ID.Info) {
+            // Look for TimestampScale
+            const infoEnd = el.size === -1 ? Math.min(end, u8.length) : el.dataPos + el.size;
+            for (const sub of iterateEbml(u8, el.dataPos, infoEnd)) {
+              if (sub.id === EBML_ID.TimestampScale && sub.size > 0 && sub.size <= 8) {
+                timestampScale = ebmlReadUint(u8, sub.dataPos, sub.size);
+              }
+            }
+          } else if (el.id === EBML_ID.Tracks) {
+            const tracksEnd = el.size === -1 ? Math.min(end, u8.length) : el.dataPos + el.size;
+            for (const te of iterateEbml(u8, el.dataPos, tracksEnd)) {
+              if (te.id === EBML_ID.TrackEntry) {
+                const teEnd = te.size === -1 ? tracksEnd : te.dataPos + te.size;
+                let trackType = 0;
+                let pixelW = 0, pixelH = 0;
+                for (const tf of iterateEbml(u8, te.dataPos, teEnd)) {
+                  if (tf.id === EBML_ID.TrackType && tf.size <= 4) {
+                    trackType = ebmlReadUint(u8, tf.dataPos, tf.size);
+                  } else if (tf.id === EBML_ID.Video) {
+                    const vidEnd = tf.size === -1 ? teEnd : tf.dataPos + tf.size;
+                    for (const vf of iterateEbml(u8, tf.dataPos, vidEnd)) {
+                      if (vf.id === EBML_ID.PixelWidth  && vf.size <= 4) pixelW = ebmlReadUint(u8, vf.dataPos, vf.size);
+                      if (vf.id === EBML_ID.PixelHeight && vf.size <= 4) pixelH = ebmlReadUint(u8, vf.dataPos, vf.size);
+                    }
+                  }
+                }
+                if (trackType === 1 && pixelW > 0) { // type 1 = video
+                  codedWidth = pixelW;
+                  codedHeight = pixelH;
+                  break;
+                }
+              }
+            }
+          }
+          if (codedWidth > 0 && timestampScale !== 1000000) break; // found both
+        }
+        break; // only one Segment
+      }
+
+      pos = end;
+    }
+
+    return { codec, codedWidth, codedHeight, description: null, timestampScale, container: "webm" };
+  }
+
+  /**
+   * Parse WebM Cluster elements from a media segment (or the tail of an init segment).
+   * Returns an array of { data, timestamp, duration, isKeyframe }.
+   * timestamp is in seconds.
+   *
+   * @param {ArrayBuffer} buffer
+   * @param {{ timestampScale: number }} initInfo
+   */
+  function parseWebMClusters(buffer, initInfo = {}) {
+    const u8 = new Uint8Array(buffer);
+    const timestampScale = initInfo.timestampScale || 1000000; // ns per unit
+    const samples = [];
+
+    // Find all Cluster elements at the top level (or inside Segment)
+    // YouTube WebM segments often start directly with a Cluster
+    let searchStart = 0;
+
+    // Check if buffer starts with EBML header — if so, skip to Segment content
+    const firstIdResult = ebmlReadId(u8, 0);
+    if (firstIdResult && firstIdResult.id === EBML_ID.EBML) {
+      const firstSizeResult = ebmlReadSize(u8, firstIdResult.nextPos);
+      if (firstSizeResult) {
+        searchStart = firstSizeResult.nextPos + firstSizeResult.size;
+        // Now skip Segment header
+        const segIdResult = ebmlReadId(u8, searchStart);
+        if (segIdResult && segIdResult.id === EBML_ID.Segment) {
+          const segSizeResult = ebmlReadSize(u8, segIdResult.nextPos);
+          if (segSizeResult) searchStart = segSizeResult.nextPos;
+        }
+      }
+    }
+
+    for (const el of iterateEbml(u8, searchStart, u8.length)) {
+      if (el.id !== EBML_ID.Cluster) continue;
+
+      const clusterEnd = el.size === -1 ? u8.length : el.dataPos + el.size;
+      let clusterTimestamp = 0;
+
+      // First pass: read Cluster Timestamp
+      for (const ce of iterateEbml(u8, el.dataPos, clusterEnd)) {
+        if (ce.id === EBML_ID.Timestamp && ce.size <= 8) {
+          clusterTimestamp = ebmlReadUint(u8, ce.dataPos, ce.size);
+          break;
+        }
+      }
+
+      // Second pass: read SimpleBlocks
+      for (const ce of iterateEbml(u8, el.dataPos, clusterEnd)) {
+        if (ce.id !== EBML_ID.SimpleBlock) continue;
+        if (ce.size < 4) continue;
+
+        // SimpleBlock layout:
+        //   track number: VINT
+        //   int16: relative timecode (big-endian)
+        //   flags: 1 byte
+        //   frame data: rest
+
+        const sbPos = ce.dataPos;
+        const sbEnd = ce.dataPos + ce.size;
+
+        const trackResult = ebmlReadSize(u8, sbPos); // track# encoded as VINT (same encoding as size)
+        if (!trackResult) continue;
+
+        const relTimecodePos = trackResult.nextPos;
+        if (relTimecodePos + 3 > sbEnd) continue;
+
+        // signed int16 relative timecode
+        const relTimecode = (u8[relTimecodePos] << 8 | u8[relTimecodePos + 1]) << 16 >> 16;
+        const flags = u8[relTimecodePos + 2];
+        const isKeyframe = Boolean(flags & 0x80);
+        const frameDataPos = relTimecodePos + 3;
+        const frameSize = sbEnd - frameDataPos;
+        if (frameSize <= 0) continue;
+
+        // timestamp in seconds: (clusterTimestamp + relTimecode) * timestampScale / 1e9
+        const absoluteTimecode = clusterTimestamp + relTimecode;
+        const timestampSeconds = (absoluteTimecode * timestampScale) / 1_000_000_000;
+
+        samples.push({
+          data: buffer.slice(frameDataPos, frameDataPos + frameSize),
+          timestamp: timestampSeconds,
+          duration: 0, // WebM SimpleBlock doesn't carry duration per-frame
+          isKeyframe
+        });
+      }
+    }
+
+    return samples;
   }
 
   /* ================================================================== */
@@ -452,7 +721,7 @@
   /* ================================================================== */
 
   // Make available globally for use in iframe sandboxes or content scripts.
-  const mp4demux = { parseInitSegment, parseMediaSegment, parseTimescale };
+  const mp4demux = { parseInitSegment, parseMediaSegment, parseTimescale, parseWebMInitSegment, parseWebMClusters };
 
   if (typeof globalThis !== "undefined") {
     globalThis.__mp4demux = mp4demux;

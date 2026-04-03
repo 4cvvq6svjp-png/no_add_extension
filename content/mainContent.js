@@ -948,24 +948,30 @@
       }
 
       if (msg.type === "init-segment") {
-        this.initSegment = msg.data;
-        this.decoderConfigured = false;
-        this.useFallback = false;
-
+        // Cancel fallback timeout — we have MSE data
         if (this.fallbackTimeout !== null) {
           window.clearTimeout(this.fallbackTimeout);
           this.fallbackTimeout = null;
         }
+
+        logInfo("AheadScanner: init segment capturé", {
+          bytes: msg.data?.byteLength,
+          mime: msg.mime,
+          container: msg.container
+        });
+
+        this.initSegment = msg.data;
+        this.initSegmentContainer = msg.container || "mp4";
+        this.initSegmentMime = msg.mime || "";
+        this.decoderConfigured = false;
+        this.useFallback = false;
+
         if (this.fallbackInterval !== null) {
           window.clearInterval(this.fallbackInterval);
           this.fallbackInterval = null;
         }
 
         this.ocrSourceTag = "ahead-ocr";
-        logInfo("AheadScanner: init segment capturé", {
-          bytes: msg.data?.byteLength,
-          mime: msg.mime
-        });
         return;
       }
 
@@ -1085,9 +1091,12 @@
       if (!this.decoderIframe) return false;
 
       try {
+        const initCopy = this.initSegment.slice(0);
         await this.decoderRequest("configure", {
-          initSegment: this.initSegment.slice(0)
-        }, [this.initSegment.slice(0)]);
+          initSegment: initCopy,
+          container: this.initSegmentContainer,
+          mime: this.initSegmentMime
+        }, [initCopy]);
         this.decoderConfigured = true;
         logInfo("AheadScanner: decoder configuré.");
         return true;
