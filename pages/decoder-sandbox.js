@@ -26,8 +26,8 @@
   let pendingDecode = null; // { resolve, reject, timeout }
   let codecInfo = null;
 
-  function reply(payload) {
-    window.parent.postMessage({ channel: CHANNEL, ...payload }, "*");
+  function reply(payload, transfer) {
+    window.parent.postMessage({ channel: CHANNEL, ...payload }, "*", transfer ?? []);
   }
 
   function formatErr(error) {
@@ -188,6 +188,85 @@
       return;
     }
 
+    /* ----- scan-segment: parse media segment + decode keyframes ----- */
+    if (msg.type === "scan-segment") {
+      try {
+        if (!mp4) throw new Error("mp4demux not loaded");
+        if (!decoder || decoder.state !== "configured") {
+          throw new Error("Decoder not configured");
+        }
+        if (!codecInfo) throw new Error("No codec info");
+
+        const mediaBuffer = msg.mediaSegment;
+        if (!(mediaBuffer instanceof ArrayBuffer)) throw new Error("mediaSegment must be ArrayBuffer");
+
+        const samples = mp4.parseMediaSegment(mediaBuffer, {
+          timescale: codecInfo.timescale,
+          defaultSampleDuration: 0,
+          defaultSampleSize: 0,
+          defaultSampleFlags: 0
+        });
+
+        const minTime = msg.minTime ?? -Infinity;
+        const sampleInterval = msg.sampleInterval ?? 5;
+
+        // Filter to keyframes beyond minTime, spaced by sampleInterval
+        const keyframes = [];
+        let lastKfTime = -Infinity;
+        for (const s of samples) {
+          if (s.isKeyframe && s.timestamp > minTime && s.timestamp > lastKfTime + sampleInterval) {
+            keyframes.push(s);
+            lastKfTime = s.timestamp;
+          }
+        }
+
+        // Decode each keyframe and collect bitmaps
+        const results = [];
+        for (const kf of keyframes) {
+          try {
+            const chunk = new EncodedVideoChunk({
+              type: "key",
+              timestamp: Math.round(kf.timestamp * 1_000_000),
+              duration: kf.duration ? Math.round(kf.duration * 1_000_000) : undefined,
+              data: kf.data
+            });
+
+            const bitmapPromise = new Promise((resolve, reject) => {
+              const timeout = setTimeout(() => {
+                resolvePending(null, new Error("decode timeout"));
+              }, 10000);
+              pendingDecode = { resolve, reject, timeout };
+            });
+
+            decoder.decode(chunk);
+            await decoder.flush();
+
+            const bitmap = await bitmapPromise;
+            if (bitmap) {
+              results.push({ timestamp: kf.timestamp, duration: kf.duration, imageBitmap: bitmap });
+            }
+          } catch {
+            // Skip failed frames, continue with the rest
+          }
+        }
+
+        // Transfer all bitmaps back
+        const transferList = results.map((r) => r.imageBitmap);
+        reply({
+          type: "scan-segment-ok",
+          reqId,
+          frames: results.map((r) => ({
+            timestamp: r.timestamp,
+            duration: r.duration,
+            imageBitmap: r.imageBitmap
+          }))
+        }, transferList);
+      } catch (err) {
+        reply({ type: "scan-segment-err", reqId, error: formatErr(err) });
+      }
+      return;
+    }
+
     /* ----- reset ----- */
     if (msg.type === "reset") {
       destroyDecoder();
@@ -201,12 +280,6 @@
       reply({ type: "terminate-ok", reqId });
     }
   });
-
-  // Fix reply to support transferable
-  const origReply = reply;
-  reply = function (payload, transfer) {
-    window.parent.postMessage({ channel: CHANNEL, ...payload }, "*", transfer ?? []);
-  };
 
   // Signal readiness
   window.parent.postMessage({ channel: CHANNEL, type: "sandbox-ready" }, "*");

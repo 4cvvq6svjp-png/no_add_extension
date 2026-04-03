@@ -448,6 +448,19 @@
       return this.ocrBackend ?? "none";
     }
 
+    /**
+     * Copy the top portion of the full-frame canvas into the smaller ROI
+     * canvas.  This dramatically reduces the pixel count sent to Tesseract
+     * since the "collaboration commerciale" overlay always appears at the top.
+     */
+    prepareRoiCanvas() {
+      this.roiCtx.drawImage(
+        this.canvas,
+        0, 0, this.canvas.width, this.roiHeight,   // source rect
+        0, 0, this.roiCanvas.width, this.roiHeight  // dest rect
+      );
+    }
+
     async ensureOcrIframe() {
       if (this.ocrIframe?.isConnected) {
         return;
@@ -656,7 +669,8 @@
 
     async detectWithTextDetector(sampleTime) {
       try {
-        const blocks = await this.textDetector.detect(this.canvas);
+        this.prepareRoiCanvas();
+        const blocks = await this.textDetector.detect(this.roiCanvas);
         const extractedText = blocks
           .map((block) => block?.rawValue ?? "")
           .filter(Boolean)
@@ -689,6 +703,44 @@
     }
 
     async detectWithTesseract(sampleTime) {
+      // Fast path: if TextDetector is also available, use it as a quick
+      // pre-filter (~10ms).  If it finds no text at all in the ROI, skip
+      // the expensive Tesseract call entirely.
+      if (this.textDetector) {
+        try {
+          this.prepareRoiCanvas();
+          const blocks = await this.textDetector.detect(this.roiCanvas);
+          if (!blocks || blocks.length === 0) {
+            return {
+              sampleTime,
+              hasCommercialKeyword: false,
+              matchedKeywords: [],
+              source: "text-detector-prefilter-empty"
+            };
+          }
+
+          // TextDetector found text — check if it already matches keywords
+          const quickText = blocks
+            .map((b) => b?.rawValue ?? "")
+            .filter(Boolean)
+            .join(" ");
+          const quickMatch = extractCommercialKeywords(quickText);
+          if (quickMatch.length > 0) {
+            return {
+              sampleTime,
+              hasCommercialKeyword: true,
+              matchedKeywords: quickMatch,
+              source: "text-detector-prefilter",
+              extractedText: quickText
+            };
+          }
+          // Text found but no keyword match — fall through to Tesseract
+          // for more accurate OCR (TextDetector can miss accented chars).
+        } catch {
+          // TextDetector failed, fall through to Tesseract.
+        }
+      }
+
       const bridge = await this.ensureTesseractBridge();
       if (!bridge) {
         return {
@@ -702,7 +754,9 @@
       let bitmap = null;
 
       try {
-        bitmap = await createImageBitmap(this.canvas);
+        // Use the smaller ROI canvas for Tesseract (top 25% of frame)
+        this.prepareRoiCanvas();
+        bitmap = await createImageBitmap(this.roiCanvas);
         const result = await this.iframeOcrRequest(
           "recognize",
           { imageBitmap: bitmap },
@@ -1058,70 +1112,52 @@
         if (!configured) return;
 
         // Find the next unscanned segment
-        const segmentEntry = this.capturedSegments.find((entry) => {
-          return !entry.scanned;
-        });
-
+        const segmentEntry = this.capturedSegments.find((entry) => !entry.scanned);
         if (!segmentEntry) return;
 
-        // Parse the media segment to find keyframes
-        let timescale = 90000;
-        try {
-          const mp4 = window.__mp4demux;
-          if (mp4) {
-            timescale = mp4.parseTimescale(this.initSegment);
-          }
-        } catch { /* use default */ }
-
-        const mp4 = window.__mp4demux;
-        if (!mp4) {
-          segmentEntry.scanned = true;
-          return;
-        }
-
-        const samples = mp4.parseMediaSegment(segmentEntry.data, { timescale });
         segmentEntry.scanned = true;
 
-        // Only decode keyframes, and only those we haven’t scanned yet
-        const keyframes = samples.filter((s) =>
-          s.isKeyframe && s.timestamp > this.lastScannedTime + CONFIG.frameSampleSeconds
-        );
+        // Send the raw media segment to the decoder sandbox which handles
+        // both fMP4 parsing and keyframe decoding (mp4demux lives there).
+        const result = await this.decoderRequest("scan-segment", {
+          mediaSegment: segmentEntry.data,
+          minTime: this.lastScannedTime + CONFIG.frameSampleSeconds,
+          sampleInterval: CONFIG.frameSampleSeconds
+        }, [segmentEntry.data]);
 
-        for (const kf of keyframes) {
-          if (this.lastScannedTime >= kf.timestamp) continue;
+        if (!result.frames || result.frames.length === 0) return;
+
+        for (const frame of result.frames) {
+          if (!frame.imageBitmap) continue;
 
           try {
-            const result = await this.decoderRequest("decode", {
-              data: kf.data,
-              timestamp: kf.timestamp,
-              duration: kf.duration,
-              isKeyframe: true
-            }, [kf.data]);
+            const detection = await this.frameClassifier.detectFromBitmap(
+              frame.imageBitmap,
+              frame.timestamp
+            );
 
-            if (result.imageBitmap) {
-              const detection = await this.frameClassifier.detectFromBitmap(
-                result.imageBitmap,
-                kf.timestamp
-              );
+            try { frame.imageBitmap.close(); } catch { /* ignore */ }
 
-              try { result.imageBitmap.close(); } catch { /* ignore */ }
+            this.consumeDetection(detection);
+            this.lastScannedTime = frame.timestamp;
 
-              this.consumeDetection(detection);
-              this.lastScannedTime = kf.timestamp;
-
-              logInfo("AheadScanner: frame analysée", {
-                time: kf.timestamp.toFixed(1),
-                keyword: detection.hasCommercialKeyword,
-                lead: (kf.timestamp - this.mainVideo.currentTime).toFixed(1) + "s en avance"
-              });
-            }
+            logInfo("AheadScanner: frame analysée", {
+              time: frame.timestamp.toFixed(1),
+              keyword: detection.hasCommercialKeyword,
+              lead: (frame.timestamp - this.mainVideo.currentTime).toFixed(1) + "s en avance"
+            });
           } catch (error) {
-            logWarn("AheadScanner: échec décodage frame", {
-              time: kf.timestamp,
+            try { frame.imageBitmap.close(); } catch { /* ignore */ }
+            logWarn("AheadScanner: échec OCR sur frame décodée", {
+              time: frame.timestamp,
               error: formatErrorForLog(error)
             });
           }
         }
+      } catch (error) {
+        logWarn("AheadScanner: échec scan-segment", {
+          error: formatErrorForLog(error)
+        });
       } finally {
         this.pendingScan = false;
       }
