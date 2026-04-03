@@ -856,6 +856,9 @@
       // Listen for MSE intercepted data from MAIN world
       window.addEventListener("message", this.boundOnMseMessage);
 
+      // Request any segments already captured before we were ready (timing gap)
+      window.postMessage({ channel: MSE_CHANNEL, type: "request-replay" }, "*");
+
       // Periodic scan for new segments to process
       this.scanInterval = window.setInterval(
         () => void this.scanNext(),

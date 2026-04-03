@@ -48,6 +48,35 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /*  Buffer: keep last init + recent media segments for late listeners  */
+  /* ------------------------------------------------------------------ */
+
+  let lastInitSegment = null; // { data, mime, timestampOffset }
+  const pendingMediaSegments = []; // last N media segments before content script is ready
+  const MAX_PENDING = 20;
+
+  // Listen for "request-replay" from the ISOLATED world content script
+  window.addEventListener("message", (event) => {
+    const msg = event.data;
+    if (!msg || msg.channel !== CHANNEL || msg.type !== "request-replay") return;
+
+    if (lastInitSegment) {
+      post("init-segment", {
+        data: lastInitSegment.data.slice(0),
+        mime: lastInitSegment.mime,
+        timestampOffset: lastInitSegment.timestampOffset
+      });
+    }
+    for (const seg of pendingMediaSegments) {
+      post("media-segment", {
+        data: seg.data.slice(0),
+        mime: seg.mime,
+        timestampOffset: seg.timestampOffset
+      });
+    }
+  });
+
+  /* ------------------------------------------------------------------ */
   /*  Track which SourceBuffers carry video                              */
   /* ------------------------------------------------------------------ */
 
@@ -107,12 +136,18 @@
         : new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)).buffer;
 
       if (isInitSegment(copy)) {
+        lastInitSegment = { data: copy, mime: meta.mime, timestampOffset: meta.timestampOffset };
+        pendingMediaSegments.length = 0; // Reset on new init
         post("init-segment", {
-          data: copy,
+          data: copy.slice(0),
           mime: meta.mime,
           timestampOffset: meta.timestampOffset
         });
       } else {
+        pendingMediaSegments.push({ data: copy, mime: meta.mime, timestampOffset: meta.timestampOffset });
+        if (pendingMediaSegments.length > MAX_PENDING) {
+          pendingMediaSegments.shift();
+        }
         post("media-segment", {
           data: copy,
           mime: meta.mime,
@@ -132,6 +167,8 @@
   URL.createObjectURL = function patchedCreateObjectURL(obj) {
     const url = origCreateObjectURL.call(this, obj);
     if (obj instanceof MediaSource) {
+      lastInitSegment = null;
+      pendingMediaSegments.length = 0;
       post("new-media-source", { blobUrl: url });
     }
     return url;
