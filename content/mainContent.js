@@ -836,6 +836,7 @@
       this.lastScannedTime = -Infinity;
       this.pendingScan = false;
       this.scanInterval = null;
+      this.fallbackTimeout = null;
       this.fallbackInterval = null;
       this.useFallback = false;
 
