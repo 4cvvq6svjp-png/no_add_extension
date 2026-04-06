@@ -1092,10 +1092,14 @@
 
       try {
         const initCopy = this.initSegment.slice(0);
+        const fallbackWidth  = this.mainVideo?.videoWidth  || 0;
+        const fallbackHeight = this.mainVideo?.videoHeight || 0;
         await this.decoderRequest("configure", {
           initSegment: initCopy,
           container: this.initSegmentContainer,
-          mime: this.initSegmentMime
+          mime: this.initSegmentMime,
+          fallbackWidth,
+          fallbackHeight
         }, [initCopy]);
         this.decoderConfigured = true;
         logInfo("AheadScanner: decoder configuré.");

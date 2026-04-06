@@ -121,6 +121,22 @@
           info = mp4.parseWebMInitSegment(initBuffer, mime);
           if (!info) throw new Error("Failed to parse WebM init segment");
           timescale = info.timestampScale; // stored as ns scale
+          // Log what the EBML parser found (for debugging)
+          console.info(TAG, "WebM EBML parse result:", {
+            codec: info.codec, codedWidth: info.codedWidth, codedHeight: info.codedHeight,
+            timestampScale: info.timestampScale, bufferBytes: initBuffer.byteLength
+          });
+          // Fallback to video-element dimensions when EBML parsing misses them
+          if (info.codedWidth === 0 || info.codedHeight === 0) {
+            const fw = msg.fallbackWidth | 0;
+            const fh = msg.fallbackHeight | 0;
+            if (fw > 0 && fh > 0) {
+              console.warn(TAG, `WebM: EBML returned 0x0, using video-element fallback ${fw}x${fh}`);
+              info = { ...info, codedWidth: fw, codedHeight: fh };
+            } else {
+              throw new Error("WebM EBML parsing returned coded size (0, 0) and no fallback dimensions provided");
+            }
+          }
         } else {
           info = mp4.parseInitSegment(initBuffer);
           if (!info) throw new Error("Failed to parse init segment");
