@@ -514,27 +514,57 @@
 
   /**
    * Iterate top-level EBML elements within u8[start..end].
-   * Yields { id, dataPos, size } (does not recurse).
+   * Yields { id, dataPos, size }. Tolerates unknown-size (-1) elements by
+   * treating them as "extends to parent end" — the size yielded is normalized
+   * to a concrete byte count, and iteration ends after such an element since
+   * its boundary is unknowable without reaching the end of the parent.
    */
   function* iterateEbml(u8, start, end) {
     let pos = start;
     while (pos < end) {
       const idResult = ebmlReadId(u8, pos);
       if (!idResult) break;
-      pos = idResult.nextPos;
-
-      const sizeResult = ebmlReadSize(u8, pos);
+      const sizeResult = ebmlReadSize(u8, idResult.nextPos);
       if (!sizeResult) break;
-      pos = sizeResult.nextPos;
 
-      const size = sizeResult.size;
-      const dataPos = pos;
+      const dataPos = sizeResult.nextPos;
+      const rawSize = sizeResult.size;
+      const size = rawSize === -1 ? (end - dataPos) : rawSize;
 
       yield { id: idResult.id, dataPos, size };
 
-      if (size === -1) break; // unknown size — can't skip
-      pos += size;
+      if (rawSize === -1) break;
+      pos = dataPos + size;
     }
+  }
+
+  /**
+   * Find the first EBML element with a given ID inside [start, end).
+   * Walks element headers, descending past unknown-size containers without
+   * stopping. This is robust against streamed/unknown-size YouTube WebM init
+   * segments, where the size-driven hierarchy is unreliable.
+   */
+  function findEbml(u8, targetId, start, end) {
+    let pos = start;
+    while (pos < end) {
+      const idResult = ebmlReadId(u8, pos);
+      if (!idResult) { pos += 1; continue; }
+      const sizeResult = ebmlReadSize(u8, idResult.nextPos);
+      if (!sizeResult) { pos = idResult.nextPos; continue; }
+
+      const dataPos = sizeResult.nextPos;
+      const rawSize = sizeResult.size;
+
+      if (idResult.id === targetId) {
+        const size = rawSize === -1 ? (end - dataPos) : rawSize;
+        return { dataPos, size };
+      }
+
+      // Unknown-size element: step past header only and keep scanning so we
+      // can still find IDs that live inside it (e.g. Tracks inside Segment).
+      pos = rawSize === -1 ? dataPos : (dataPos + rawSize);
+    }
+    return null;
   }
 
   // Common EBML element IDs (Matroska spec)
@@ -557,97 +587,70 @@
   /**
    * Parse a WebM init segment (EBML header + Segment + Tracks).
    * Returns { codec, codedWidth, codedHeight, description: null, timestampScale, container: "webm" }
-   * codec is extracted from the MIME string (most reliable for WebM).
+   *
+   * The codec string comes from the MIME parameter — the EBML CodecID
+   * (`V_VP9`) is not a valid WebCodecs identifier.
+   *
+   * Dimensions and timestamp scale are located by flat-scanning the buffer
+   * for known IDs. This is intentional: YouTube delivers a streaming
+   * `Segment` with size = -1, so a strictly hierarchical walk cannot reliably
+   * descend into it. Flat scan is safe because EBML IDs are unique enough
+   * for the small set we care about.
    */
   function parseWebMInitSegment(buffer, mimeString) {
     const u8 = new Uint8Array(buffer);
-    let codedWidth = 0;
-    let codedHeight = 0;
-    let timestampScale = 1000000; // default: 1ms per unit → timestamps in ns/timestampScale
 
-    // Extract codec from MIME string (e.g. 'video/webm; codecs="vp09.00.51.08..."')
-    let codec = "vp8"; // fallback
+    let codec = "vp8";
     if (mimeString) {
       const m = mimeString.match(/codecs\s*=\s*"?([^";,]+)/i);
       if (m) {
         const c = m[1].trim().toLowerCase();
-        if (c.startsWith("vp09") || c.startsWith("vp9")) codec = c.startsWith("vp09") ? c : "vp09.00.41.08";
-        else if (c.startsWith("vp8"))  codec = "vp8";
-        else if (c.startsWith("av01")) codec = c;
-        else if (c.startsWith("vp0")) codec = c;
-        else codec = c;
-      }
-    }
-
-    // Walk EBML structure to find Segment > Info (TimestampScale) and Tracks (dimensions)
-    const TAG_EBML = "[mp4demux/WebM]";
-    console.info(TAG_EBML, "parseWebMInitSegment: buffer", u8.length, "bytes, mime:", mimeString);
-
-    let pos = 0;
-    while (pos < u8.length) {
-      const idResult = ebmlReadId(u8, pos);
-      if (!idResult) { console.warn(TAG_EBML, "outer: ebmlReadId failed at pos", pos); break; }
-      const sizeResult = ebmlReadSize(u8, idResult.nextPos);
-      if (!sizeResult) { console.warn(TAG_EBML, "outer: ebmlReadSize failed at pos", idResult.nextPos); break; }
-      const dataPos = sizeResult.nextPos;
-      const size = sizeResult.size;
-      const end = size === -1 ? u8.length : dataPos + size;
-
-      console.info(TAG_EBML, `outer element id=0x${idResult.id.toString(16)} size=${size} dataPos=${dataPos}`);
-
-      if (idResult.id === EBML_ID.Segment) {
-        // Inside Segment, look for Info and Tracks
-        for (const el of iterateEbml(u8, dataPos, Math.min(end, u8.length))) {
-          console.info(TAG_EBML, `  segment child id=0x${el.id.toString(16)} size=${el.size} dataPos=${el.dataPos}`);
-          if (el.id === EBML_ID.Info) {
-            // Look for TimestampScale
-            const infoEnd = el.size === -1 ? Math.min(end, u8.length) : el.dataPos + el.size;
-            for (const sub of iterateEbml(u8, el.dataPos, infoEnd)) {
-              if (sub.id === EBML_ID.TimestampScale && sub.size > 0 && sub.size <= 8) {
-                timestampScale = ebmlReadUint(u8, sub.dataPos, sub.size);
-                console.info(TAG_EBML, "  TimestampScale:", timestampScale);
-              }
-            }
-          } else if (el.id === EBML_ID.Tracks) {
-            const tracksEnd = el.size === -1 ? Math.min(end, u8.length) : el.dataPos + el.size;
-            for (const te of iterateEbml(u8, el.dataPos, tracksEnd)) {
-              console.info(TAG_EBML, `    TrackEntry? id=0x${te.id.toString(16)} size=${te.size}`);
-              if (te.id === EBML_ID.TrackEntry) {
-                const teEnd = te.size === -1 ? tracksEnd : te.dataPos + te.size;
-                let trackType = 0;
-                let pixelW = 0, pixelH = 0;
-                for (const tf of iterateEbml(u8, te.dataPos, teEnd)) {
-                  console.info(TAG_EBML, `      track field id=0x${tf.id.toString(16)} size=${tf.size}`);
-                  if (tf.id === EBML_ID.TrackType && tf.size <= 4) {
-                    trackType = ebmlReadUint(u8, tf.dataPos, tf.size);
-                    console.info(TAG_EBML, "      TrackType:", trackType);
-                  } else if (tf.id === EBML_ID.Video) {
-                    const vidEnd = tf.size === -1 ? teEnd : tf.dataPos + tf.size;
-                    for (const vf of iterateEbml(u8, tf.dataPos, vidEnd)) {
-                      console.info(TAG_EBML, `        video field id=0x${vf.id.toString(16)} size=${vf.size}`);
-                      if (vf.id === EBML_ID.PixelWidth  && vf.size <= 4) pixelW = ebmlReadUint(u8, vf.dataPos, vf.size);
-                      if (vf.id === EBML_ID.PixelHeight && vf.size <= 4) pixelH = ebmlReadUint(u8, vf.dataPos, vf.size);
-                    }
-                    console.info(TAG_EBML, "      Video dimensions:", pixelW, "x", pixelH);
-                  }
-                }
-                if (trackType === 1 && pixelW > 0) { // type 1 = video
-                  codedWidth = pixelW;
-                  codedHeight = pixelH;
-                  break;
-                }
-              }
-            }
-          }
-          if (codedWidth > 0 && timestampScale !== 1000000) break; // found both
+        if (c.startsWith("vp9") && !c.startsWith("vp09")) {
+          codec = "vp09.00.41.08";
+        } else {
+          codec = c;
         }
-        break; // only one Segment
       }
-
-      pos = end;
     }
 
-    console.info(TAG_EBML, "parseWebMInitSegment result:", codec, `${codedWidth}x${codedHeight}`, "tsScale:", timestampScale);
+    let timestampScale = 1000000;
+    const info = findEbml(u8, EBML_ID.Info, 0, u8.length);
+    if (info) {
+      const tsEl = findEbml(u8, EBML_ID.TimestampScale, info.dataPos, info.dataPos + info.size);
+      if (tsEl && tsEl.size > 0 && tsEl.size <= 8) {
+        timestampScale = ebmlReadUint(u8, tsEl.dataPos, tsEl.size);
+      }
+    }
+
+    let codedWidth = 0;
+    let codedHeight = 0;
+    const tracks = findEbml(u8, EBML_ID.Tracks, 0, u8.length);
+    if (tracks) {
+      const tracksEnd = tracks.dataPos + tracks.size;
+      let pos = tracks.dataPos;
+      while (pos < tracksEnd) {
+        const te = findEbml(u8, EBML_ID.TrackEntry, pos, tracksEnd);
+        if (!te) break;
+        const teEnd = te.dataPos + te.size;
+
+        const ttEl = findEbml(u8, EBML_ID.TrackType, te.dataPos, teEnd);
+        const trackType = (ttEl && ttEl.size > 0 && ttEl.size <= 4)
+          ? ebmlReadUint(u8, ttEl.dataPos, ttEl.size) : 0;
+
+        if (trackType === 1) {
+          const v = findEbml(u8, EBML_ID.Video, te.dataPos, teEnd);
+          if (v) {
+            const vEnd = v.dataPos + v.size;
+            const w = findEbml(u8, EBML_ID.PixelWidth, v.dataPos, vEnd);
+            const h = findEbml(u8, EBML_ID.PixelHeight, v.dataPos, vEnd);
+            if (w && w.size <= 4) codedWidth  = ebmlReadUint(u8, w.dataPos, w.size);
+            if (h && h.size <= 4) codedHeight = ebmlReadUint(u8, h.dataPos, h.size);
+          }
+          break;
+        }
+        pos = teEnd;
+      }
+    }
 
     return { codec, codedWidth, codedHeight, description: null, timestampScale, container: "webm" };
   }

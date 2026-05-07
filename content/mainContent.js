@@ -1091,17 +1091,31 @@
       await this.ensureDecoderIframe();
       if (!this.decoderIframe) return false;
 
+      // Snapshot init metadata; a new init-segment can arrive during the await
+      // (quality switch, ad insertion) and we must not mark the decoder as
+      // configured for stale bytes.
+      const initSnapshot = this.initSegment;
+      const containerSnapshot = this.initSegmentContainer;
+      const mimeSnapshot = this.initSegmentMime;
+
       try {
-        const initCopy = this.initSegment.slice(0);
+        const initCopy = initSnapshot.slice(0);
         const fallbackWidth  = this.mainVideo?.videoWidth  || 0;
         const fallbackHeight = this.mainVideo?.videoHeight || 0;
         await this.decoderRequest("configure", {
           initSegment: initCopy,
-          container: this.initSegmentContainer,
-          mime: this.initSegmentMime,
+          container: containerSnapshot,
+          mime: mimeSnapshot,
           fallbackWidth,
           fallbackHeight
         }, [initCopy]);
+
+        if (this.initSegment !== initSnapshot) {
+          // A newer init arrived during configure — leave decoderConfigured
+          // false so the next scanNext re-runs configure with the fresh data.
+          return false;
+        }
+
         this.decoderConfigured = true;
         logInfo("AheadScanner: decoder configuré.");
         return true;

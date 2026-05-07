@@ -137,18 +137,27 @@
   const origAppendBuffer = SourceBuffer.prototype.appendBuffer;
 
   SourceBuffer.prototype.appendBuffer = function patchedAppendBuffer(data) {
-    // Call original first so we never break playback.
+    const meta = sbMeta.get(this);
+
+    // Copy BEFORE handing to the browser. appendBuffer may take ownership of
+    // a transferable buffer and detach it asynchronously, after which our
+    // copy attempt would silently fail.
+    let copy = null;
+    if (meta?.isVideo) {
+      try {
+        copy = (data instanceof ArrayBuffer)
+          ? data.slice(0)
+          : new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)).buffer;
+      } catch {
+        copy = null;
+      }
+    }
+
     origAppendBuffer.call(this, data);
 
-    const meta = sbMeta.get(this);
-    if (!meta?.isVideo) return;
+    if (!copy) return;
 
     try {
-      // Copy the buffer — YouTube may detach or reuse it.
-      const copy = (data instanceof ArrayBuffer)
-        ? data.slice(0)
-        : new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)).buffer;
-
       if (isInitSegment(copy)) {
         const container = containerType(meta.mime);
         lastInitSegment = { data: copy, mime: meta.mime, timestampOffset: meta.timestampOffset, container };
