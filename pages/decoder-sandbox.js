@@ -243,15 +243,31 @@
         // Filter to keyframes beyond minTime, spaced by sampleInterval
         const keyframes = [];
         let lastKfTime = -Infinity;
+        let totalKeyframes = 0;
+        let firstSampleTs = null;
+        let lastSampleTs = null;
         for (const s of samples) {
+          if (firstSampleTs === null) firstSampleTs = s.timestamp;
+          lastSampleTs = s.timestamp;
+          if (s.isKeyframe) totalKeyframes += 1;
           if (s.isKeyframe && s.timestamp > minTime && s.timestamp > lastKfTime + sampleInterval) {
             keyframes.push(s);
             lastKfTime = s.timestamp;
           }
         }
 
+        console.info(TAG, "scan-segment parse:", {
+          samples: samples.length,
+          keyframesTotal: totalKeyframes,
+          keyframesKept: keyframes.length,
+          minTime: Number.isFinite(minTime) ? minTime.toFixed(2) : minTime,
+          tsRange: firstSampleTs !== null ? `${firstSampleTs.toFixed(2)}..${lastSampleTs.toFixed(2)}` : "(empty)",
+          container: codecInfo.container
+        });
+
         // Decode each keyframe and collect bitmaps
         const results = [];
+        let decodeFailures = 0;
         for (const kf of keyframes) {
           try {
             const chunk = new EncodedVideoChunk({
@@ -274,10 +290,17 @@
             const bitmap = await bitmapPromise;
             if (bitmap) {
               results.push({ timestamp: kf.timestamp, duration: kf.duration, imageBitmap: bitmap });
+            } else {
+              decodeFailures += 1;
             }
-          } catch {
-            // Skip failed frames, continue with the rest
+          } catch (err) {
+            decodeFailures += 1;
+            console.warn(TAG, "keyframe decode failed", { ts: kf.timestamp, err: formatErr(err) });
           }
+        }
+
+        if (decodeFailures > 0) {
+          console.warn(TAG, `scan-segment: ${decodeFailures}/${keyframes.length} keyframes failed to decode`);
         }
 
         // Transfer all bitmaps back

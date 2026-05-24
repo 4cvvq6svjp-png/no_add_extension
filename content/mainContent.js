@@ -845,6 +845,13 @@
       this.configureFailures = 0;
       this.configureFailedInit = null;
 
+      // Diagnostic counters
+      this.totalMediaSegmentsReceived = 0;
+      this.totalScans = 0;
+      this.totalFramesDecoded = 0;
+      this.totalOcrMatches = 0;
+      this.heartbeatInterval = null;
+
       // Bound listener
       this.boundOnMseMessage = (event) => this.onMseMessage(event);
     }
@@ -880,6 +887,37 @@
           this.startFallbackPolling();
         }
       }, 8000);
+
+      // Diagnostic heartbeat: snapshot of pipeline state every 5s.
+      this.heartbeatInterval = window.setInterval(() => this.logHeartbeat(), 5000);
+    }
+
+    logHeartbeat() {
+      const unscanned = this.capturedSegments.filter((e) => !e.scanned).length;
+      const currentTime = Number(this.mainVideo?.currentTime ?? 0);
+      const buffered = this.mainVideo?.buffered;
+      let bufferedAhead = 0;
+      if (buffered && buffered.length > 0) {
+        for (let i = 0; i < buffered.length; i++) {
+          if (buffered.start(i) <= currentTime && currentTime <= buffered.end(i)) {
+            bufferedAhead = buffered.end(i) - currentTime;
+            break;
+          }
+        }
+      }
+      logInfo("AheadScanner heartbeat", {
+        currentTime: currentTime.toFixed(1),
+        bufferedAhead: bufferedAhead.toFixed(1) + "s",
+        decoderConfigured: this.decoderConfigured,
+        useFallback: this.useFallback,
+        capturedSegments: `${this.capturedSegments.length} (${unscanned} non scannés)`,
+        mediaSegmentsReceived: this.totalMediaSegmentsReceived,
+        scansRun: this.totalScans,
+        framesDecoded: this.totalFramesDecoded,
+        ocrMatches: this.totalOcrMatches,
+        storeSize: this.segmentStore?.segments?.length ?? 0,
+        lastScannedTime: Number.isFinite(this.lastScannedTime) ? this.lastScannedTime.toFixed(1) : "-"
+      });
     }
 
     stop() {
@@ -898,6 +936,11 @@
       if (this.fallbackInterval !== null) {
         window.clearInterval(this.fallbackInterval);
         this.fallbackInterval = null;
+      }
+
+      if (this.heartbeatInterval !== null) {
+        window.clearInterval(this.heartbeatInterval);
+        this.heartbeatInterval = null;
       }
 
       // Flush pending commercial segment
@@ -991,6 +1034,7 @@
           timestampOffset: msg.timestampOffset ?? 0,
           receivedAt: Date.now()
         });
+        this.totalMediaSegmentsReceived += 1;
 
         // Evict old segments (behind main video position - 10s)
         this.evictOldSegments();
@@ -1171,16 +1215,26 @@
         if (!segmentEntry) return;
 
         segmentEntry.scanned = true;
+        this.totalScans += 1;
 
+        const minTime = this.lastScannedTime + CONFIG.frameSampleSeconds;
         // Send the raw media segment to the decoder sandbox which handles
         // both fMP4 parsing and keyframe decoding (mp4demux lives there).
         const result = await this.decoderRequest("scan-segment", {
           mediaSegment: segmentEntry.data,
-          minTime: this.lastScannedTime + CONFIG.frameSampleSeconds,
+          minTime,
           sampleInterval: CONFIG.frameSampleSeconds
         }, [segmentEntry.data]);
 
-        if (!result.frames || result.frames.length === 0) return;
+        const frameCount = result.frames?.length ?? 0;
+        this.totalFramesDecoded += frameCount;
+        if (frameCount === 0) {
+          logInfo("AheadScanner: scan-segment OK mais aucune keyframe utile", {
+            minTime: Number.isFinite(minTime) ? minTime.toFixed(1) : "-",
+            bufferBytes: segmentEntry.data?.byteLength ?? 0
+          });
+          return;
+        }
 
         for (const frame of result.frames) {
           if (!frame.imageBitmap) continue;
@@ -1195,10 +1249,14 @@
 
             this.consumeDetection(detection);
             this.lastScannedTime = frame.timestamp;
+            if (detection.hasCommercialKeyword) this.totalOcrMatches += 1;
 
             logInfo("AheadScanner: frame analysée", {
               time: frame.timestamp.toFixed(1),
               keyword: detection.hasCommercialKeyword,
+              matched: detection.matchedKeywords,
+              ocrSource: detection.source,
+              textPreview: (detection.extractedText ?? "").slice(0, 80),
               lead: (frame.timestamp - this.mainVideo.currentTime).toFixed(1) + "s en avance"
             });
           } catch (error) {
@@ -1301,6 +1359,7 @@
       this.notifier = notifier;
       this.interval = null;
       this.lastSkipAt = 0;
+      this.lastDiagnosticLogAt = 0;
       this.boundTick = () => this.tick();
     }
 
@@ -1329,6 +1388,21 @@
       const currentTime = Number(this.video.currentTime ?? 0);
       const segment = this.segmentStore.findSegmentForTime(currentTime);
       if (!segment) {
+        // Throttled diagnostic: if we have stored segments but none match the
+        // current time, log the gap once every 10s so we can tell whether
+        // detections are ahead/behind playback or simply miss the range.
+        const store = this.segmentStore.segments;
+        if (store && store.length > 0 && nowMs - this.lastDiagnosticLogAt > 10000) {
+          this.lastDiagnosticLogAt = nowMs;
+          const summary = store.slice(0, 3).map((s) =>
+            `[${s.start.toFixed(1)}..${s.end.toFixed(1)} ${s.source}]`
+          ).join(" ");
+          logInfo("SkipController: aucun segment ne couvre currentTime", {
+            currentTime: currentTime.toFixed(1),
+            storeSize: store.length,
+            firstSegments: summary
+          });
+        }
         return;
       }
 

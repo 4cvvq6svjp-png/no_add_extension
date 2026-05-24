@@ -253,12 +253,15 @@ WebM is used by Chromium on Linux for VP9 streams. It uses the EBML binary forma
 
 ### 7. Platform Differences
 
-| Platform | Codec | Container | Parser used |
-|----------|-------|-----------|-------------|
-| Windows / Mac (YouTube) | H.264 (`avc1`) | fMP4 | `parseInitSegment` + `parseMediaSegment` |
-| Linux (YouTube) | VP9 (`vp09`) | WebM | `parseWebMInitSegment` + `parseWebMClusters` |
+| Platform | Codec (observed) | Container | Parser used |
+|----------|------------------|-----------|-------------|
+| Windows / Mac (YouTube) | H.264 (`avc1`) or AV1 (`av01`) | fMP4 | `parseInitSegment` + `parseMediaSegment` |
+| Linux (YouTube) — historically | VP9 (`vp09`) | WebM | `parseWebMInitSegment` + `parseWebMClusters` |
+| Linux (YouTube) — now common | **AV1 (`av01`) in fMP4** | fMP4 | `parseInitSegment` + `parseMediaSegment` |
 
 The MIME type of the `SourceBuffer` is used by the interceptor to determine container type (`video/webm` → WebM, anything else → fMP4).
+
+**Update (2026-05-24):** YouTube has rolled out AV1 in fMP4 to Linux clients as well, so the fMP4 + AV1 path is now the primary code path on every desktop platform observed. The WebM/VP9 path still exists for older streams or fallback ABR selections, but is no longer the default on Linux. This is why correctness of the AV1 codec string emitted by `parseAv1C` is critical (see §11).
 
 ---
 
@@ -329,6 +332,8 @@ All tuneable constants are in the `CONFIG` object at the top of `mainContent.js`
 
 | Issue | Severity | Status |
 |-------|----------|--------|
+| AV1 codec string emitted by `parseAv1C` was malformed (`av01.P.LLT.BB.CCC` instead of `av01.P.LLT.BB.M.CCC`) — `VideoDecoder.isConfigSupported` rejected every AV1 stream | ~~High~~ | **Fixed.** `parseAv1C` now reads `chroma_sample_position` and emits the proper monochrome digit + 3-digit chroma triplet per ISO BMFF. Critical because YouTube now ships AV1/fMP4 on Linux (see §7). |
+| `AheadScanner` re-attempted `configure` every 1.2 s indefinitely when the platform genuinely lacked a decoder, flooding the console | Medium | **Fixed.** `ensureDecoderConfigured` tracks failures per init segment; after 3 failures on the same init it pins `configureFailedInit`, switches `useFallback = true`, and starts the main-video OCR poller. Counters reset on every new init segment. |
 | WebM coded size returns (0, 0) from EBML parser | ~~High~~ | **Fixed.** Root cause was `iterateEbml` breaking on the streaming `Segment` element (size = -1). Replaced with `findEbml`, a flat-scan helper that descends past unknown-size containers. The `videoWidth/videoHeight` fallback remains as a safety net. |
 | Buffer copy in `mseInterceptor` happened after `origAppendBuffer` | High | **Fixed.** Copy is now performed before the original call, so the MSE implementation cannot detach a transferable buffer out from under us. |
 | Configure race: stale init bytes if quality switch happens during configure round-trip | Medium | **Fixed.** `ensureDecoderConfigured` snapshots `initSegment` and re-checks identity after the await; if a fresher init arrived, `decoderConfigured` stays false and the next scan tick reconfigures. |
@@ -341,6 +346,26 @@ All tuneable constants are in the `CONFIG` object at the top of `mainContent.js`
 | YouTube could change its SourceBuffer MIME patterns | External risk | The `isVideoMime()` heuristic (`avc`, `vp0`, `av01`) may miss new codecs |
 | `TextDetector` API is not available on all Chromium builds | Platform | Gracefully falls back to Tesseract; performance degrades significantly |
 | AV1 (`av01`) on WebM is not handled | Medium | Only fMP4 AV1 is implicitly handled; AV1-in-WebM would need a new EBML codec path |
+
+---
+
+### 11bis. Diagnostics & Logging
+
+To make end-to-end pipeline failures debuggable from the DevTools console alone, the following structured logs are emitted (all prefixed `[NoAddExtension]`, `[NoAdd-MSE]`, or `[NoAdd-Decoder]`):
+
+| Source | Cadence | Log | What it tells you |
+|--------|---------|-----|-------------------|
+| `mseInterceptor` | every 5 s, throttled | `media-segments: N reçus, K KB cumulés` | YouTube is feeding fMP4/WebM data into MSE and we are observing it. Silence here means the MSE patch never engaged. |
+| `mseInterceptor` | once per stream | `Video SourceBuffer registered <mime>` | The MIME (and therefore codec/container) YouTube selected for this video. |
+| `AheadScanner` | every 5 s | `AheadScanner heartbeat { currentTime, bufferedAhead, decoderConfigured, useFallback, capturedSegments, mediaSegmentsReceived, scansRun, framesDecoded, ocrMatches, storeSize, lastScannedTime }` | One-line snapshot of the entire pipeline state. The single most useful log for triage: it tells you whether segments are arriving, whether the decoder is configured, whether scans are running, and whether OCR has matched anything. |
+| `decoder-sandbox` | once per `scan-segment` | `scan-segment parse: { samples, keyframesTotal, keyframesKept, minTime, tsRange, container }` | Whether the demuxer found any samples at all, how many were keyframes, and how many survived the `minTime`/`sampleInterval` filter. `keyframesKept = 0` while `keyframesTotal > 0` means the filter is too aggressive for this segment. |
+| `decoder-sandbox` | per failed keyframe | `keyframe decode failed { ts, err }` + summary `N/M keyframes failed to decode` | WebCodecs decoder errors on specific frames (corrupt data, codec/profile mismatch). |
+| `AheadScanner` | per analyzed frame | `frame analysée { time, keyword, matched, ocrSource, textPreview, lead }` | The exact text the OCR returned for each keyframe, which keywords (if any) matched, and how far ahead of playback the scan is. `textPreview` is truncated to 80 chars. |
+| `AheadScanner` | per empty scan | `scan-segment OK mais aucune keyframe utile { minTime, bufferBytes }` | The scan completed but the decoder sandbox returned no usable frames — either no keyframes in this segment, or they were all below `minTime`. |
+| `SkipController` | every 10 s, throttled | `aucun segment ne couvre currentTime { currentTime, storeSize, firstSegments }` | The store has detected segments but `currentTime` is outside all of them. Useful to confirm whether detections are landing in the wrong time range (e.g. after playback already passed them, or pointing into the future the user hasn't reached). |
+| `SkipController` | per skip | `Skip appliqué { from, to, source }` | Confirms a successful skip and identifies which detection source (`dom-overlay`, `ahead-ocr`, `main-video-ocr`) produced the segment. |
+
+**Reading order during triage.** Start with the `heartbeat`. If `mediaSegmentsReceived` is 0, the MSE patch failed (check MAIN-world install). If it is non-zero but `scansRun` is 0, the decoder configure is failing — look upward for `échec configuration decoder`. If `scansRun > 0` but `framesDecoded` is 0, look for `scan-segment parse:` lines to see whether the demuxer returns samples. If `framesDecoded > 0` but `ocrMatches` is 0, inspect `textPreview` in `frame analysée` to see what the OCR actually reads (the overlay may be cropped out, or YouTube may have changed the disclosure wording).
 
 ---
 

@@ -68,6 +68,11 @@
   const pendingMediaSegments = []; // last N media segments before content script is ready
   const MAX_PENDING = 20;
 
+  // Stats for throttled cadence logging
+  let mediaSegmentCount = 0;
+  let mediaSegmentBytes = 0;
+  let lastStatsLogAt = 0;
+
   // Listen for "request-replay" from the ISOLATED world content script
   window.addEventListener("message", (event) => {
     const msg = event.data;
@@ -178,6 +183,14 @@
           mime: meta.mime,
           timestampOffset: meta.timestampOffset
         });
+
+        mediaSegmentCount += 1;
+        mediaSegmentBytes += copy.byteLength;
+        const now = Date.now();
+        if (now - lastStatsLogAt > 5000) {
+          console.info(TAG, `media-segments: ${mediaSegmentCount} reçus, ${(mediaSegmentBytes / 1024).toFixed(0)} KB cumulés`);
+          lastStatsLogAt = now;
+        }
       }
     } catch {
       // Never let interception errors affect playback.
