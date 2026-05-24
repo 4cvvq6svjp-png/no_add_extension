@@ -231,20 +231,12 @@
     const monochrome = (byte2 >> 4) & 0x01;
     const chromaSubX = (byte2 >> 3) & 0x01;
     const chromaSubY = (byte2 >> 2) & 0x01;
-
-    let chromaSub;
-    if (monochrome) {
-      chromaSub = "000";
-    } else if (chromaSubX && chromaSubY) {
-      chromaSub = "110";
-    } else if (chromaSubX) {
-      chromaSub = "100";
-    } else {
-      chromaSub = "111";
-    }
+    const chromaSamplePos = byte2 & 0x03;
 
     const tier = seqTier0 === 0 ? "M" : "H";
-    const codec = `av01.${seqProfile}.${pad2(seqLevelIdx0)}${tier}.${pad2(bitDepth)}.${chromaSub}`;
+    // AV1 codecs parameter (ISO BMFF): av01.<profile>.<level><tier>.<bitDepth>.<monochrome>.<subX><subY><samplePos>
+    const chromaTriplet = monochrome ? "000" : `${chromaSubX}${chromaSubY}${chromaSamplePos}`;
+    const codec = `av01.${seqProfile}.${pad2(seqLevelIdx0)}${tier}.${pad2(bitDepth)}.${monochrome}.${chromaTriplet}`;
 
     const description = new Uint8Array(
       view.buffer,

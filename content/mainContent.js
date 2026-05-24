@@ -840,6 +840,11 @@
       this.fallbackInterval = null;
       this.useFallback = false;
 
+      // Track failed configure attempts per init segment to avoid log spam
+      // when the codec is genuinely unsupported by the platform (e.g. no AV1).
+      this.configureFailures = 0;
+      this.configureFailedInit = null;
+
       // Bound listener
       this.boundOnMseMessage = (event) => this.onMseMessage(event);
     }
@@ -966,6 +971,8 @@
         this.initSegmentMime = msg.mime || "";
         this.decoderConfigured = false;
         this.useFallback = false;
+        this.configureFailures = 0;
+        this.configureFailedInit = null;
 
         if (this.fallbackInterval !== null) {
           window.clearInterval(this.fallbackInterval);
@@ -1087,6 +1094,10 @@
     async ensureDecoderConfigured() {
       if (this.decoderConfigured) return true;
       if (!this.initSegment) return false;
+      // Stop hammering configure when this exact init has already failed too
+      // many times (typically: the platform genuinely lacks a decoder for the
+      // codec advertised by YouTube).
+      if (this.configureFailedInit === this.initSegment) return false;
 
       await this.ensureDecoderIframe();
       if (!this.decoderIframe) return false;
@@ -1117,12 +1128,25 @@
         }
 
         this.decoderConfigured = true;
+        this.configureFailures = 0;
         logInfo("AheadScanner: decoder configuré.");
         return true;
       } catch (error) {
+        this.configureFailures += 1;
         logWarn("AheadScanner: échec configuration decoder", {
+          attempt: this.configureFailures,
           error: formatErrorForLog(error)
         });
+
+        if (this.configureFailures >= 3 && this.initSegment === initSnapshot) {
+          // Platform can't decode this codec — stop retrying and let the DOM
+          // overlay detector + main-video OCR fallback take over.
+          this.configureFailedInit = initSnapshot;
+          this.useFallback = true;
+          this.ocrSourceTag = "main-video-ocr";
+          this.startFallbackPolling();
+          logWarn("AheadScanner: codec non supporté après 3 tentatives, bascule en fallback OCR vidéo.");
+        }
         return false;
       }
     }
