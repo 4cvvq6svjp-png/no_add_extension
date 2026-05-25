@@ -70,9 +70,24 @@
     if (msg.type === "recognize") {
       try {
         const worker = await getWorker();
+
+        // Tesseract.js' internal Web Worker fails with
+        // "Error attempting to read image" when handed a raw ImageBitmap
+        // that has already been transferred via postMessage. Reify it into a
+        // Blob (PNG) through an OffscreenCanvas — Blob is the most widely
+        // supported input across Tesseract.js versions.
+        let input = msg.imageBitmap;
+        if (typeof ImageBitmap !== "undefined" && input instanceof ImageBitmap) {
+          const canvas = new OffscreenCanvas(input.width, input.height);
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(input, 0, 0);
+          try { input.close(); } catch { /* ignore */ }
+          input = await canvas.convertToBlob({ type: "image/png" });
+        }
+
         const {
           data: { text }
-        } = await worker.recognize(msg.imageBitmap);
+        } = await worker.recognize(input);
         answer({
           type: "recognize-ok",
           reqId: msg.reqId,

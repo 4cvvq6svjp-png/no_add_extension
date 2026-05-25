@@ -438,6 +438,8 @@
       this.ocrIframe = null;
       this.tesseractBridgePromise = null;
       this.lastOcrError = null;
+      this.tesseractErrorCount = 0;
+      this.tesseractDisabled = false;
     }
 
     isAvailable() {
@@ -751,6 +753,15 @@
         };
       }
 
+      if (this.tesseractDisabled) {
+        return {
+          sampleTime,
+          hasCommercialKeyword: false,
+          matchedKeywords: [],
+          source: "tesseract-disabled"
+        };
+      }
+
       let bitmap = null;
 
       try {
@@ -763,6 +774,9 @@
           [bitmap]
         );
         bitmap = null;
+
+        // Reset error streak on success
+        this.tesseractErrorCount = 0;
 
         const extractedText = result.text ?? "";
         const matchedKeywords = extractCommercialKeywords(extractedText);
@@ -783,12 +797,22 @@
           }
         }
 
-        const message = error instanceof Error ? error.message : String(error);
-        if (this.lastOcrError !== message) {
-          this.lastOcrError = message;
+        this.tesseractErrorCount += 1;
+        const detail = formatErrorForLog(error);
+
+        // Always log the first 3 errors verbatim so we never miss the actual
+        // failure mode; throttle by uniqueness after that.
+        if (this.tesseractErrorCount <= 3 || this.lastOcrError !== detail) {
+          this.lastOcrError = detail;
           logWarn("Impossible d'analyser une frame pour OCR (Tesseract)", {
-            message
+            attempt: this.tesseractErrorCount,
+            error: detail
           });
+        }
+
+        if (this.tesseractErrorCount >= 5 && !this.tesseractDisabled) {
+          this.tesseractDisabled = true;
+          logWarn("Tesseract désactivé après 5 échecs consécutifs — OCR via WebCodecs neutralisé, seule la détection DOM reste active.");
         }
 
         return {
@@ -915,6 +939,9 @@
         scansRun: this.totalScans,
         framesDecoded: this.totalFramesDecoded,
         ocrMatches: this.totalOcrMatches,
+        ocrBackend: this.frameClassifier?.getBackendLabel?.() ?? "?",
+        tesseractErrors: this.frameClassifier?.tesseractErrorCount ?? 0,
+        tesseractDisabled: this.frameClassifier?.tesseractDisabled ?? false,
         storeSize: this.segmentStore?.segments?.length ?? 0,
         lastScannedTime: Number.isFinite(this.lastScannedTime) ? this.lastScannedTime.toFixed(1) : "-"
       });
