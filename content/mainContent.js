@@ -15,8 +15,8 @@
     skipMarginSeconds: 0.4,
     skipCooldownMs: 900,
     analysisPollMs: 1200,
-    canvasWidth: 420,
-    canvasHeight: 236,
+    canvasWidth: 1280,
+    canvasHeight: 720,
     ocrRoiTopFraction: 0.25,
     overlayPollMs: 750,
     initTimeoutMs: 20000
