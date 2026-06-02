@@ -11,7 +11,7 @@
     frameSampleSeconds: 10,
     minSegmentSeconds: 3,
     mergeGapSeconds: 2,
-    noMatchGraceSeconds: 8,
+    noMatchGraceSeconds: 25,
     skipMarginSeconds: 0.4,
     skipCooldownMs: 900,
     analysisPollMs: 1200,
