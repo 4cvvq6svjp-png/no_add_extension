@@ -256,13 +256,32 @@
           }
         }
 
+        // Diagnostic: when a media segment yields zero samples, surface the
+        // top-level box types so we can tell whether it's pure indexing
+        // (styp/sidx), a SABR-wrapped chunk, or a parser miss.
+        let topBoxes = null;
+        if (samples.length === 0 && codecInfo.container === "mp4") {
+          const u8 = new Uint8Array(mediaBuffer);
+          const seen = [];
+          let pos = 0;
+          while (pos + 8 <= u8.length && seen.length < 6) {
+            const size = (u8[pos] << 24) | (u8[pos + 1] << 16) | (u8[pos + 2] << 8) | u8[pos + 3];
+            const type = String.fromCharCode(u8[pos + 4], u8[pos + 5], u8[pos + 6], u8[pos + 7]);
+            seen.push(`${type}(${size >>> 0})`);
+            if (size < 8 || pos + size > u8.length) break;
+            pos += size;
+          }
+          topBoxes = seen.join(", ") || "(none)";
+        }
+
         console.info(TAG, "scan-segment parse:", {
           samples: samples.length,
           keyframesTotal: totalKeyframes,
           keyframesKept: keyframes.length,
           minTime: Number.isFinite(minTime) ? minTime.toFixed(2) : minTime,
           tsRange: firstSampleTs !== null ? `${firstSampleTs.toFixed(2)}..${lastSampleTs.toFixed(2)}` : "(empty)",
-          container: codecInfo.container
+          container: codecInfo.container,
+          ...(topBoxes !== null && { bufBytes: mediaBuffer.byteLength, topBoxes })
         });
 
         // Decode each keyframe and collect bitmaps
