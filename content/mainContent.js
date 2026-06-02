@@ -8,7 +8,7 @@
   const OCR_MESSAGE_CHANNEL = "no-add-extension-ocr";
 
   const CONFIG = {
-    frameSampleSeconds: 5,
+    frameSampleSeconds: 10,
     minSegmentSeconds: 3,
     mergeGapSeconds: 2,
     noMatchGraceSeconds: 8,
@@ -17,7 +17,7 @@
     analysisPollMs: 1200,
     canvasWidth: 1280,
     canvasHeight: 720,
-    ocrRoiTopFraction: 0.25,
+    ocrRoiTopFraction: 1.0,
     overlayPollMs: 750,
     initTimeoutMs: 20000
   };
