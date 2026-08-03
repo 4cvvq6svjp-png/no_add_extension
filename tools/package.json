@@ -1,0 +1,14 @@
+{
+  "name": "no_add_extension-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Harness de test/capture des logs (dev-only) pour No Add Extension.",
+  "scripts": {
+    "capture": "node capture-logs.mjs",
+    "install-browser": "playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright": "^1.48.0"
+  }
+}
