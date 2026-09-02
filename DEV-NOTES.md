@@ -1,7 +1,11 @@
 # Notes de développement — détection & outillage
 
 Journal des travaux sur la fiabilité de la détection/skip et l'outillage de test.
-Voir aussi `tools/README.md` (harness de capture des logs).
+Voir aussi `tools/README.md` (tests unitaires et harness de capture des logs).
+
+> Les entrées antérieures au découpage (§2.8) citent `content/mainContent.js` :
+> ce fichier a depuis été éclaté en modules sous `content/`. Les noms de
+> fonctions, eux, sont inchangés.
 
 ---
 
@@ -207,6 +211,54 @@ mais pas pour le débit. Le levier est ailleurs, voir §4.5.
 
 **Reste à faire** : le découpage (lot D), les défauts du lot E — dont la
 ré-entrance de `setupSession` — et la réécriture du README (F1, faite).
+
+### 2.8 Découpage en modules *(2026-09-02)*
+
+`content/mainContent.js` faisait 1 947 lignes en une seule IIFE, dont **824
+pour `AheadScanner`** qui portait huit responsabilités : on ne pouvait pas lire
+la sonde sans traverser le réassemblage fMP4. Aucun test ne pouvait atteindre
+ces unités.
+
+**Trois étapes, trois commits**, pour que chaque diff soit relisible :
+extractions dans le fichier unique (la logique bouge), puis découpage en
+fichiers (de simples déplacements), puis restructuration du harness.
+
+`AheadScanner` devient `MseSegmentBuffer` (messages MSE, réassemblage moof+mdat,
+éviction, `seq`), `DecoderSandbox` (configure + scan-segment), `AdEndProbe` (la
+sonde) et un `AheadScanner` réduit à l'orchestration. `FrameClassifier` devient
+`RoiComposer`, `TesseractOcr` et un `FrameClassifier` réduit au choix de
+backend.
+
+**L'algorithme de la sonde n'est pas retouché.** Son raisonnement par *indices*
+est correct : le temps d'un segment n'est connu qu'APRÈS décodage, la sélection
+du prochain segment à sonder ne peut donc être que positionnelle.
+
+**Mécanisme de découpage.** 13 fichiers sous `content/`, listés dans
+`manifest.json` ; ils partagent le monde isolé et publient dans un objet
+`NoAdd`. Chaque fichier commence par ce qu'il y prend :
+
+```js
+const { CONFIG, logInfo, formatError } = NoAdd;
+```
+
+Une liste d'imports en tout sauf le nom, sans changer le modèle de chargement
+(synchrone, pas de `web_accessible_resources` supplémentaire, résistant à une
+double injection). Basculable vers de vrais modules ES plus tard sans
+re-découper.
+
+**Ce que ça débloque, concrètement.** Les tests chargent désormais les modules
+**dans l'ordre du manifeste** et lisent le namespace : le contournement qui
+greffait une ligne d'export sur l'IIFE a disparu, et un module mal placé dans
+l'ordre échouerait au test comme dans le navigateur. 14 tests ajoutés sur des
+unités jusque-là inatteignables — réassemblage fMP4 (chunk coupé au milieu d'un
+`mdat`, deux unités dans un chunk, discontinuité de `timestampOffset`,
+stabilité des `seq` sous éviction) et les deux garde-fous de la sonde (deux
+négatifs consécutifs, invalidation par un positif postérieur, seuil de
+confirmation sur grand saut). **33 tests, < 1 s, sans navigateur.**
+
+Le volume de code augmente (1 947 → ~2 590 lignes réparties) : en-têtes de
+classe et documentation. L'objectif de ce lot est la lisibilité, pas la
+concision.
 
 ---
 

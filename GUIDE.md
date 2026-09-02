@@ -126,7 +126,7 @@ Pendant que le spectateur regarde la vidéo normalement, un petit surveillant (`
    normalement           prend une copie
                               │
                               ▼
-                      mainContent.js  (le chef d'orchestre)
+                      content/*.js  (le chef d'orchestre)
                               │
                               ├── envoie le morceau à
                               ▼

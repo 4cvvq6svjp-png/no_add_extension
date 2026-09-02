@@ -34,6 +34,20 @@ test("les cadences périodiques viennent toutes de CONFIG", () => {
   ].sort((a, b) => a - b));
 });
 
+test("chaque module trouve ses dépendances dans l'ordre du manifeste", () => {
+  const expected = [
+    "CONFIG", "COMMERCIAL_KEYWORDS", "logInfo", "logWarn", "normalizeText",
+    "extractCommercialKeywords", "combineSources", "sleep", "formatError",
+    "waitForVideoElement", "getVideoIdFromCurrentUrl", "noDetection",
+    "SegmentStore", "PlayerNotifier", "SandboxBridge", "OverlayDetector",
+    "RoiComposer", "TesseractOcr", "FrameClassifier", "MseSegmentBuffer",
+    "DecoderSandbox", "AdEndProbe", "AheadScanner", "SkipController"
+  ];
+
+  const missing = expected.filter((name) => globalThis.__NoAdd[name] === undefined);
+  assert.deepEqual(missing, [], "un module publie moins que prévu");
+});
+
 /* --------------------------------------------------------------------- */
 /*  Composite OCR                                                         */
 /* --------------------------------------------------------------------- */

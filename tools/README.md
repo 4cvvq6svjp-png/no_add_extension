@@ -32,9 +32,10 @@ vérifie sans lecture vidéo :
 Ce qui n'y est **pas** couvert et reste du ressort du harness : décodage
 WebCodecs, OCR Tesseract, interception MSE, sonde de fin de pub, skip réel.
 
-> `test/dom-stub.mjs` greffe une ligne d'export sur l'IIFE de `mainContent.js`
-> pour atteindre ses classes. Ce contournement disparaîtra avec le découpage en
-> modules (lot D3 de la revue de code).
+> `test/dom-stub.mjs` charge les modules **dans l'ordre déclaré par le
+> manifeste** et lit le namespace qu'ils publient. Les tests exercent donc le
+> vrai ordre de chargement : un module qui dépendrait d'un autre chargé après
+> lui échouerait ici comme dans le navigateur.
 
 ---
 
