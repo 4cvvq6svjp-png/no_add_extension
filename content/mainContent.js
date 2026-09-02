@@ -600,12 +600,236 @@
     };
   }
 
+  /* ------------------------------------------------------------------ */
+  /*  RoiComposer — l'image envoyée à l'OCR                              */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Compose l'image soumise à l'OCR : les 4 coins de la frame, cropés à la
+   * résolution NATIVE de la source, upscalés dans une grille 2×2, puis
+   * binarisés.
+   *
+   * Le texte de disclosure (« Publicité », « collaboration commerciale »…)
+   * siège dans un coin et est minuscule à l'échelle de la frame : l'OCR plein
+   * cadre ne rend que du bruit. Un seul canvas → un seul appel OCR.
+   *
+   * Deux points décident de la lisibilité, et donc de tout le taux de
+   * détection :
+   * - la source est lue telle quelle, sans canvas intermédiaire qui réduirait
+   *   la frame avant de la ré-agrandir ;
+   * - la cellule reprend le RATIO du crop. Une cellule au ratio libre étirait
+   *   les glyphes de 66 % en vertical, ce qui fait chuter Tesseract.
+   */
+  class RoiComposer {
+    constructor() {
+      this.canvas = document.createElement("canvas");
+      this.ctx = this.canvas.getContext("2d", { willReadFrequently: true });
+    }
+
+    isAvailable() {
+      return Boolean(this.ctx);
+    }
+
+    /**
+     * @param {ImageBitmap|HTMLVideoElement} source
+     * @returns {boolean} false si la source n'a pas encore de dimensions.
+     */
+    compose(source) {
+      const sourceWidth = source.videoWidth || source.width || 0;
+      const sourceHeight = source.videoHeight || source.height || 0;
+      if (sourceWidth <= 0 || sourceHeight <= 0) {
+        return false;
+      }
+
+      const cropWidth = Math.max(1, Math.round(sourceWidth * CONFIG.ocrCornerWidthFraction));
+      const cropHeight = Math.max(1, Math.round(sourceHeight * CONFIG.ocrCornerHeightFraction));
+      const cellWidth = Math.round(CONFIG.ocrCompositeWidth / 2);
+      const cellHeight = Math.max(1, Math.round((cellWidth * cropHeight) / cropWidth));
+
+      if (this.canvas.width !== cellWidth * 2 || this.canvas.height !== cellHeight * 2) {
+        this.canvas.width = cellWidth * 2;
+        this.canvas.height = cellHeight * 2;
+      }
+
+      const ctx = this.ctx;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
+      const cropLeft = sourceWidth - cropWidth;
+      const cropTop = sourceHeight - cropHeight;
+
+      // src (coin de la frame) → dst (cellule de la grille), upscalé.
+      ctx.drawImage(source, 0,        0,       cropWidth, cropHeight, 0,         0,          cellWidth, cellHeight);
+      ctx.drawImage(source, cropLeft, 0,       cropWidth, cropHeight, cellWidth, 0,          cellWidth, cellHeight);
+      ctx.drawImage(source, 0,        cropTop, cropWidth, cropHeight, 0,         cellHeight, cellWidth, cellHeight);
+      ctx.drawImage(source, cropLeft, cropTop, cropWidth, cropHeight, cellWidth, cellHeight, cellWidth, cellHeight);
+
+      this.binarize();
+      return true;
+    }
+
+    /**
+     * Ne garder que les pixels quasi-blancs (le texte) → noir sur fond blanc.
+     * Isole la disclosure fine du bruit de l'image.
+     */
+    binarize() {
+      const image = this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
+      const pixels = image.data;
+      const threshold = CONFIG.ocrBinarizeThreshold;
+
+      for (let i = 0; i < pixels.length; i += 4) {
+        const luminance = 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+        const value = luminance >= threshold ? 0 : 255;
+        pixels[i] = value;
+        pixels[i + 1] = value;
+        pixels[i + 2] = value;
+      }
+
+      this.ctx.putImageData(image, 0, 0);
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  TesseractOcr — moteur lourd, hébergé en iframe d'extension         */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Tesseract tourne dans une iframe `chrome-extension://` : la CSP de YouTube
+   * bloque son worker WASM, celle de l'extension l'autorise.
+   *
+   * Se désactive après `maxTesseractFailures` échecs consécutifs — au-delà,
+   * insister ne ferait que bloquer la boucle de scan sur des appels perdus.
+   */
+  class TesseractOcr {
+    constructor() {
+      this.bridge = new SandboxBridge({
+        channel: OCR_MESSAGE_CHANNEL,
+        pagePath: "pages/ocr-sandbox.html",
+        readyTimeoutMs: CONFIG.ocrReadyTimeoutMs,
+        requestTimeoutMs: CONFIG.ocrRequestTimeoutMs
+      });
+
+      this.ready = null;
+      this.errorCount = 0;
+      this.disabled = false;
+      this.lastError = null;
+    }
+
+    /**
+     * @param {HTMLCanvasElement} canvas
+     * @returns {Promise<{ text: string } | { error: string }>} `error` porte le
+     *   tag de diagnostic ("tesseract-disabled", "tesseract-error"…).
+     */
+    async recognize(canvas) {
+      if (this.disabled) {
+        return { error: "tesseract-disabled" };
+      }
+
+      const ready = await this.ensureReady();
+      if (!ready) {
+        return { error: "tesseract-unavailable" };
+      }
+
+      let bitmap = null;
+
+      try {
+        bitmap = await createImageBitmap(canvas);
+        const result = await this.bridge.request(
+          "recognize",
+          { imageBitmap: bitmap },
+          { transferList: [bitmap] }
+        );
+        bitmap = null;
+
+        this.errorCount = 0;
+        return { text: result.text ?? "" };
+      } catch (error) {
+        if (bitmap) {
+          try { bitmap.close(); } catch { /* ignore */ }
+        }
+        this.noteFailure(error);
+        return { error: "tesseract-error" };
+      }
+    }
+
+    noteFailure(error) {
+      this.errorCount += 1;
+      const detail = formatError(error);
+
+      // Les 3 premières erreurs sont loguées telles quelles pour ne jamais
+      // manquer le vrai mode de défaillance ; ensuite on déduplique.
+      if (this.errorCount <= 3 || this.lastError !== detail) {
+        this.lastError = detail;
+        logWarn("Impossible d'analyser une frame pour OCR (Tesseract)", {
+          attempt: this.errorCount,
+          error: detail
+        });
+      }
+
+      if (this.errorCount >= CONFIG.maxTesseractFailures && !this.disabled) {
+        this.disabled = true;
+        logWarn(
+          `Tesseract désactivé après ${CONFIG.maxTesseractFailures} échecs consécutifs — ` +
+          "OCR via WebCodecs neutralisé, seule la détection DOM reste active."
+        );
+      }
+    }
+
+    async ensureReady() {
+      if (this.ready) {
+        return this.ready;
+      }
+
+      this.ready = (async () => {
+        const connected = await this.bridge.ensureReady();
+        if (!connected) {
+          return false;
+        }
+        await this.bridge.request("init", {}, { timeoutMs: CONFIG.ocrInitTimeoutMs });
+        logInfo("Tesseract prêt (sandbox iframe chrome-extension://).");
+        return true;
+      })().catch((error) => {
+        logWarn("Échec d’initialisation Tesseract (iframe)", {
+          error: formatError(error)
+        });
+        this.ready = null;
+        this.bridge.destroy();
+        return false;
+      });
+
+      return this.ready;
+    }
+
+    async terminate() {
+      if (this.bridge.isConnected()) {
+        try {
+          await this.bridge.request("terminate", {});
+        } catch {
+          // best-effort
+        }
+      }
+
+      this.bridge.destroy();
+      this.ready = null;
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  FrameClassifier — « cette frame contient-elle une disclosure ? »   */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Choisit le moteur OCR disponible et transforme une frame en verdict.
+   *
+   * Le choix est exclusif : `TextDetector` (natif, ~10ms) quand la plateforme
+   * l'expose, Tesseract sinon. Sur les Chromium Linux courants `TextDetector`
+   * est absent, c'est donc Tesseract qui travaille.
+   */
   class FrameClassifier {
     constructor() {
-      // Composite 2×2 des 4 coins de la frame, là où le texte de disclosure
-      // apparaît. Un seul canvas → un seul appel OCR.
-      this.roiCanvas = document.createElement("canvas");
-      this.roiCtx = this.roiCanvas.getContext("2d", { willReadFrequently: true });
+      this.roi = new RoiComposer();
 
       this.textDetector = null;
       if ("TextDetector" in window) {
@@ -626,106 +850,26 @@
         this.ocrBackend = null;
       }
 
-      this.tesseractBridge = new SandboxBridge({
-        channel: OCR_MESSAGE_CHANNEL,
-        pagePath: "pages/ocr-sandbox.html",
-        readyTimeoutMs: CONFIG.ocrReadyTimeoutMs,
-        requestTimeoutMs: CONFIG.ocrRequestTimeoutMs
-      });
-      this.tesseractReady = null;
-
+      this.tesseract = this.ocrBackend === "tesseract" ? new TesseractOcr() : null;
       this.lastOcrError = null;
-      this.tesseractErrorCount = 0;
-      this.tesseractDisabled = false;
     }
 
     isAvailable() {
-      return Boolean(this.roiCtx && this.ocrBackend);
+      return Boolean(this.roi.isAvailable() && this.ocrBackend);
     }
 
     getBackendLabel() {
       return this.ocrBackend ?? "none";
     }
 
-    /* ---------------------------------------------------------------- */
-    /*  Préparation de l'image envoyée à l'OCR                           */
-    /* ---------------------------------------------------------------- */
-
-    /**
-     * Compose les 4 coins de la source dans un canvas 2×2, chacun croppé à la
-     * résolution NATIVE de la source puis upscalé dans sa cellule.
-     *
-     * Le texte de disclosure (« Publicité », « collaboration commerciale »…)
-     * siège dans un coin et est minuscule à l'échelle de la frame : l'OCR
-     * plein cadre ne rend que du bruit.
-     *
-     * Deux points qui décident de la lisibilité :
-     * - on lit la source telle quelle (pas de canvas intermédiaire qui
-     *   réduirait la frame avant de la ré-agrandir) ;
-     * - la cellule reprend le RATIO du crop, sinon les glyphes sont étirés.
-     *
-     * @param {ImageBitmap|HTMLVideoElement} source
-     * @returns {boolean} false si la source n'a pas encore de dimensions.
-     */
-    composeCorners(source) {
-      const sourceWidth = source.videoWidth || source.width || 0;
-      const sourceHeight = source.videoHeight || source.height || 0;
-      if (sourceWidth <= 0 || sourceHeight <= 0) {
-        return false;
-      }
-
-      const cropWidth = Math.max(1, Math.round(sourceWidth * CONFIG.ocrCornerWidthFraction));
-      const cropHeight = Math.max(1, Math.round(sourceHeight * CONFIG.ocrCornerHeightFraction));
-      const cellWidth = Math.round(CONFIG.ocrCompositeWidth / 2);
-      const cellHeight = Math.max(1, Math.round((cellWidth * cropHeight) / cropWidth));
-
-      if (this.roiCanvas.width !== cellWidth * 2 || this.roiCanvas.height !== cellHeight * 2) {
-        this.roiCanvas.width = cellWidth * 2;
-        this.roiCanvas.height = cellHeight * 2;
-      }
-
-      const ctx = this.roiCtx;
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = "high";
-      ctx.fillStyle = "#000";
-      ctx.fillRect(0, 0, this.roiCanvas.width, this.roiCanvas.height);
-
-      const cropLeft = sourceWidth - cropWidth;
-      const cropTop = sourceHeight - cropHeight;
-
-      // src (coin de la frame) → dst (cellule de la grille), upscalé.
-      ctx.drawImage(source, 0,        0,       cropWidth, cropHeight, 0,         0,          cellWidth, cellHeight);
-      ctx.drawImage(source, cropLeft, 0,       cropWidth, cropHeight, cellWidth, 0,          cellWidth, cellHeight);
-      ctx.drawImage(source, 0,        cropTop, cropWidth, cropHeight, 0,         cellHeight, cellWidth, cellHeight);
-      ctx.drawImage(source, cropLeft, cropTop, cropWidth, cropHeight, cellWidth, cellHeight, cellWidth, cellHeight);
-
-      this.binarize();
-      return true;
+    // Exposés pour le heartbeat de diagnostic.
+    get tesseractErrorCount() {
+      return this.tesseract?.errorCount ?? 0;
     }
 
-    /**
-     * Ne garder que les pixels quasi-blancs (le texte) → noir sur fond blanc.
-     * Isole la disclosure fine du bruit de l'image.
-     */
-    binarize() {
-      const image = this.roiCtx.getImageData(0, 0, this.roiCanvas.width, this.roiCanvas.height);
-      const pixels = image.data;
-      const threshold = CONFIG.ocrBinarizeThreshold;
-
-      for (let i = 0; i < pixels.length; i += 4) {
-        const luminance = 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
-        const value = luminance >= threshold ? 0 : 255;
-        pixels[i] = value;
-        pixels[i + 1] = value;
-        pixels[i + 2] = value;
-      }
-
-      this.roiCtx.putImageData(image, 0, 0);
+    get tesseractDisabled() {
+      return this.tesseract?.disabled ?? false;
     }
-
-    /* ---------------------------------------------------------------- */
-    /*  Analyse                                                          */
-    /* ---------------------------------------------------------------- */
 
     /**
      * Analyse une frame, qu'elle vienne du décodeur (ImageBitmap) ou du
@@ -737,7 +881,7 @@
       }
 
       try {
-        if (!this.composeCorners(source)) {
+        if (!this.roi.compose(source)) {
           return noDetection(sampleTime, "source-not-ready");
         }
       } catch (error) {
@@ -754,20 +898,13 @@
 
     async detectWithTextDetector(sampleTime) {
       try {
-        const blocks = await this.textDetector.detect(this.roiCanvas);
+        const blocks = await this.textDetector.detect(this.roi.canvas);
         const extractedText = blocks
           .map((block) => block?.rawValue ?? "")
           .filter(Boolean)
           .join(" ");
-        const matchedKeywords = extractCommercialKeywords(extractedText);
 
-        return {
-          sampleTime,
-          hasCommercialKeyword: matchedKeywords.length > 0,
-          matchedKeywords,
-          source: "text-detector",
-          extractedText
-        };
+        return this.classify(sampleTime, extractedText, "text-detector");
       } catch (error) {
         this.logOcrErrorOnce("Impossible d'analyser une frame pour OCR (TextDetector)", error);
         return noDetection(sampleTime, "text-detector-error");
@@ -775,69 +912,24 @@
     }
 
     async detectWithTesseract(sampleTime) {
-      if (this.tesseractDisabled) {
-        return noDetection(sampleTime, "tesseract-disabled");
+      const result = await this.tesseract.recognize(this.roi.canvas);
+      if (result.error) {
+        return noDetection(sampleTime, result.error);
       }
 
-      const ready = await this.ensureTesseractReady();
-      if (!ready) {
-        return noDetection(sampleTime, "tesseract-unavailable");
-      }
-
-      let bitmap = null;
-
-      try {
-        bitmap = await createImageBitmap(this.roiCanvas);
-        const result = await this.tesseractBridge.request(
-          "recognize",
-          { imageBitmap: bitmap },
-          { transferList: [bitmap] }
-        );
-        bitmap = null;
-
-        this.tesseractErrorCount = 0;
-
-        const extractedText = result.text ?? "";
-        const matchedKeywords = extractCommercialKeywords(extractedText);
-
-        return {
-          sampleTime,
-          hasCommercialKeyword: matchedKeywords.length > 0,
-          matchedKeywords,
-          source: "tesseract",
-          extractedText
-        };
-      } catch (error) {
-        if (bitmap) {
-          try { bitmap.close(); } catch { /* ignore */ }
-        }
-        return this.onTesseractFailure(sampleTime, error);
-      }
+      return this.classify(sampleTime, result.text, "tesseract");
     }
 
-    onTesseractFailure(sampleTime, error) {
-      this.tesseractErrorCount += 1;
-      const detail = formatError(error);
+    classify(sampleTime, extractedText, source) {
+      const matchedKeywords = extractCommercialKeywords(extractedText);
 
-      // Les 3 premières erreurs sont loguées telles quelles pour ne jamais
-      // manquer le vrai mode de défaillance ; ensuite on déduplique.
-      if (this.tesseractErrorCount <= 3 || this.lastOcrError !== detail) {
-        this.lastOcrError = detail;
-        logWarn("Impossible d'analyser une frame pour OCR (Tesseract)", {
-          attempt: this.tesseractErrorCount,
-          error: detail
-        });
-      }
-
-      if (this.tesseractErrorCount >= CONFIG.maxTesseractFailures && !this.tesseractDisabled) {
-        this.tesseractDisabled = true;
-        logWarn(
-          `Tesseract désactivé après ${CONFIG.maxTesseractFailures} échecs consécutifs — ` +
-          "OCR via WebCodecs neutralisé, seule la détection DOM reste active."
-        );
-      }
-
-      return noDetection(sampleTime, "tesseract-error");
+      return {
+        sampleTime,
+        hasCommercialKeyword: matchedKeywords.length > 0,
+        matchedKeywords,
+        source,
+        extractedText
+      };
     }
 
     logOcrErrorOnce(message, error) {
@@ -849,352 +941,150 @@
       logWarn(message, { error: detail });
     }
 
-    /* ---------------------------------------------------------------- */
-    /*  Cycle de vie de la sandbox Tesseract                             */
-    /* ---------------------------------------------------------------- */
-
-    async ensureTesseractReady() {
-      if (this.ocrBackend !== "tesseract") {
-        return false;
-      }
-      if (this.tesseractReady) {
-        return this.tesseractReady;
-      }
-
-      this.tesseractReady = (async () => {
-        const connected = await this.tesseractBridge.ensureReady();
-        if (!connected) {
-          return false;
-        }
-        await this.tesseractBridge.request("init", {}, { timeoutMs: CONFIG.ocrInitTimeoutMs });
-        logInfo("Tesseract prêt (sandbox iframe chrome-extension://).");
-        return true;
-      })().catch((error) => {
-        logWarn("Échec d’initialisation Tesseract (iframe)", {
-          error: formatError(error)
-        });
-        this.tesseractReady = null;
-        this.tesseractBridge.destroy();
-        return false;
-      });
-
-      return this.tesseractReady;
-    }
-
     async terminate() {
-      if (this.ocrBackend === "tesseract" && this.tesseractBridge.isConnected()) {
-        try {
-          await this.tesseractBridge.request("terminate", {});
-        } catch {
-          // best-effort
-        }
-      }
-
-      this.tesseractBridge.destroy();
-      this.tesseractReady = null;
+      await this.tesseract?.terminate();
     }
   }
 
+
   /* ------------------------------------------------------------------ */
-  /*  AheadScanner — MSE interception + WebCodecs decoder                */
-  /*  On intercepte les segments fMP4 bruts que YouTube pousse dans MSE, */
-  /*  on décode les keyframes via WebCodecs dans une iframe sandbox, et  */
-  /*  on OCRise les bitmaps obtenues — sans second lecteur vidéo.        */
+  /*  MseSegmentBuffer — segments vidéo interceptés dans MSE            */
   /* ------------------------------------------------------------------ */
 
-  class AheadScanner {
-    constructor({ mainVideo, frameClassifier, segmentStore }) {
-      this.mainVideo = mainVideo;
-      this.frameClassifier = frameClassifier;
-      this.segmentStore = segmentStore;
+  /**
+   * File des segments vidéo bruts que YouTube pousse dans MSE.
+   *
+   * Reçoit les messages du monde MAIN, réassemble les unités moof+mdat fMP4
+   * (YouTube en découpe une sur plusieurs `appendBuffer()`, et un mdat tronqué
+   * fait renvoyer 0 sample au demuxer), et tient la file des segments à
+   * scanner.
+   *
+   * Chaque segment porte un `seq` monotone : l'éviction décale les indices du
+   * tableau, or la sonde a besoin d'identifiants stables.
+   */
+  class MseSegmentBuffer {
+    constructor({ onInitSegment, onNewMediaSource }) {
+      this.onInitSegment = onInitSegment;
+      this.onNewMediaSource = onNewMediaSource;
 
-      this.ocrSourceTag = "ahead-ocr";
-
-      // Captured MSE data
       this.initSegment = null;
-      this.initSegmentContainer = "mp4";
-      this.initSegmentMime = "";
-      this.capturedSegments = []; // [{ data, timestampOffset, seq, scanned }]
-      // Identifiant monotone par segment capturé : evictOldSegments décale les
-      // indices du tableau, la sonde raisonne donc sur des seq stables.
+      this.container = "mp4";
+      this.mime = "";
+
+      this.segments = []; // [{ data, timestampOffset, seq, scanned }]
       this.segmentSeq = 0;
-      // Réassemblage fMP4 : YouTube peut découper un moof+mdat sur plusieurs
-      // appendBuffer(), on ne met en file que des unités complètes.
+
+      // Tampon de réassemblage fMP4 et offset de la timeline courante.
       this.mp4Accum = null;
       this.mp4AccumTsOffset = null;
 
-      // Decoder sandbox
-      this.decoderBridge = new SandboxBridge({
-        channel: DECODER_CHANNEL,
-        pagePath: "pages/decoder-sandbox.html",
-        readyTimeoutMs: CONFIG.decoderReadyTimeoutMs,
-        requestTimeoutMs: CONFIG.decoderRequestTimeoutMs
-      });
-      this.decoderConfigured = false;
+      this.totalReceived = 0;
 
-      // Scanning state
-      this.lastScannedTime = -Infinity;
-      // Ré-entrance du seul chemin qui en a besoin : le repli est piloté par un
-      // setInterval, la boucle de scan MSE est séquentielle par construction.
-      this.fallbackBusy = false;
-      this.scanLoopStopped = true;
-      this.scanLoopRunning = false;
-      this.fallbackTimeout = null;
-      this.fallbackInterval = null;
-      this.useFallback = false;
-
-      // Sonde de fin de pub : une fois une pub détectée, on cesse le balayage
-      // séquentiel pour aller localiser sa FIN au bord du buffer, puis on
-      // bissecte. null = mode séquentiel.
-      this.probeState = null;
-
-      // Track failed configure attempts per init segment to avoid log spam
-      // when the codec is genuinely unsupported by the platform (e.g. no AV1).
-      this.configureFailures = 0;
-      this.configureFailedInit = null;
-
-      // Diagnostic counters
-      this.totalMediaSegmentsReceived = 0;
-      this.totalScans = 0;
-      this.totalFramesDecoded = 0;
-      this.totalOcrMatches = 0;
-      this.heartbeatInterval = null;
-
-      // Bound listener
-      this.boundOnMseMessage = (event) => this.onMseMessage(event);
+      this.boundOnMessage = (event) => this.onMessage(event);
     }
 
-    async start() {
-      if (!this.frameClassifier.isAvailable()) {
-        logWarn("Aucun moteur OCR disponible, AheadScanner désactivé.");
-        return;
-      }
-
-      if (!mp4demux) {
-        logWarn("mp4demux non chargé — le réassemblage fMP4 est indisponible.");
-      }
-
-      logInfo("AheadScanner démarré", {
-        backend: this.frameClassifier.getBackendLabel()
-      });
-
-      // Listen for MSE intercepted data from MAIN world
-      window.addEventListener("message", this.boundOnMseMessage);
-
-      // Request any segments already captured before we were ready (timing gap)
+    listen() {
+      window.addEventListener("message", this.boundOnMessage);
+      // Rejoue ce qui a été capturé avant que la session ne soit prête.
       window.postMessage({ channel: MSE_CHANNEL, type: "request-replay" }, "*");
-
-      // Boucle de scan continue : les scans s'enchaînent dos à dos tant qu'il
-      // reste du backlog. On n'attend `analysisPollMs` que lorsqu'il n'y a rien
-      // à faire — c'est un intervalle d'INACTIVITÉ, pas un plafond de débit
-      // (un setInterval quantisait le cycle à 2 ticks, soit la moitié du débit
-      // perdue en attente alors que ~25s de contenu attendaient en file).
-      this.startScanLoop();
-
-      // Fallback: if no MSE data arrives within 8s, fall back to main video OCR
-      this.fallbackTimeout = window.setTimeout(() => {
-        if (!this.initSegment) {
-          logWarn("Aucun segment MSE reçu — repli OCR sur la vidéo principale.");
-          this.useFallback = true;
-          this.ocrSourceTag = "main-video-ocr";
-          this.startFallbackPolling();
-        }
-      }, CONFIG.noMseDataTimeoutMs);
-
-      // Diagnostic heartbeat: snapshot of pipeline state every 5s.
-      this.heartbeatInterval = window.setInterval(() => this.logHeartbeat(), CONFIG.heartbeatMs);
     }
 
-    /** (Re)démarre la boucle de scan ; sans effet si elle tourne déjà. */
-    startScanLoop() {
-      this.scanLoopStopped = false;
-      void this.runScanLoop();
+    stopListening() {
+      window.removeEventListener("message", this.boundOnMessage);
     }
 
-    async runScanLoop() {
-      if (this.scanLoopRunning) return; // jamais deux boucles sur une instance
-      this.scanLoopRunning = true;
-
-      try {
-        while (!this.scanLoopStopped) {
-          let didWork = false;
-
-          try {
-            didWork = await this.scanNext();
-          } catch (error) {
-            logWarn("AheadScanner: boucle de scan interrompue", {
-              error: formatError(error)
-            });
-          }
-
-          if (!didWork) {
-            await sleep(CONFIG.analysisPollMs);
-          }
-        }
-      } finally {
-        this.scanLoopRunning = false;
-      }
-    }
-
-    logHeartbeat() {
-      const unscanned = this.capturedSegments.filter((e) => !e.scanned).length;
-      const currentTime = Number(this.mainVideo?.currentTime ?? 0);
-      const buffered = this.mainVideo?.buffered;
-      let bufferedAhead = 0;
-      if (buffered && buffered.length > 0) {
-        for (let i = 0; i < buffered.length; i++) {
-          if (buffered.start(i) <= currentTime && currentTime <= buffered.end(i)) {
-            bufferedAhead = buffered.end(i) - currentTime;
-            break;
-          }
-        }
-      }
-      logInfo("AheadScanner heartbeat", {
-        currentTime: currentTime.toFixed(1),
-        bufferedAhead: bufferedAhead.toFixed(1) + "s",
-        decoderConfigured: this.decoderConfigured,
-        useFallback: this.useFallback,
-        capturedSegments: `${this.capturedSegments.length} (${unscanned} non scannés)`,
-        mediaSegmentsReceived: this.totalMediaSegmentsReceived,
-        scansRun: this.totalScans,
-        framesDecoded: this.totalFramesDecoded,
-        ocrMatches: this.totalOcrMatches,
-        ocrBackend: this.frameClassifier?.getBackendLabel?.() ?? "?",
-        tesseractErrors: this.frameClassifier?.tesseractErrorCount ?? 0,
-        tesseractDisabled: this.frameClassifier?.tesseractDisabled ?? false,
-        storeSize: this.segmentStore?.segments?.length ?? 0,
-        lastScannedTime: Number.isFinite(this.lastScannedTime) ? this.lastScannedTime.toFixed(1) : "-",
-        mode: this.probeState ? "sonde" : "séquentiel",
-        probe: this.probeState
-          ? `[${this.probeState.lastPositiveTime.toFixed(1)}..${
-              Number.isFinite(this.probeState.firstNegativeTime)
-                ? this.probeState.firstNegativeTime.toFixed(1)
-                : "?"
-            }] ${this.probeState.probes} sonde(s), ${this.probeState.positiveCount} positif(s)`
-          : "-"
-      });
-    }
-
-    stop() {
-      window.removeEventListener("message", this.boundOnMseMessage);
-
-      this.scanLoopStopped = true;
-
-      if (this.fallbackTimeout !== null) {
-        window.clearTimeout(this.fallbackTimeout);
-        this.fallbackTimeout = null;
-      }
-
-      if (this.fallbackInterval !== null) {
-        window.clearInterval(this.fallbackInterval);
-        this.fallbackInterval = null;
-      }
-
-      if (this.heartbeatInterval !== null) {
-        window.clearInterval(this.heartbeatInterval);
-        this.heartbeatInterval = null;
-      }
-
-      this.lastScannedTime = -Infinity;
-      this.fallbackBusy = false;
-      this.probeState = null;
+    clear() {
       this.initSegment = null;
-      this.capturedSegments = [];
+      this.segments = [];
+      this.mp4Accum = null;
+    }
 
-      this.decoderBridge.postWithoutReply("terminate");
-      this.decoderBridge.destroy();
-      this.decoderConfigured = false;
+    get unscannedCount() {
+      return this.segments.filter((entry) => !entry.scanned).length;
+    }
+
+    nextUnscanned() {
+      return this.segments.find((entry) => !entry.scanned) ?? null;
+    }
+
+    indexOfSeq(seq) {
+      if (seq === null || seq === undefined) return -1;
+      return this.segments.findIndex((entry) => entry.seq === seq);
+    }
+
+    hasUnscannedBetween(lowIndex, highIndex) {
+      for (let i = lowIndex + 1; i < highIndex; i++) {
+        if (!this.segments[i].scanned) return true;
+      }
+      return false;
     }
 
     /* ---------------------------------------------------------------- */
-    /*  MSE message handling (from MAIN world interceptor)               */
+    /*  Réception des messages du monde MAIN                             */
     /* ---------------------------------------------------------------- */
 
-    onMseMessage(event) {
+    onMessage(event) {
       const msg = event.data;
       if (!msg || msg.channel !== MSE_CHANNEL) return;
 
-      if (msg.type === "new-media-source") {
-        // New video — reset state
-        this.initSegment = null;
-        this.capturedSegments = [];
-        this.mp4Accum = null;
-        this.lastScannedTime = -Infinity;
-        this.probeState = null;
-        this.decoderConfigured = false;
-        logInfo("AheadScanner: nouveau MediaSource détecté, reset.");
-        return;
-      }
+      switch (msg.type) {
+        case "new-media-source":
+          this.clear();
+          logInfo("MseSegmentBuffer: nouveau MediaSource détecté, reset.");
+          this.onNewMediaSource();
+          return;
 
-      if (msg.type === "init-segment") {
-        // Cancel fallback timeout — we have MSE data
-        if (this.fallbackTimeout !== null) {
-          window.clearTimeout(this.fallbackTimeout);
-          this.fallbackTimeout = null;
-        }
-
-        logInfo("AheadScanner: init segment capturé", {
-          bytes: msg.data?.byteLength,
-          mime: msg.mime,
-          container: msg.container
-        });
-
-        this.initSegment = msg.data;
-        this.initSegmentContainer = msg.container || "mp4";
-        this.initSegmentMime = msg.mime || "";
-        this.mp4Accum = null;
-        this.decoderConfigured = false;
-        this.useFallback = false;
-        this.configureFailures = 0;
-        this.configureFailedInit = null;
-
-        if (this.fallbackInterval !== null) {
-          window.clearInterval(this.fallbackInterval);
-          this.fallbackInterval = null;
-        }
-
-        this.ocrSourceTag = "ahead-ocr";
-        // Le repli avait pu arrêter la boucle de scan : on la relance.
-        this.startScanLoop();
-        return;
-      }
-
-      if (msg.type === "media-segment") {
-        if (!this.initSegment) return; // Ignore media without init
-
-        this.totalMediaSegmentsReceived += 1;
-
-        const isWebm = (this.initSegmentContainer ?? "mp4") === "webm";
-        if (isWebm) {
-          // WebM: the cluster parser flat-scans, so a per-append push is fine.
-          this.capturedSegments.push({
-            data: msg.data,
-            timestampOffset: msg.timestampOffset ?? 0,
-            seq: this.segmentSeq++
+        case "init-segment":
+          logInfo("MseSegmentBuffer: init segment capturé", {
+            bytes: msg.data?.byteLength,
+            mime: msg.mime,
+            container: msg.container
           });
-        } else {
-          // fMP4: YouTube may split one media segment (moof+mdat) across several
-          // appendBuffer() calls. Reassemble the byte stream and only enqueue
-          // COMPLETE moof+mdat units, otherwise parseMediaSegment sees a
-          // truncated mdat and returns 0 samples.
-          this.accumulateMp4Chunk(msg.data, msg.timestampOffset ?? 0);
-        }
+          this.initSegment = msg.data;
+          this.container = msg.container || "mp4";
+          this.mime = msg.mime || "";
+          this.mp4Accum = null;
+          this.onInitSegment();
+          return;
 
-        // Plafond en NOMBRE de segments, pas en retard temporel.
-        this.evictOldSegments();
-        return;
+        case "media-segment":
+          if (!this.initSegment) return; // Un média sans init est inexploitable.
+          this.totalReceived += 1;
+          this.acceptMediaSegment(msg.data, msg.timestampOffset ?? 0);
+          this.evictOldSegments();
+          return;
+
+        default:
+          return;
       }
     }
 
+    acceptMediaSegment(data, timestampOffset) {
+      if (this.container === "webm") {
+        // WebM : le parseur de clusters balaie à plat, un push par append suffit.
+        this.enqueue(data, timestampOffset);
+        return;
+      }
+      this.accumulateMp4Chunk(data, timestampOffset);
+    }
+
+    enqueue(data, timestampOffset) {
+      this.segments.push({ data, timestampOffset, seq: this.segmentSeq++ });
+    }
+
+    /* ---------------------------------------------------------------- */
+    /*  Réassemblage fMP4                                                */
+    /* ---------------------------------------------------------------- */
+
     /**
-     * Append a raw appendBuffer() chunk to the fMP4 reassembly buffer and
-     * extract every complete moof+mdat unit into capturedSegments.
+     * Ajoute un chunk brut au tampon de réassemblage et en extrait toutes les
+     * unités moof+mdat complètes.
      */
     accumulateMp4Chunk(chunkBuffer, timestampOffset) {
       const incoming = new Uint8Array(chunkBuffer);
 
-      // A timestampOffset change signals a discontinuity (e.g. a seek): drop any
-      // dangling partial bytes so we don't merge across timelines.
+      // Un changement de timestampOffset signale une discontinuité (un seek) :
+      // on jette les octets partiels pour ne pas coudre deux timelines.
       if (this.mp4Accum && this.mp4Accum.length > 0 &&
           this.mp4AccumTsOffset !== timestampOffset) {
         this.mp4Accum = null;
@@ -1202,7 +1092,7 @@
       this.mp4AccumTsOffset = timestampOffset;
 
       if (!this.mp4Accum || this.mp4Accum.length === 0) {
-        this.mp4Accum = incoming.slice(); // own copy (starts at a box boundary)
+        this.mp4Accum = incoming.slice(); // copie propre, sur une frontière de boîte
       } else {
         const merged = new Uint8Array(this.mp4Accum.length + incoming.length);
         merged.set(this.mp4Accum, 0);
@@ -1229,20 +1119,16 @@
 
       while (pos < bytes.length) {
         const header = mp4demux.readBoxHeader(bytes, pos);
-        if (!header) break;                       // entête tronqué — attendre
-        if (header.extendsToEnd) break;           // non délimitable — attendre
-        if (header.size < header.headerSize) break; // corrompu — on garde le reste
+        if (!header) break;                          // entête tronqué — attendre
+        if (header.extendsToEnd) break;              // non délimitable — attendre
+        if (header.size < header.headerSize) break;  // corrompu — on garde le reste
         if (pos + header.size > bytes.length) break; // boîte incomplète — attendre
 
         if (header.type === "moof") {
           sawMoof = true;
         } else if (header.type === "mdat" && sawMoof) {
           const unit = bytes.slice(unitStart, pos + header.size); // copie propre
-          this.capturedSegments.push({
-            data: unit.buffer,
-            timestampOffset,
-            seq: this.segmentSeq++
-          });
+          this.enqueue(unit.buffer, timestampOffset);
           unitStart = pos + header.size;
           sawMoof = false;
         }
@@ -1250,188 +1136,185 @@
         pos += header.size;
       }
 
-      // Keep only the unconsumed tail for the next chunk.
+      // On ne garde que la queue non consommée pour le prochain chunk.
       this.mp4Accum = unitStart > 0 ? bytes.slice(unitStart) : bytes;
-      // Safety valve: never let the buffer grow unbounded on persistent misalign.
+      // Soupape : ne jamais laisser le tampon croître sans fin sur un désalignement.
       if (this.mp4Accum.length > CONFIG.maxMp4AccumBytes) this.mp4Accum = new Uint8Array(0);
     }
 
+    /** Plafond en NOMBRE de segments, pas en retard temporel. */
     evictOldSegments() {
-      const maxSegments = CONFIG.maxCapturedSegments;
-      if (this.capturedSegments.length > maxSegments) {
-        this.capturedSegments = this.capturedSegments.slice(-maxSegments);
+      if (this.segments.length > CONFIG.maxCapturedSegments) {
+        this.segments = this.segments.slice(-CONFIG.maxCapturedSegments);
       }
     }
+  }
 
-    async ensureDecoderConfigured() {
-      if (this.decoderConfigured) return true;
-      if (!this.initSegment) return false;
-      // Stop hammering configure when this exact init has already failed too
-      // many times (typically: the platform genuinely lacks a decoder for the
-      // codec advertised by YouTube).
-      if (this.configureFailedInit === this.initSegment) return false;
+  /* ------------------------------------------------------------------ */
+  /*  DecoderSandbox — configuration et décodage des keyframes           */
+  /* ------------------------------------------------------------------ */
 
-      const connected = await this.decoderBridge.ensureReady();
+  /**
+   * Façade sur la sandbox WebCodecs : configuration à partir de l'init segment
+   * courant, puis décodage des keyframes d'un segment média.
+   *
+   * Tient le compte des échecs de configuration par init segment : quand la
+   * plateforme n'a réellement pas de décodeur pour le codec annoncé, on cesse
+   * d'insister et on prévient l'appelant via `onUnsupportedCodec`.
+   */
+  class DecoderSandbox {
+    constructor({ buffer, mainVideo, onUnsupportedCodec }) {
+      this.buffer = buffer;
+      this.mainVideo = mainVideo;
+      this.onUnsupportedCodec = onUnsupportedCodec;
+
+      this.bridge = new SandboxBridge({
+        channel: DECODER_CHANNEL,
+        pagePath: "pages/decoder-sandbox.html",
+        readyTimeoutMs: CONFIG.decoderReadyTimeoutMs,
+        requestTimeoutMs: CONFIG.decoderRequestTimeoutMs
+      });
+
+      this.configured = false;
+      this.configureFailures = 0;
+      this.failedInitSegment = null;
+    }
+
+    /** Un nouvel init segment invalide la configuration en cours. */
+    invalidateConfiguration() {
+      this.configured = false;
+      this.configureFailures = 0;
+      this.failedInitSegment = null;
+    }
+
+    destroy() {
+      this.bridge.postWithoutReply("terminate");
+      this.bridge.destroy();
+      this.configured = false;
+    }
+
+    async ensureConfigured() {
+      if (this.configured) return true;
+
+      const initSegment = this.buffer.initSegment;
+      if (!initSegment) return false;
+      // Ne pas marteler configure quand cet init exact a déjà échoué trop
+      // souvent (typiquement : pas de décodeur pour le codec annoncé).
+      if (this.failedInitSegment === initSegment) return false;
+
+      const connected = await this.bridge.ensureReady();
       if (!connected) return false;
 
-      // Snapshot init metadata; a new init-segment can arrive during the await
-      // (quality switch, ad insertion) and we must not mark the decoder as
-      // configured for stale bytes.
-      const initSnapshot = this.initSegment;
-      const containerSnapshot = this.initSegmentContainer;
-      const mimeSnapshot = this.initSegmentMime;
+      // Un nouvel init segment peut arriver pendant l'aller-retour (changement
+      // de qualité, insertion de pub) : on ne doit pas marquer le décodeur
+      // configuré pour des octets périmés.
+      const container = this.buffer.container;
+      const mime = this.buffer.mime;
 
       try {
-        const initCopy = initSnapshot.slice(0);
-        const fallbackWidth  = this.mainVideo?.videoWidth  || 0;
-        const fallbackHeight = this.mainVideo?.videoHeight || 0;
-        await this.decoderBridge.request("configure", {
+        const initCopy = initSegment.slice(0);
+        await this.bridge.request("configure", {
           initSegment: initCopy,
-          container: containerSnapshot,
-          mime: mimeSnapshot,
-          fallbackWidth,
-          fallbackHeight
+          container,
+          mime,
+          fallbackWidth: this.mainVideo?.videoWidth || 0,
+          fallbackHeight: this.mainVideo?.videoHeight || 0
         }, { transferList: [initCopy] });
 
-        if (this.initSegment !== initSnapshot) {
-          // A newer init arrived during configure — leave decoderConfigured
-          // false so the next scanNext re-runs configure with the fresh data.
+        if (this.buffer.initSegment !== initSegment) {
+          // Un init plus frais est arrivé : laisser `configured` à false pour
+          // que le prochain scan reconfigure avec les bons octets.
           return false;
         }
 
-        this.decoderConfigured = true;
+        this.configured = true;
         this.configureFailures = 0;
-        logInfo("AheadScanner: decoder configuré.");
+        logInfo("DecoderSandbox: decoder configuré.");
         return true;
       } catch (error) {
         this.configureFailures += 1;
-        logWarn("AheadScanner: échec configuration decoder", {
+        logWarn("DecoderSandbox: échec configuration decoder", {
           attempt: this.configureFailures,
           error: formatError(error)
         });
 
         if (this.configureFailures >= CONFIG.maxConfigureFailures &&
-            this.initSegment === initSnapshot) {
-          // Platform can't decode this codec — stop retrying and let the DOM
-          // overlay detector + main-video OCR fallback take over.
-          this.configureFailedInit = initSnapshot;
-          this.useFallback = true;
-          this.ocrSourceTag = "main-video-ocr";
-          this.startFallbackPolling();
+            this.buffer.initSegment === initSegment) {
+          this.failedInitSegment = initSegment;
           logWarn(
-            `AheadScanner: codec non supporté après ${CONFIG.maxConfigureFailures} tentatives, ` +
+            `DecoderSandbox: codec non supporté après ${CONFIG.maxConfigureFailures} tentatives, ` +
             "bascule en fallback OCR vidéo."
           );
+          this.onUnsupportedCodec();
         }
         return false;
       }
     }
 
-    /* ---------------------------------------------------------------- */
-    /*  Scanning logic                                                   */
-    /* ---------------------------------------------------------------- */
+    /**
+     * Démuxe un segment média et renvoie ses keyframes décodées.
+     * Le buffer est TRANSFÉRÉ à la sandbox : zéro copie, mais neutré ici.
+     */
+    async scanSegment(entry, { minTime, sampleInterval }) {
+      return this.bridge.request("scan-segment", {
+        mediaSegment: entry.data,
+        minTime,
+        sampleInterval
+      }, { transferList: [entry.data] });
+    }
+  }
 
-    async scanNext() {
-      if (this.useFallback) return false; // Handled by fallback polling
-      if (!this.initSegment || this.capturedSegments.length === 0) return false;
+  /* ------------------------------------------------------------------ */
+  /*  AdEndProbe — localisation dichotomique de la fin d'une pub         */
+  /* ------------------------------------------------------------------ */
 
-      try {
-        const configured = await this.ensureDecoderConfigured();
-        if (!configured) return false;
+  /**
+   * Une fois une pub détectée, cesser de balayer la file segment par segment
+   * (13 analyses pour 68s) et aller localiser sa FIN au bord du buffer
+   * (~5-6 analyses), puis bissecter.
+   *
+   * La sonde raisonne sur les INDICES de la file, pas sur le temps : le temps
+   * d'un segment n'est connu qu'APRÈS décodage, donc le choix du prochain
+   * segment à sonder ne peut être que positionnel. Elle apprend le temps a
+   * posteriori, via le `timestamp` renvoyé par le décodeur.
+   *
+   * Deux garde-fous symétriques, tous deux mesurés (DEV-NOTES §2.6) :
+   * - anti sur-saut : un saut supérieur à `bigJumpThresholdSeconds` exige deux
+   *   lectures positives distinctes, sinon un faux positif isolé ferait sauter
+   *   du contenu légitime ;
+   * - anti fin prématurée : l'OCR rate environ une frame sur onze, donc un
+   *   négatif isolé n'est qu'un CANDIDAT. Il faut deux segments CONSÉCUTIFS
+   *   négatifs pour borner la pub, et tout positif postérieur invalide la borne.
+   */
+  class AdEndProbe {
+    constructor({ buffer, segmentStore, mainVideo, sourceTag, startTime, firstSegment }) {
+      this.buffer = buffer;
+      this.segmentStore = segmentStore;
+      this.mainVideo = mainVideo;
+      this.sourceTag = sourceTag;
 
-        // Hors sonde : balayage séquentiel (plus ancien segment non scanné).
-        // En sonde : on vise le bord du buffer, puis on bissecte.
-        const probing = this.probeState !== null;
-        const segmentEntry = probing
-          ? this.pickProbeSegment()
-          : this.capturedSegments.find((entry) => !entry.scanned);
-        if (!segmentEntry) return false;
+      this.startTime = startTime;
+      this.lastPositiveSeq = firstSegment.seq;
+      this.lastPositiveTime = startTime;
+      this.firstNegativeSeq = null;
+      this.firstNegativeTime = Infinity;
+      this.pendingNegativeSeq = null;
+      this.pendingNegativeTime = Infinity;
 
-        segmentEntry.scanned = true;
-        this.totalScans += 1;
-        if (probing) this.probeState.probes += 1;
+      this.positiveCount = 1;
+      this.probes = 0;
 
-        // En sonde on vise une keyframe PRÉCISE, en avance sur tout ce qui a été
-        // scanné : le filtre minTime l'écarterait.
-        const minTime = probing
-          ? -Infinity
-          : this.lastScannedTime + CONFIG.frameSampleSeconds;
-        // La sandbox décodeur fait le démuxage ET le décodage des keyframes :
-        // le buffer y est TRANSFÉRÉ (zéro copie, mais neutré ici).
-        const result = await this.decoderBridge.request("scan-segment", {
-          mediaSegment: segmentEntry.data,
-          minTime,
-          sampleInterval: CONFIG.frameSampleSeconds
-        }, { transferList: [segmentEntry.data] });
-
-        const frameCount = result.frames?.length ?? 0;
-        this.totalFramesDecoded += frameCount;
-        if (frameCount === 0) {
-          // Sans keyframe décodée, ce segment n'apprend rien à la sonde ; on le
-          // laisse marqué scanné pour que la bissection passe au suivant.
-          logInfo("AheadScanner: scan-segment OK mais aucune keyframe utile", {
-            minTime: Number.isFinite(minTime) ? minTime.toFixed(1) : "-",
-            tsRange: result.tsRange
-              ? `${result.tsRange.start.toFixed(1)}..${result.tsRange.end.toFixed(1)}`
-              : "-",
-            bufferBytes: segmentEntry.data?.byteLength ?? 0
-          });
-          return true;
-        }
-
-        for (const frame of result.frames) {
-          if (!frame.imageBitmap) continue;
-
-          try {
-            const detection = await this.frameClassifier.detect(
-              frame.imageBitmap,
-              frame.timestamp
-            );
-
-            try { frame.imageBitmap.close(); } catch { /* ignore */ }
-
-            if (probing) {
-              this.consumeProbeResult(segmentEntry, frame.timestamp, detection);
-            } else {
-              this.consumeDetection(detection, segmentEntry);
-              this.lastScannedTime = frame.timestamp;
-            }
-            if (detection.hasCommercialKeyword) this.totalOcrMatches += 1;
-
-            logInfo("AheadScanner: frame analysée", {
-              time: frame.timestamp.toFixed(1),
-              mode: probing ? "sonde" : "séquentiel",
-              keyword: detection.hasCommercialKeyword,
-              matched: detection.matchedKeywords,
-              ocrSource: detection.source,
-              textPreview: (detection.extractedText ?? "").slice(0, 80),
-              lead: (frame.timestamp - this.mainVideo.currentTime).toFixed(1) + "s en avance"
-            });
-          } catch (error) {
-            try { frame.imageBitmap.close(); } catch { /* ignore */ }
-            logWarn("AheadScanner: échec OCR sur frame décodée", {
-              time: frame.timestamp,
-              error: formatError(error)
-            });
-          }
-        }
-
-        return true;
-      } catch (error) {
-        logWarn("AheadScanner: échec scan-segment", {
-          error: formatError(error)
-        });
-        return false;
-      }
+      /** Passe à true quand la fin est encadrée ; l'appelant abandonne la sonde. */
+      this.resolved = false;
     }
 
-    /* ---------------------------------------------------------------- */
-    /*  Sonde de fin de pub                                              */
-    /* ---------------------------------------------------------------- */
-
-    indexOfSeq(seq) {
-      if (seq === null || seq === undefined) return -1;
-      return this.capturedSegments.findIndex((entry) => entry.seq === seq);
+    /** Résumé une ligne pour le heartbeat. */
+    describe() {
+      const upperBound = Number.isFinite(this.firstNegativeTime)
+        ? this.firstNegativeTime.toFixed(1)
+        : "?";
+      return `[${this.lastPositiveTime.toFixed(1)}..${upperBound}] ` +
+        `${this.probes} sonde(s), ${this.positiveCount} positif(s)`;
     }
 
     /**
@@ -1441,16 +1324,15 @@
      * Renvoie null quand il n'y a rien de neuf à sonder (buffer pas encore
      * étendu) ou quand la fin est déjà encadrée.
      */
-    pickProbeSegment() {
-      const segments = this.capturedSegments;
-      const state = this.probeState;
-      const positiveIndex = Math.max(0, this.indexOfSeq(state.lastPositiveSeq));
-      const confirmedIndex = state.firstNegativeSeq === null
+    pickSegment() {
+      const segments = this.buffer.segments;
+      const positiveIndex = Math.max(0, this.buffer.indexOfSeq(this.lastPositiveSeq));
+      const confirmedIndex = this.firstNegativeSeq === null
         ? -1
-        : this.indexOfSeq(state.firstNegativeSeq);
-      const pendingIndex = state.pendingNegativeSeq === null
+        : this.buffer.indexOfSeq(this.firstNegativeSeq);
+      const pendingIndex = this.pendingNegativeSeq === null
         ? -1
-        : this.indexOfSeq(state.pendingNegativeSeq);
+        : this.buffer.indexOfSeq(this.pendingNegativeSeq);
 
       // Un candidat non encore confirmé sert quand même de borne haute
       // PROVISOIRE : bissecter dessous est toujours plus informatif qu'attendre
@@ -1486,57 +1368,47 @@
       }
 
       // Fin encadrée au mieux.
-      this.maybeResolveProbe();
+      this.maybeResolve();
       return null;
     }
 
-    hasUnscannedBetween(lowIndex, highIndex) {
-      for (let i = lowIndex + 1; i < highIndex; i++) {
-        if (!this.capturedSegments[i].scanned) return true;
-      }
-      return false;
-    }
-
-    consumeProbeResult(entry, time, detection) {
-      const state = this.probeState;
-      if (!state || !Number.isFinite(time)) return;
+    consumeResult(entry, time, detection) {
+      if (this.resolved || !Number.isFinite(time)) return;
 
       if (detection.hasCommercialKeyword) {
-        if (time > state.lastPositiveTime) {
-          state.lastPositiveSeq = entry.seq;
-          state.lastPositiveTime = time;
+        if (time > this.lastPositiveTime) {
+          this.lastPositiveSeq = entry.seq;
+          this.lastPositiveTime = time;
         }
-        state.positiveCount += 1;
+        this.positiveCount += 1;
         this.invalidateNegativeBoundsBefore(time);
         this.extendAdEnd(time);
-      } else if (time > state.lastPositiveTime) {
-        // Symétrique du garde-fou anti sur-saut. L'OCR rate ~1 frame sur 11 sur
-        // la vidéo de référence : un négatif ISOLÉ ne borne donc pas la pub.
-        // La confirmation doit être POSITIONNELLE — deux segments CONSÉCUTIFS
-        // négatifs. Deux négatifs quelconques ne suffisent pas : sur une pub
-        // longue, des faux négatifs épars finissent par se confirmer entre eux
+      } else if (time > this.lastPositiveTime) {
+        // La confirmation d'un négatif doit être POSITIONNELLE — deux segments
+        // CONSÉCUTIFS. Deux négatifs quelconques ne suffisent pas : sur une pub
+        // longue, des faux négatifs épars finiraient par se confirmer entre eux
         // alors qu'un positif les sépare.
-        const index = this.indexOfSeq(entry.seq);
-        const pendingIndex = state.pendingNegativeSeq === null
+        const index = this.buffer.indexOfSeq(entry.seq);
+        const pendingIndex = this.pendingNegativeSeq === null
           ? -1
-          : this.indexOfSeq(state.pendingNegativeSeq);
+          : this.buffer.indexOfSeq(this.pendingNegativeSeq);
 
         if (pendingIndex >= 0 && index === pendingIndex + 1) {
-          state.firstNegativeSeq = state.pendingNegativeSeq;
-          state.firstNegativeTime = state.pendingNegativeTime;
+          this.firstNegativeSeq = this.pendingNegativeSeq;
+          this.firstNegativeTime = this.pendingNegativeTime;
           logInfo("Sonde: fin confirmée par 2 négatifs consécutifs", {
-            time: state.pendingNegativeTime.toFixed(1)
+            time: this.pendingNegativeTime.toFixed(1)
           });
-        } else if (pendingIndex < 0 || time < state.pendingNegativeTime) {
-          state.pendingNegativeSeq = entry.seq;
-          state.pendingNegativeTime = time;
+        } else if (pendingIndex < 0 || time < this.pendingNegativeTime) {
+          this.pendingNegativeSeq = entry.seq;
+          this.pendingNegativeTime = time;
           logInfo("Sonde: négatif candidat, confirmation requise", {
             time: time.toFixed(1)
           });
         }
       }
 
-      this.maybeResolveProbe();
+      this.maybeResolve();
     }
 
     /**
@@ -1544,20 +1416,18 @@
      * faux négatif OCR, la pub continue au-delà.
      */
     invalidateNegativeBoundsBefore(time) {
-      const state = this.probeState;
-
-      if (state.pendingNegativeSeq !== null && state.pendingNegativeTime <= time) {
+      if (this.pendingNegativeSeq !== null && this.pendingNegativeTime <= time) {
         logInfo("Sonde: négatif candidat invalidé par un positif postérieur", {
-          negatif: state.pendingNegativeTime.toFixed(1),
+          negatif: this.pendingNegativeTime.toFixed(1),
           positif: time.toFixed(1)
         });
-        state.pendingNegativeSeq = null;
-        state.pendingNegativeTime = Infinity;
+        this.pendingNegativeSeq = null;
+        this.pendingNegativeTime = Infinity;
       }
 
-      if (state.firstNegativeSeq !== null && state.firstNegativeTime <= time) {
-        state.firstNegativeSeq = null;
-        state.firstNegativeTime = Infinity;
+      if (this.firstNegativeSeq !== null && this.firstNegativeTime <= time) {
+        this.firstNegativeSeq = null;
+        this.firstNegativeTime = Infinity;
       }
     }
 
@@ -1567,24 +1437,23 @@
      * simplement à segment.end) : un grand saut exige 2 lectures positives.
      */
     extendAdEnd(endTime) {
-      const state = this.probeState;
       const currentTime = Number(this.mainVideo?.currentTime ?? 0);
       const jump = endTime - currentTime;
 
       if (jump > CONFIG.bigJumpThresholdSeconds &&
-          state.positiveCount < CONFIG.probeMinPositivesForBigJump) {
+          this.positiveCount < CONFIG.probeMinPositivesForBigJump) {
         logInfo("Sonde: extension retenue, confirmation requise", {
           end: endTime.toFixed(1),
           jump: jump.toFixed(1) + "s",
-          positiveCount: state.positiveCount
+          positiveCount: this.positiveCount
         });
         return;
       }
 
       const added = this.segmentStore.addSegment({
-        start: Math.max(0, state.startTime - CONFIG.segmentStartPadSeconds),
+        start: Math.max(0, this.startTime - CONFIG.segmentStartPadSeconds),
         end: endTime,
-        source: this.ocrSourceTag,
+        source: this.sourceTag,
         confidence: 0.85
       });
 
@@ -1592,7 +1461,7 @@
         logInfo("Sonde: fin de pub étendue", {
           end: endTime.toFixed(1),
           jump: jump.toFixed(1) + "s",
-          positiveCount: state.positiveCount
+          positiveCount: this.positiveCount
         });
       }
     }
@@ -1601,47 +1470,340 @@
      * La fin est localisée dès que le dernier positif et le premier négatif sont
      * des segments adjacents (~5s de granularité, imposée par le GOP).
      */
-    maybeResolveProbe() {
-      const state = this.probeState;
-      if (!state || state.firstNegativeSeq === null) return;
+    maybeResolve() {
+      if (this.firstNegativeSeq === null) return;
 
-      const positiveIndex = this.indexOfSeq(state.lastPositiveSeq);
-      const negativeIndex = this.indexOfSeq(state.firstNegativeSeq);
+      const positiveIndex = this.buffer.indexOfSeq(this.lastPositiveSeq);
+      const negativeIndex = this.buffer.indexOfSeq(this.firstNegativeSeq);
       if (positiveIndex < 0 || negativeIndex < 0) return;
       // Encadré soit par adjacence, soit parce qu'il ne reste rien à sonder
       // entre les deux bornes.
       if (negativeIndex - positiveIndex > 1 &&
-          this.hasUnscannedBetween(positiveIndex, negativeIndex)) {
+          this.buffer.hasUnscannedBetween(positiveIndex, negativeIndex)) {
         return;
       }
 
       // Borne haute confirmée par une lecture NÉGATIVE : pas de garde-fou ici,
       // la bissection est intrinsèquement bornée par le premier négatif.
       this.segmentStore.addSegment({
-        start: Math.max(0, state.startTime - CONFIG.segmentStartPadSeconds),
-        end: state.firstNegativeTime,
-        source: this.ocrSourceTag,
+        start: Math.max(0, this.startTime - CONFIG.segmentStartPadSeconds),
+        end: this.firstNegativeTime,
+        source: this.sourceTag,
         confidence: 0.9
       });
 
       // L'intérieur de la pub n'apprend plus rien : inutile de le rescanner.
       for (let i = positiveIndex; i < negativeIndex; i++) {
-        this.capturedSegments[i].scanned = true;
+        this.buffer.segments[i].scanned = true;
       }
-      this.lastScannedTime = state.firstNegativeTime;
 
       logInfo("Sonde: fin de pub localisée", {
-        start: state.startTime.toFixed(1),
-        end: state.firstNegativeTime.toFixed(1),
-        sondes: state.probes
+        start: this.startTime.toFixed(1),
+        end: this.firstNegativeTime.toFixed(1),
+        sondes: this.probes
       });
 
-      this.probeState = null;
+      this.resolved = true;
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  AheadScanner — orchestration du look-ahead                         */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Chef d'orchestre du look-ahead : fait tourner la boucle de scan sur les
+   * segments capturés, envoie les keyframes décodées à l'OCR, accumule les
+   * détections en segments commerciaux et arme la sonde de fin de pub.
+   *
+   * Quand aucune donnée MSE n'arrive (lecteur non-MSE) ou que le codec n'est
+   * pas décodable, bascule sur un repli qui OCRise le lecteur visible.
+   */
+  class AheadScanner {
+    constructor({ mainVideo, frameClassifier, segmentStore }) {
+      this.mainVideo = mainVideo;
+      this.frameClassifier = frameClassifier;
+      this.segmentStore = segmentStore;
+
+      this.ocrSourceTag = "ahead-ocr";
+
+      this.buffer = new MseSegmentBuffer({
+        onInitSegment: () => this.onInitSegment(),
+        onNewMediaSource: () => this.onNewMediaSource()
+      });
+
+      this.decoder = new DecoderSandbox({
+        buffer: this.buffer,
+        mainVideo,
+        onUnsupportedCodec: () => this.switchToFallback()
+      });
+
+      // Sonde de fin de pub ; null = balayage séquentiel.
+      this.probe = null;
+
+      // Boucle de scan
+      this.lastScannedTime = -Infinity;
+      this.scanLoopStopped = true;
+      this.scanLoopRunning = false;
+
+      // Repli OCR sur la vidéo principale
+      this.useFallback = false;
+      this.fallbackTimeout = null;
+      this.fallbackInterval = null;
+      // Ré-entrance du seul chemin qui en a besoin : le repli est piloté par un
+      // setInterval, la boucle de scan MSE est séquentielle par construction.
+      this.fallbackBusy = false;
+
+      // Compteurs de diagnostic
+      this.totalScans = 0;
+      this.totalFramesDecoded = 0;
+      this.totalOcrMatches = 0;
+      this.heartbeatInterval = null;
+    }
+
+    async start() {
+      if (!this.frameClassifier.isAvailable()) {
+        logWarn("Aucun moteur OCR disponible, AheadScanner désactivé.");
+        return;
+      }
+
+      if (!mp4demux) {
+        logWarn("mp4demux non chargé — le réassemblage fMP4 est indisponible.");
+      }
+
+      logInfo("AheadScanner démarré", {
+        backend: this.frameClassifier.getBackendLabel()
+      });
+
+      this.buffer.listen();
+      this.startScanLoop();
+
+      // Sans donnée MSE au bout de quelques secondes, on replie sur l'OCR du
+      // lecteur visible.
+      this.fallbackTimeout = window.setTimeout(() => {
+        if (!this.buffer.initSegment) {
+          logWarn("Aucun segment MSE reçu — repli OCR sur la vidéo principale.");
+          this.switchToFallback();
+        }
+      }, CONFIG.noMseDataTimeoutMs);
+
+      this.heartbeatInterval = window.setInterval(
+        () => this.logHeartbeat(),
+        CONFIG.heartbeatMs
+      );
+    }
+
+    stop() {
+      this.buffer.stopListening();
+      this.scanLoopStopped = true;
+
+      if (this.fallbackTimeout !== null) {
+        window.clearTimeout(this.fallbackTimeout);
+        this.fallbackTimeout = null;
+      }
+
+      if (this.fallbackInterval !== null) {
+        window.clearInterval(this.fallbackInterval);
+        this.fallbackInterval = null;
+      }
+
+      if (this.heartbeatInterval !== null) {
+        window.clearInterval(this.heartbeatInterval);
+        this.heartbeatInterval = null;
+      }
+
+      this.lastScannedTime = -Infinity;
+      this.fallbackBusy = false;
+      this.probe = null;
+      this.buffer.clear();
+      this.decoder.destroy();
     }
 
     /* ---------------------------------------------------------------- */
-    /*  Fallback: OCR on main video (no MSE data available)              */
+    /*  Réactions aux évènements du tampon MSE                           */
     /* ---------------------------------------------------------------- */
+
+    onInitSegment() {
+      // On reçoit de la donnée MSE : le repli n'a plus lieu d'être.
+      if (this.fallbackTimeout !== null) {
+        window.clearTimeout(this.fallbackTimeout);
+        this.fallbackTimeout = null;
+      }
+      if (this.fallbackInterval !== null) {
+        window.clearInterval(this.fallbackInterval);
+        this.fallbackInterval = null;
+      }
+
+      this.useFallback = false;
+      this.ocrSourceTag = "ahead-ocr";
+      this.decoder.invalidateConfiguration();
+      // Le repli avait pu arrêter la boucle de scan : on la relance.
+      this.startScanLoop();
+    }
+
+    onNewMediaSource() {
+      this.lastScannedTime = -Infinity;
+      this.probe = null;
+      this.decoder.invalidateConfiguration();
+    }
+
+    /* ---------------------------------------------------------------- */
+    /*  Boucle de scan                                                   */
+    /* ---------------------------------------------------------------- */
+
+    /** (Re)démarre la boucle de scan ; sans effet si elle tourne déjà. */
+    startScanLoop() {
+      this.scanLoopStopped = false;
+      void this.runScanLoop();
+    }
+
+    /**
+     * Les scans s'enchaînent dos à dos tant qu'il reste du backlog. On n'attend
+     * `analysisPollMs` que lorsqu'il n'y a rien à faire — c'est un intervalle
+     * d'INACTIVITÉ, pas un plafond de débit (un setInterval quantisait le cycle
+     * à 2 ticks, soit la moitié du débit perdue en attente alors que ~25s de
+     * contenu attendaient en file).
+     */
+    async runScanLoop() {
+      if (this.scanLoopRunning) return; // jamais deux boucles sur une instance
+      this.scanLoopRunning = true;
+
+      try {
+        while (!this.scanLoopStopped) {
+          let didWork = false;
+
+          try {
+            didWork = await this.scanNext();
+          } catch (error) {
+            logWarn("AheadScanner: boucle de scan interrompue", {
+              error: formatError(error)
+            });
+          }
+
+          if (!didWork) {
+            await sleep(CONFIG.analysisPollMs);
+          }
+        }
+      } finally {
+        this.scanLoopRunning = false;
+      }
+    }
+
+    /** @returns {Promise<boolean>} true si un segment a été traité. */
+    async scanNext() {
+      if (this.useFallback) return false; // pris en charge par le repli
+      if (!this.buffer.initSegment || this.buffer.segments.length === 0) return false;
+
+      try {
+        const configured = await this.decoder.ensureConfigured();
+        if (!configured) return false;
+
+        // Hors sonde : balayage séquentiel (plus ancien segment non scanné).
+        // En sonde : on vise le bord du buffer, puis on bissecte.
+        const probe = this.probe;
+        const segmentEntry = probe ? probe.pickSegment() : this.buffer.nextUnscanned();
+        this.dropProbeIfResolved();
+        if (!segmentEntry) return false;
+
+        segmentEntry.scanned = true;
+        this.totalScans += 1;
+        if (probe) probe.probes += 1;
+
+        // En sonde on vise une keyframe PRÉCISE, en avance sur tout ce qui a été
+        // scanné : le filtre minTime l'écarterait.
+        const minTime = probe
+          ? -Infinity
+          : this.lastScannedTime + CONFIG.frameSampleSeconds;
+
+        const result = await this.decoder.scanSegment(segmentEntry, {
+          minTime,
+          sampleInterval: CONFIG.frameSampleSeconds
+        });
+
+        const frames = result.frames ?? [];
+        this.totalFramesDecoded += frames.length;
+
+        if (frames.length === 0) {
+          // Sans keyframe décodée, ce segment n'apprend rien à la sonde ; on le
+          // laisse marqué scanné pour que la bissection passe au suivant.
+          logInfo("AheadScanner: scan-segment OK mais aucune keyframe utile", {
+            minTime: Number.isFinite(minTime) ? minTime.toFixed(1) : "-",
+            tsRange: result.tsRange
+              ? `${result.tsRange.start.toFixed(1)}..${result.tsRange.end.toFixed(1)}`
+              : "-",
+            bufferBytes: segmentEntry.data?.byteLength ?? 0
+          });
+          return true;
+        }
+
+        for (const frame of frames) {
+          await this.analyseFrame(frame, segmentEntry, probe);
+        }
+
+        return true;
+      } catch (error) {
+        logWarn("AheadScanner: échec scan-segment", {
+          error: formatError(error)
+        });
+        return false;
+      }
+    }
+
+    async analyseFrame(frame, segmentEntry, probe) {
+      if (!frame.imageBitmap) return;
+
+      try {
+        const detection = await this.frameClassifier.detect(
+          frame.imageBitmap,
+          frame.timestamp
+        );
+
+        try { frame.imageBitmap.close(); } catch { /* ignore */ }
+
+        if (probe) {
+          probe.consumeResult(segmentEntry, frame.timestamp, detection);
+          this.dropProbeIfResolved();
+        } else {
+          this.consumeDetection(detection, segmentEntry);
+          this.lastScannedTime = frame.timestamp;
+        }
+        if (detection.hasCommercialKeyword) this.totalOcrMatches += 1;
+
+        logInfo("AheadScanner: frame analysée", {
+          time: frame.timestamp.toFixed(1),
+          mode: probe ? "sonde" : "séquentiel",
+          keyword: detection.hasCommercialKeyword,
+          matched: detection.matchedKeywords,
+          ocrSource: detection.source,
+          textPreview: (detection.extractedText ?? "").slice(0, 80),
+          lead: (frame.timestamp - this.mainVideo.currentTime).toFixed(1) + "s en avance"
+        });
+      } catch (error) {
+        try { frame.imageBitmap.close(); } catch { /* ignore */ }
+        logWarn("AheadScanner: échec OCR sur frame décodée", {
+          time: frame.timestamp,
+          error: formatError(error)
+        });
+      }
+    }
+
+    /** La sonde a encadré la fin : on reprend le balayage séquentiel après elle. */
+    dropProbeIfResolved() {
+      if (!this.probe?.resolved) return;
+      this.lastScannedTime = this.probe.firstNegativeTime;
+      this.probe = null;
+    }
+
+    /* ---------------------------------------------------------------- */
+    /*  Repli : OCR sur la vidéo principale                              */
+    /* ---------------------------------------------------------------- */
+
+    /** Bascule sur l'OCR du lecteur visible (pas de MSE, ou codec indécodable). */
+    switchToFallback() {
+      this.useFallback = true;
+      this.ocrSourceTag = "main-video-ocr";
+      this.startFallbackPolling();
+    }
 
     startFallbackPolling() {
       if (this.fallbackInterval !== null) return;
@@ -1676,19 +1838,19 @@
     }
 
     /* ---------------------------------------------------------------- */
-    /*  Detection accumulation (same logic as old GhostAnalyzer)         */
+    /*  Accumulation des détections                                      */
     /* ---------------------------------------------------------------- */
 
+    /**
+     * Commit PROACTIF : dès qu'un mot-clé commercial est vu (souvent en avance
+     * grâce au look-ahead), on insère immédiatement un segment
+     * `[t - marge, t + fenêtre]`. Les détections successives se fusionnent
+     * (`mergeGapSeconds`) en un segment qui couvre toute la pub, et le
+     * SkipController peut couper dès le DÉBUT — sans attendre la fin.
+     */
     consumeDetection(detection, segmentEntry = null) {
       const t = Number(detection.sampleTime ?? 0);
       if (!Number.isFinite(t)) return;
-
-      // Seules les détections positives comptent. Commit PROACTIF : dès qu'un
-      // mot-clé commercial est vu (souvent en avance via le look-ahead), on
-      // insère immédiatement un segment [t-marge, t+fenêtre]. Les détections
-      // successives se fusionnent (mergeGapSeconds) en un segment qui couvre
-      // toute la pub, et le SkipController peut couper dès le DÉBUT — sans
-      // attendre la fin + une période de grâce comme auparavant.
       if (!detection.hasCommercialKeyword) return;
 
       const start = Math.max(0, t - CONFIG.segmentStartPadSeconds);
@@ -1705,26 +1867,64 @@
         logInfo("Segment OCR ajouté/étendu", { start, end, source: this.ocrSourceTag });
       }
 
-      // Arme la sonde : à partir d'ici, cesser de balayer la pub segment par
-      // segment (13 analyses pour 68s) et aller localiser sa FIN au bord du
-      // buffer (~5-6 analyses). Sans segment capturé (mode fallback vidéo), il
-      // n'y a rien à sonder : on reste en séquentiel.
-      if (!this.probeState && segmentEntry && !this.useFallback) {
-        this.probeState = {
+      // Sans segment capturé (mode repli vidéo), il n'y a rien à sonder : on
+      // reste en balayage séquentiel.
+      if (!this.probe && segmentEntry && !this.useFallback) {
+        this.probe = new AdEndProbe({
+          buffer: this.buffer,
+          segmentStore: this.segmentStore,
+          mainVideo: this.mainVideo,
+          sourceTag: this.ocrSourceTag,
           startTime: t,
-          lastPositiveSeq: segmentEntry.seq,
-          lastPositiveTime: t,
-          firstNegativeSeq: null,
-          firstNegativeTime: Infinity,
-          pendingNegativeSeq: null,
-          pendingNegativeTime: Infinity,
-          positiveCount: 1,
-          probes: 0
-        };
+          firstSegment: segmentEntry
+        });
         logInfo("Sonde armée", { start: t.toFixed(1) });
       }
     }
+
+    /* ---------------------------------------------------------------- */
+    /*  Diagnostic                                                       */
+    /* ---------------------------------------------------------------- */
+
+    /** Secondes de vidéo déjà bufferisées devant le playhead. */
+    bufferedAhead(currentTime) {
+      const buffered = this.mainVideo?.buffered;
+      if (!buffered) return 0;
+
+      for (let i = 0; i < buffered.length; i++) {
+        if (buffered.start(i) <= currentTime && currentTime <= buffered.end(i)) {
+          return buffered.end(i) - currentTime;
+        }
+      }
+      return 0;
+    }
+
+    logHeartbeat() {
+      const currentTime = Number(this.mainVideo?.currentTime ?? 0);
+
+      logInfo("AheadScanner heartbeat", {
+        currentTime: currentTime.toFixed(1),
+        bufferedAhead: this.bufferedAhead(currentTime).toFixed(1) + "s",
+        decoderConfigured: this.decoder.configured,
+        useFallback: this.useFallback,
+        capturedSegments: `${this.buffer.segments.length} (${this.buffer.unscannedCount} non scannés)`,
+        mediaSegmentsReceived: this.buffer.totalReceived,
+        scansRun: this.totalScans,
+        framesDecoded: this.totalFramesDecoded,
+        ocrMatches: this.totalOcrMatches,
+        ocrBackend: this.frameClassifier?.getBackendLabel?.() ?? "?",
+        tesseractErrors: this.frameClassifier?.tesseractErrorCount ?? 0,
+        tesseractDisabled: this.frameClassifier?.tesseractDisabled ?? false,
+        storeSize: this.segmentStore?.segments?.length ?? 0,
+        lastScannedTime: Number.isFinite(this.lastScannedTime)
+          ? this.lastScannedTime.toFixed(1)
+          : "-",
+        mode: this.probe ? "sonde" : "séquentiel",
+        probe: this.probe ? this.probe.describe() : "-"
+      });
+    }
   }
+
 
   class SkipController {
     constructor({ video, segmentStore, notifier }) {

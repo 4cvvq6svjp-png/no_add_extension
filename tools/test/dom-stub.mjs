@@ -136,8 +136,9 @@ export function loadContentScript() {
 
   const source = readFileSync(join(REPO_ROOT, "content/mainContent.js"), "utf8");
   const exportLine =
-    "\n  globalThis.__CONTENT_INTERNALS__ = { CONFIG, SegmentStore, FrameClassifier, " +
-    "SkipController, OverlayDetector, AheadScanner, SandboxBridge, " +
+    "\n  globalThis.__CONTENT_INTERNALS__ = { CONFIG, SegmentStore, RoiComposer, " +
+    "FrameClassifier, TesseractOcr, SkipController, OverlayDetector, AheadScanner, " +
+    "MseSegmentBuffer, DecoderSandbox, AdEndProbe, SandboxBridge, " +
     "extractCommercialKeywords, combineSources, normalizeText };\n})();\n";
 
   const closing = /\n\}\)\(\);\s*$/;
