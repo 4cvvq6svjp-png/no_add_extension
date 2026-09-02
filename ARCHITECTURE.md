@@ -53,7 +53,7 @@ YouTube Page
         │   │   ├── decoder-sandbox.js  (WebCodecs VideoDecoder)
         │   │   └── libs/mp4demux.js    (fMP4 + WebM parser)
         │   └── FrameClassifier
-        │       ├── TextDetector API   (fast native pre-filter)
+        │       ├── TextDetector API   (fast native backend, when present)
         │       └── ocr-sandbox iframe
         │           └── Tesseract.js   (heavy OCR fallback)
         ├── SegmentStore       (stores detected commercial ranges)
@@ -74,7 +74,7 @@ YouTube Page
 - Patches `MediaSource.prototype.addSourceBuffer` to record which `SourceBuffer` instances carry video (based on MIME type: `video/*`, `avc`, `vp0`, `av01`).
 - Patches `SourceBuffer.prototype.appendBuffer` to intercept every buffer append. For video buffers, it **copies the data before** delegating to the original `appendBuffer` and sends the copy via `window.postMessage`. The copy must happen before the original call because the MSE implementation can take ownership of a transferable buffer and detach it asynchronously, after which the copy attempt would silently fail.
 - Patches `URL.createObjectURL` to detect when YouTube creates a new `MediaSource` (happens on SPA navigation to a new video) and resets the buffer.
-- Maintains a **replay buffer** (`lastInitSegment` + `pendingMediaSegments`, max 20 segments) so that if the ISOLATED world content script starts after some segments have already been appended, it can request a replay and not miss them.
+- Maintains a **replay buffer** (`lastInitSegment` + `pendingMediaSegments`, max 20 segments) so that if the ISOLATED world content script starts after some segments have already been appended, it can request a replay and not miss them. Buffering stops once a replay has been served — the content script only asks once per session — and resumes on the next `MediaSource`, so full segments are not pinned in memory for the whole video.
 - Classifies each buffer as either an **init segment** (contains `ftyp`/`moov` for fMP4, or starts with EBML magic `0x1A45DFA3` for WebM) or a **media segment** (everything else).
 - Attaches a `container` field (`"mp4"` or `"webm"`) to each message, derived from the SourceBuffer's MIME type.
 
@@ -121,14 +121,14 @@ A UI element: a small semi-transparent overlay injected into `#movie_player` tha
 **Role:** OCR engine that takes a video frame (from a `<video>` element or an `ImageBitmap`) and returns whether it contains commercial keywords.
 
 **How it works:**
-- Draws the source image to a 420×236 canvas.
-- Crops the top 25% of the canvas into an ROI canvas (420×59). The disclosure overlay always appears near the top of the frame.
-- Sends the ROI canvas to one of two OCR backends:
+- Crops the four corners of the frame **at its native resolution** (no intermediate downscale) and upscales them into a 2×2 composite, so a single OCR pass covers every corner the disclosure may sit in.
+- Each cell keeps the crop's aspect ratio: a free-ratio cell stretched glyphs vertically (×1.66 with the former 1600×900 composite) and cost OCR accuracy.
+- Binarizes the composite (near-white pixels only) and sends it to one of two OCR backends:
 
 **Backend 1: `TextDetector` API (Chrome Shape Detection API)**
 - Native browser API, extremely fast (~5–15ms).
 - Used as the primary backend when available (Chromium 88+, not Firefox, not all platforms).
-- Also used as a fast pre-filter when Tesseract is the primary backend: if `TextDetector` finds no text blocks at all, skip the Tesseract call entirely.
+- Backend selection is exclusive: when `TextDetector` exists it *is* the backend, otherwise Tesseract is. A `TextDetector` pre-filter in front of Tesseract used to be described here and coded in `detectWithTesseract`, but the two conditions are mutually exclusive so it could never run; the dead branch was removed.
 
 **Backend 2: Tesseract.js (inside OCR sandbox iframe)**
 - Tesseract is a full OCR engine compiled to WebAssembly (~20MB).
@@ -163,7 +163,7 @@ A UI element: a small semi-transparent overlay injected into `#movie_player` tha
    - Receives back an array of `{ timestamp, imageBitmap }` decoded keyframes.
    - For each bitmap, calls `frameClassifier.detectFromBitmap()`, then `consumeDetection()`.
    - Closes each bitmap after use.
-4. **`consumeDetection()`**: Accumulates OCR results into commercial segments. An "active commercial" starts when a keyword is detected. It ends when `noMatchGraceSeconds = 8s` of non-matching frames pass. The finished segment is added to `SegmentStore`.
+4. **`consumeDetection()`**: Commits proactively — every positive detection immediately stores `[t - segmentStartPadSeconds, t + segmentForwardSeconds]`, and successive detections merge (`mergeGapSeconds`). The real end of the ad is then located by the bisection probe (see DEV-NOTES §2.6), not by waiting out a grace period.
 5. **Fallback mode**: If `useFallback = true`, `startFallbackPolling()` creates an interval that calls `fallbackTick()` every 1200ms. This reads frames directly from the visible `<video>` element using `detectFromVideo()` — same OCR path, no decoder needed.
 
 #### 4.2.6 `SkipController`
@@ -193,8 +193,6 @@ A UI element: a small semi-transparent overlay injected into `#movie_player` tha
 |--------|---------|----------|
 | `configure` | `{ initSegment: ArrayBuffer, container, mime, fallbackWidth, fallbackHeight }` | `configure-ok` / `configure-err` |
 | `scan-segment` | `{ mediaSegment: ArrayBuffer, minTime, sampleInterval }` | `scan-segment-ok { frames[] }` / `scan-segment-err` |
-| `decode` | `{ data: ArrayBuffer, timestamp, isKeyframe, duration? }` | `decode-ok { imageBitmap }` / `decode-err` |
-| `reset` | — | `reset-ok` |
 | `terminate` | — | `terminate-ok` |
 
 **`configure` handler:**
@@ -220,15 +218,15 @@ The caller (`AheadScanner.ensureDecoderConfigured`) snapshots `initSegment` / `c
 
 ### 6. `libs/mp4demux.js` — Container Parser Library
 
-**Role:** Pure JS library for parsing fMP4 (ISO BMFF) and WebM (EBML/Matroska) container formats. Loaded inside the decoder iframe only.
+**Role:** Pure JS library for parsing fMP4 (ISO BMFF) and WebM (EBML/Matroska) container formats. Loaded **both** inside the decoder iframe and in the isolated world (declared before `mainContent.js` in the manifest), so `AheadScanner`'s fMP4 reassembly reads box headers with the same `readBoxHeader` as the demuxer rather than its own copy.
 
 #### 6.1 fMP4 functions
 
-- **`parseInitSegment(buffer)`**: Walks the ISO BMFF box tree to find `moov > trak > mdia > minf > stbl > stsd`. Extracts codec string (`avc1.PPCCLL`, `hvc1.…`, `mp4a.40.2`, etc.), coded dimensions, and the codec-specific descriptor box (`avcC`, `hvcC`, `av1C`, `vpcC`).
-- **`parseTimescale(buffer)`**: Reads `moov > mvhd` for the movie timescale.
+- **`readBoxHeader(bytes, pos)`**: Reads one box header (type, size, header size), handling the 64-bit extended size and reporting the "runs to end of stream" case through `extendsToEnd`. Returns `null` when the header itself is incomplete, so a caller reassembling a byte stream can tell "wait for more" from "malformed". Shared by `iterateBoxes`, `AheadScanner.extractMp4Segments` and the decoder's empty-segment diagnostic.
+- **`codecFromMime(mime)`**: Extracts the `codecs=` parameter, preserving case (AV1 encodes its tier as an uppercase `M`/`H`).
+- **`parseInitSegment(buffer, mime)`**: Takes the codec string from the MIME, then walks `moov > trak > mdia > minf > stbl > stsd` for the coded dimensions and copies the raw bytes of the first codec-configuration box (`avcC`, `hvcC`, `vpcC`, `av1C`) as WebCodecs `description`. Any sample entry type works, so `hvc1` and `vp09`-in-mp4 need no new code path.
+- **`parseTimescale(buffer)`**: Reads `moov > trak > mdia > mdhd` for the media timescale.
 - **`parseMediaSegment(buffer, { timescale, defaultSampleDuration, defaultSampleSize, defaultSampleFlags })`**: Walks `moof > traf > tfhd + tfdt + trun` boxes to extract individual sample records. Returns `[{ data, timestamp (seconds), duration, isKeyframe }]`.
-
-**Utility helpers:** `hex(n)`, `pad2(n)` — used to build codec strings like `avc1.64001f`.
 
 #### 6.2 WebM / EBML functions
 
@@ -312,17 +310,20 @@ On page load at `https://www.youtube.com/watch`:
 
 All tuneable constants are in the `CONFIG` object at the top of `mainContent.js`:
 
+All timing constants live in `CONFIG` too — sandbox timeouts, poll cadences and give-up thresholds were hard-coded until the A/B/C cleanup.
+
 | Parameter | Default | Meaning |
 |-----------|---------|---------|
-| `frameSampleSeconds` | 5 | Minimum gap between analyzed keyframes |
+| `frameSampleSeconds` | 4 | Minimum gap between analyzed keyframes |
 | `minSegmentSeconds` | 3 | Minimum duration for a segment to be stored |
 | `mergeGapSeconds` | 2 | Merge segments closer than this |
-| `noMatchGraceSeconds` | 8 | Non-matching frames needed to close an active commercial |
 | `skipMarginSeconds` | 0.4 | Extra seconds to seek past segment end |
 | `skipCooldownMs` | 900 | Minimum ms between consecutive skips |
 | `analysisPollMs` | 1200 | `scanNext` / `fallbackTick` interval |
-| `canvasWidth/Height` | 420×236 | Resolution for OCR canvas |
-| `ocrRoiTopFraction` | 0.25 | Top fraction of frame sent to OCR |
+| `ocrCornerWidthFraction` | 0.30 | Width of each corner crop, as a fraction of the frame |
+| `ocrCornerHeightFraction` | 0.18 | Height of each corner crop |
+| `ocrCompositeWidth` | 1600 | Composite width; the height is derived from the crop ratio |
+| `ocrBinarizeThreshold` | 190 | Luminance above which a pixel is treated as text |
 | `overlayPollMs` | 750 | DOM overlay check interval |
 | `initTimeoutMs` | 20000 | Max wait for `<video>` element |
 
@@ -332,17 +333,17 @@ All tuneable constants are in the `CONFIG` object at the top of `mainContent.js`
 
 | Issue | Severity | Status |
 |-------|----------|--------|
-| AV1 codec string emitted by `parseAv1C` was malformed (`av01.P.LLT.BB.CCC` instead of `av01.P.LLT.BB.M.CCC`) — `VideoDecoder.isConfigSupported` rejected every AV1 stream | ~~High~~ | **Fixed.** `parseAv1C` now reads `chroma_sample_position` and emits the proper monochrome digit + 3-digit chroma triplet per ISO BMFF. Critical because YouTube now ships AV1/fMP4 on Linux (see §7). |
+| AV1 codec string emitted by `parseAv1C` was malformed — `VideoDecoder.isConfigSupported` rejected every AV1 stream | ~~High~~ | **Fixed, then removed as a failure mode.** The codec string now comes from the SourceBuffer MIME type, which already carries a valid WebCodecs string; `parseAvcC`/`parseVpcC`/`parseAv1C` are gone and only the raw configuration-box bytes are still read from the container. |
 | `AheadScanner` re-attempted `configure` every 1.2 s indefinitely when the platform genuinely lacked a decoder, flooding the console | Medium | **Fixed.** `ensureDecoderConfigured` tracks failures per init segment; after 3 failures on the same init it pins `configureFailedInit`, switches `useFallback = true`, and starts the main-video OCR poller. Counters reset on every new init segment. |
 | WebM coded size returns (0, 0) from EBML parser | ~~High~~ | **Fixed.** Root cause was `iterateEbml` breaking on the streaming `Segment` element (size = -1). Replaced with `findEbml`, a flat-scan helper that descends past unknown-size containers. The `videoWidth/videoHeight` fallback remains as a safety net. |
 | Buffer copy in `mseInterceptor` happened after `origAppendBuffer` | High | **Fixed.** Copy is now performed before the original call, so the MSE implementation cannot detach a transferable buffer out from under us. |
 | Configure race: stale init bytes if quality switch happens during configure round-trip | Medium | **Fixed.** `ensureDecoderConfigured` snapshots `initSegment` and re-checks identity after the await; if a fresher init arrived, `decoderConfigured` stays false and the next scan tick reconfigures. |
 | Tesseract worker fetches `fra.traineddata` from `tessdata.projectnaptha.com` | Medium | Open. Architecture claims "no remote code", but the language data is loaded from a CDN. On builds where `TextDetector` is available (most Linux/Windows Chromium ≥ 88) the Tesseract path is never hit; otherwise a network failure leaves OCR unavailable until the next session. Fix: bundle `fra.traineddata.gz` under `libs/tesseract/lang-data/` and point `langPath` at `chrome.runtime.getURL(...)`. |
-| `decoderBridgePromise` may be stale if iframe disconnects unexpectedly | Medium | Returns cached promise; iframe reload would require a full `stop()`/`start()` cycle |
-| `scanInterval` continues ticking even in `useFallback = true` mode | Low | Wastes one check per 1.2s (early-return guard present) |
+| Sandbox iframe disconnecting unexpectedly | ~~Medium~~ | **Fixed.** `SandboxBridge.ensureReady()` checks `iframe.isConnected` and rebuilds the sandbox instead of returning a cached promise. |
+| Scan loop still ticking in `useFallback = true` mode | ~~Low~~ | **Fixed.** `startFallbackPolling()` stops the loop; a new init segment restarts it via `startScanLoop()`. |
 | Transferring media segment neuters `segmentEntry.data` | Design | If `scan-segment` fails, the data is unrecoverable — no retry possible |
-| `evictOldSegments` evicts by count (>30), not by time behind playback | Low | Comment says "10s behind video" but implementation is count-based |
-| `pendingDecode` is a single shared slot in `decoder-sandbox.js` | Low | Works because `scan-segment` decodes keyframes sequentially and VP9 keyframes produce one output each. A queue would harden the rare super-frame / multi-output case. |
+| `evictOldSegments` evicts by count (`maxCapturedSegments`), not by time behind playback | Low | Deliberate and now documented as such; the probe tolerates it through stable `seq` ids (but see the evicted-bound case in the review's `E2`). |
+| Mapping decoded frames back to their request in `decoder-sandbox.js` | ~~Low~~ | **Fixed.** The single `pendingDecode` slot became a map keyed by chunk timestamp, so a dropped frame cannot shift later bitmaps onto the wrong keyframe. The batch is now queued before a single `flush()` instead of flushing per keyframe. |
 | YouTube could change its SourceBuffer MIME patterns | External risk | The `isVideoMime()` heuristic (`avc`, `vp0`, `av01`) may miss new codecs |
 | `TextDetector` API is not available on all Chromium builds | Platform | Gracefully falls back to Tesseract; performance degrades significantly |
 | AV1 (`av01`) on WebM is not handled | Medium | Only fMP4 AV1 is implicitly handled; AV1-in-WebM would need a new EBML codec path |
@@ -371,7 +372,7 @@ To make end-to-end pipeline failures debuggable from the DevTools console alone,
 
 ### 12. Security and Extension Permissions
 
-- **Permissions:** `storage` only (not used yet, reserved for settings).
+- **Permissions:** none. The extension declares no `permissions` at all; the service worker that used `storage` had no consumer and was removed.
 - **Host permissions:** `https://www.youtube.com/*` only.
 - **CSP for extension pages:** `script-src 'self' 'wasm-unsafe-eval'; object-src 'self'` — minimal, allows WASM for Tesseract.
 - **No remote code:** All resources are bundled in the extension package. Tesseract WASM is loaded from `libs/tesseract/*` (web-accessible resources).

@@ -1,17 +1,14 @@
 /**
  * Decoder Sandbox — WebCodecs VideoDecoder running inside an extension iframe.
  *
- * Receives encoded video frames from the content script, decodes them via
- * VideoDecoder, draws the resulting VideoFrame to a canvas, and sends back
- * an ImageBitmap.
+ * Receives raw container data from the content script, demuxes it, decodes the
+ * keyframes and sends back ImageBitmaps for OCR.
  *
  * Communication channel: "no-add-decoder"
  *
- * Message types:
- *   configure   — init segment ArrayBuffer → configure the VideoDecoder
- *   decode      — encoded chunk ArrayBuffer + timestamp + isKeyframe → ImageBitmap
- *   reset       — reset decoder state (video change)
- *   terminate   — clean up
+ *   configure     — init segment ArrayBuffer -> configure the VideoDecoder
+ *   scan-segment  — media segment ArrayBuffer -> ImageBitmap per keyframe
+ *   terminate     — release the decoder
  */
 (() => {
   "use strict";
@@ -20,23 +17,38 @@
   const TAG = "[NoAdd-Decoder]";
   const mp4 = window.__mp4demux;
 
+  /** Safety net: a batch that produces no output must not hang the scanner. */
+  const DECODE_BATCH_TIMEOUT_MS = 10000;
+  /** Top-level box types listed when a media segment yields no sample. */
+  const MAX_DIAGNOSTIC_BOXES = 6;
+
   let decoder = null;
   let canvas = null;
   let ctx = null;
-  let pendingDecode = null; // { resolve, reject, timeout }
   let codecInfo = null;
+
+  /**
+   * Pending decodes, keyed by the chunk timestamp in microseconds.
+   *
+   * Keying by timestamp rather than by arrival order means a frame the decoder
+   * silently drops cannot shift every later frame onto the wrong request — the
+   * bitmap always lands on the keyframe that asked for it.
+   *
+   * @type {Map<number, { resolve: (b: ImageBitmap | null) => void, reject: (e: Error) => void }>}
+   */
+  const decodeWaiters = new Map();
 
   function reply(payload, transfer) {
     window.parent.postMessage({ channel: CHANNEL, ...payload }, "*", transfer ?? []);
   }
 
-  function formatErr(error) {
+  function formatError(error) {
     if (error instanceof Error) return error.message || error.name || "Error";
     return String(error);
   }
 
   /* ------------------------------------------------------------------ */
-  /*  Canvas                                                             */
+  /*  VideoDecoder lifecycle                                             */
   /* ------------------------------------------------------------------ */
 
   function ensureCanvas(width, height) {
@@ -46,9 +58,26 @@
     }
   }
 
-  /* ------------------------------------------------------------------ */
-  /*  VideoDecoder lifecycle                                             */
-  /* ------------------------------------------------------------------ */
+  function settleWaiter(timestampUs, bitmap, error) {
+    // Fall back to the oldest pending request if the decoder reported a
+    // timestamp we never asked for (container/codec rounding).
+    const key = decodeWaiters.has(timestampUs)
+      ? timestampUs
+      : decodeWaiters.keys().next().value;
+    if (key === undefined) return;
+
+    const waiter = decodeWaiters.get(key);
+    decodeWaiters.delete(key);
+    if (error) waiter.reject(error);
+    else waiter.resolve(bitmap);
+  }
+
+  function rejectAllWaiters(error) {
+    for (const waiter of decodeWaiters.values()) {
+      waiter.reject(error);
+    }
+    decodeWaiters.clear();
+  }
 
   function destroyDecoder() {
     if (decoder) {
@@ -56,16 +85,7 @@
       decoder = null;
     }
     codecInfo = null;
-    resolvePending(null, new Error("decoder destroyed"));
-  }
-
-  function resolvePending(bitmap, error) {
-    if (!pendingDecode) return;
-    const p = pendingDecode;
-    pendingDecode = null;
-    clearTimeout(p.timeout);
-    if (error) p.reject(error);
-    else p.resolve(bitmap);
+    rejectAllWaiters(new Error("decoder destroyed"));
   }
 
   function createDecoder() {
@@ -73,28 +93,265 @@
 
     decoder = new VideoDecoder({
       output(frame) {
+        const timestampUs = frame.timestamp;
         try {
           ensureCanvas(frame.displayWidth, frame.displayHeight);
           ctx.drawImage(frame, 0, 0);
           frame.close();
-
-          const bitmap = canvas.transferToImageBitmap();
-          resolvePending(bitmap, null);
-        } catch (err) {
+          settleWaiter(timestampUs, canvas.transferToImageBitmap(), null);
+        } catch (error) {
           frame.close();
-          resolvePending(null, err);
+          settleWaiter(timestampUs, null, error);
         }
       },
-      error(err) {
-        console.warn(TAG, "VideoDecoder error:", err);
-        resolvePending(null, err);
+      error(error) {
+        console.warn(TAG, "VideoDecoder error:", error);
+        rejectAllWaiters(error);
       }
     });
   }
 
+  /**
+   * Decode a batch of keyframes with a single flush.
+   *
+   * Flushing once per frame drains the decoder pipeline every time and paid the
+   * full latency per keyframe; the scan rate is what governs how much of an ad
+   * the viewer sees, so the whole batch is queued before flushing.
+   *
+   * @returns {Promise<Array<{ timestamp: number, duration: number, imageBitmap: ImageBitmap | null }>>}
+   */
+  async function decodeKeyframes(keyframes) {
+    if (keyframes.length === 0) return [];
+
+    const waits = [];
+    const timeout = setTimeout(
+      () => rejectAllWaiters(new Error("decode timeout")),
+      DECODE_BATCH_TIMEOUT_MS
+    );
+
+    try {
+      for (const keyframe of keyframes) {
+        const timestampUs = Math.round(keyframe.timestamp * 1_000_000);
+        waits.push(new Promise((resolve, reject) => {
+          decodeWaiters.set(timestampUs, { resolve, reject });
+        }));
+
+        decoder.decode(new EncodedVideoChunk({
+          type: "key",
+          timestamp: timestampUs,
+          duration: keyframe.duration ? Math.round(keyframe.duration * 1_000_000) : undefined,
+          data: keyframe.data
+        }));
+      }
+
+      await decoder.flush();
+      // flush() resolves once every output has been emitted, so anything still
+      // pending here produced no frame at all.
+      rejectAllWaiters(new Error("aucune frame produite"));
+    } catch (error) {
+      rejectAllWaiters(error);
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const settled = await Promise.allSettled(waits);
+    return settled.map((result, index) => ({
+      timestamp: keyframes[index].timestamp,
+      duration: keyframes[index].duration,
+      imageBitmap: result.status === "fulfilled" ? result.value : null,
+      error: result.status === "rejected" ? formatError(result.reason) : null
+    }));
+  }
+
   /* ------------------------------------------------------------------ */
-  /*  Message handler                                                    */
+  /*  Demuxing                                                           */
   /* ------------------------------------------------------------------ */
+
+  function demuxSamples(mediaBuffer) {
+    if (codecInfo.container === "webm") {
+      return mp4.parseWebMClusters(mediaBuffer, { timestampScale: codecInfo.timescale });
+    }
+    return mp4.parseMediaSegment(mediaBuffer, {
+      timescale: codecInfo.timescale,
+      defaultSampleDuration: 0,
+      defaultSampleSize: 0,
+      defaultSampleFlags: 0
+    });
+  }
+
+  /** Keyframes past `minTime`, spaced by at least `sampleInterval` seconds. */
+  function selectKeyframes(samples, minTime, sampleInterval) {
+    const keyframes = [];
+    let lastKeyframeTime = -Infinity;
+
+    for (const sample of samples) {
+      if (!sample.isKeyframe) continue;
+      if (sample.timestamp <= minTime) continue;
+      if (sample.timestamp <= lastKeyframeTime + sampleInterval) continue;
+      keyframes.push(sample);
+      lastKeyframeTime = sample.timestamp;
+    }
+
+    return keyframes;
+  }
+
+  /**
+   * When a media segment yields zero samples, list its top-level box types so
+   * we can tell pure indexing (styp/sidx) from a SABR-wrapped chunk or a
+   * parser miss.
+   */
+  function describeTopBoxes(mediaBuffer) {
+    const bytes = new Uint8Array(mediaBuffer);
+    const seen = [];
+    let pos = 0;
+
+    while (seen.length < MAX_DIAGNOSTIC_BOXES) {
+      const header = mp4.readBoxHeader(bytes, pos);
+      if (!header) break;
+      seen.push(`${header.type}(${header.size})`);
+      if (header.extendsToEnd || header.size < header.headerSize) break;
+      pos += header.size;
+      if (pos > bytes.length) break;
+    }
+
+    return seen.join(", ") || "(none)";
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Handlers                                                           */
+  /* ------------------------------------------------------------------ */
+
+  const HANDLERS = {
+    async configure(msg) {
+      if (!mp4) throw new Error("mp4demux not loaded");
+      if (!("VideoDecoder" in self)) throw new Error("WebCodecs VideoDecoder not available");
+
+      const initBuffer = msg.initSegment;
+      if (!(initBuffer instanceof ArrayBuffer)) throw new Error("initSegment must be ArrayBuffer");
+
+      const container = msg.container || "mp4";
+      const mime = msg.mime || "";
+
+      let info;
+      let timescale;
+
+      if (container === "webm") {
+        info = mp4.parseWebMInitSegment(initBuffer, mime);
+        if (!info) throw new Error("Failed to parse WebM init segment");
+        timescale = info.timestampScale; // stored as ns scale
+
+        console.info(TAG, "WebM EBML parse result:", {
+          codec: info.codec,
+          codedWidth: info.codedWidth,
+          codedHeight: info.codedHeight,
+          timestampScale: info.timestampScale,
+          bufferBytes: initBuffer.byteLength
+        });
+
+        // Fall back to the video element's dimensions when EBML misses them.
+        if (info.codedWidth === 0 || info.codedHeight === 0) {
+          const fallbackWidth = msg.fallbackWidth | 0;
+          const fallbackHeight = msg.fallbackHeight | 0;
+          if (fallbackWidth <= 0 || fallbackHeight <= 0) {
+            throw new Error("WebM EBML parsing returned coded size (0, 0) and no fallback dimensions provided");
+          }
+          console.warn(TAG, `WebM: EBML returned 0x0, using video-element fallback ${fallbackWidth}x${fallbackHeight}`);
+          info = { ...info, codedWidth: fallbackWidth, codedHeight: fallbackHeight };
+        }
+      } else {
+        info = mp4.parseInitSegment(initBuffer, mime);
+        if (!info) throw new Error(`Failed to parse init segment (mime: ${mime || "?"})`);
+        timescale = mp4.parseTimescale(initBuffer);
+      }
+
+      const config = {
+        codec: info.codec,
+        codedWidth: info.codedWidth,
+        codedHeight: info.codedHeight
+      };
+      if (info.description) {
+        config.description = info.description;
+      }
+
+      const support = await VideoDecoder.isConfigSupported(config);
+      if (!support.supported) {
+        throw new Error(`Codec not supported: ${info.codec}`);
+      }
+
+      createDecoder();
+      decoder.configure(config);
+      codecInfo = { ...info, timescale, container };
+
+      console.info(
+        TAG,
+        "Decoder configured:", info.codec,
+        `${info.codedWidth}x${info.codedHeight}`,
+        container === "webm" ? `timestampScale=${timescale}` : `timescale=${timescale}`
+      );
+
+      return { codec: info.codec, width: info.codedWidth, height: info.codedHeight, timescale };
+    },
+
+    async "scan-segment"(msg) {
+      if (!mp4) throw new Error("mp4demux not loaded");
+      if (!decoder || decoder.state !== "configured") throw new Error("Decoder not configured");
+      if (!codecInfo) throw new Error("No codec info");
+
+      const mediaBuffer = msg.mediaSegment;
+      if (!(mediaBuffer instanceof ArrayBuffer)) throw new Error("mediaSegment must be ArrayBuffer");
+
+      const minTime = msg.minTime ?? -Infinity;
+      const sampleInterval = msg.sampleInterval ?? 5;
+
+      const samples = demuxSamples(mediaBuffer);
+      const keyframes = selectKeyframes(samples, minTime, sampleInterval);
+      const keyframesTotal = samples.reduce((count, s) => count + (s.isKeyframe ? 1 : 0), 0);
+      const firstSampleTs = samples.length > 0 ? samples[0].timestamp : null;
+      const lastSampleTs = samples.length > 0 ? samples[samples.length - 1].timestamp : null;
+      const noSampleDiagnostic = samples.length === 0 && codecInfo.container === "mp4"
+        ? { bufBytes: mediaBuffer.byteLength, topBoxes: describeTopBoxes(mediaBuffer) }
+        : null;
+
+      console.info(TAG, "scan-segment parse:", {
+        samples: samples.length,
+        keyframesTotal,
+        keyframesKept: keyframes.length,
+        minTime: Number.isFinite(minTime) ? minTime.toFixed(2) : minTime,
+        tsRange: firstSampleTs !== null ? `${firstSampleTs.toFixed(2)}..${lastSampleTs.toFixed(2)}` : "(empty)",
+        container: codecInfo.container,
+        ...(noSampleDiagnostic ?? {})
+      });
+
+      const decoded = await decodeKeyframes(keyframes);
+      const frames = decoded.filter((frame) => frame.imageBitmap !== null);
+      const failures = decoded.filter((frame) => frame.imageBitmap === null);
+
+      if (failures.length > 0) {
+        console.warn(
+          TAG,
+          `scan-segment: ${failures.length}/${keyframes.length} keyframes failed to decode`,
+          failures.map((f) => ({ ts: f.timestamp, err: f.error }))
+        );
+      }
+
+      return {
+        // Time span of the segment, independent of which keyframes survived
+        // filtering. Reported for diagnostics on empty scans.
+        tsRange: firstSampleTs !== null ? { start: firstSampleTs, end: lastSampleTs } : null,
+        frames: frames.map((frame) => ({
+          timestamp: frame.timestamp,
+          duration: frame.duration,
+          imageBitmap: frame.imageBitmap
+        })),
+        __transfer: frames.map((frame) => frame.imageBitmap)
+      };
+    },
+
+    async terminate() {
+      destroyDecoder();
+      return {};
+    }
+  };
 
   window.addEventListener("message", async (event) => {
     if (event.source !== window.parent) return;
@@ -102,258 +359,17 @@
     const msg = event.data;
     if (!msg || msg.channel !== CHANNEL) return;
 
-    const reqId = msg.reqId;
+    const handler = HANDLERS[msg.type];
+    if (!handler) return;
 
-    /* ----- configure ----- */
-    if (msg.type === "configure") {
-      try {
-        if (!mp4) throw new Error("mp4demux not loaded");
-        if (!("VideoDecoder" in self)) throw new Error("WebCodecs VideoDecoder not available");
-
-        const initBuffer = msg.initSegment;
-        if (!(initBuffer instanceof ArrayBuffer)) throw new Error("initSegment must be ArrayBuffer");
-
-        const container = msg.container || "mp4";
-        const mime = msg.mime || "";
-
-        let info, timescale;
-        if (container === "webm") {
-          info = mp4.parseWebMInitSegment(initBuffer, mime);
-          if (!info) throw new Error("Failed to parse WebM init segment");
-          timescale = info.timestampScale; // stored as ns scale
-          // Log what the EBML parser found (for debugging)
-          console.info(TAG, "WebM EBML parse result:", {
-            codec: info.codec, codedWidth: info.codedWidth, codedHeight: info.codedHeight,
-            timestampScale: info.timestampScale, bufferBytes: initBuffer.byteLength
-          });
-          // Fallback to video-element dimensions when EBML parsing misses them
-          if (info.codedWidth === 0 || info.codedHeight === 0) {
-            const fw = msg.fallbackWidth | 0;
-            const fh = msg.fallbackHeight | 0;
-            if (fw > 0 && fh > 0) {
-              console.warn(TAG, `WebM: EBML returned 0x0, using video-element fallback ${fw}x${fh}`);
-              info = { ...info, codedWidth: fw, codedHeight: fh };
-            } else {
-              throw new Error("WebM EBML parsing returned coded size (0, 0) and no fallback dimensions provided");
-            }
-          }
-        } else {
-          info = mp4.parseInitSegment(initBuffer);
-          if (!info) throw new Error("Failed to parse init segment");
-          timescale = mp4.parseTimescale(initBuffer);
-        }
-
-        const config = {
-          codec: info.codec,
-          codedWidth: info.codedWidth,
-          codedHeight: info.codedHeight
-        };
-
-        if (info.description) {
-          config.description = info.description;
-        }
-
-        const support = await VideoDecoder.isConfigSupported(config);
-        if (!support.supported) {
-          throw new Error(`Codec not supported: ${info.codec}`);
-        }
-
-        createDecoder();
-        decoder.configure(config);
-        codecInfo = { ...info, timescale, container };
-
-        console.info(TAG, "Decoder configured:", info.codec, `${info.codedWidth}x${info.codedHeight}`, container === "webm" ? `timestampScale=${timescale}` : `timescale=${timescale}`);
-
-        reply({ type: "configure-ok", reqId, codec: info.codec, width: info.codedWidth, height: info.codedHeight, timescale });
-      } catch (err) {
-        reply({ type: "configure-err", reqId, error: formatErr(err) });
-      }
-      return;
-    }
-
-    /* ----- decode ----- */
-    if (msg.type === "decode") {
-      try {
-        if (!decoder || decoder.state !== "configured") {
-          throw new Error("Decoder not configured");
-        }
-
-        const chunkData = msg.data;
-        if (!(chunkData instanceof ArrayBuffer)) throw new Error("data must be ArrayBuffer");
-
-        const chunk = new EncodedVideoChunk({
-          type: msg.isKeyframe ? "key" : "delta",
-          timestamp: Math.round(msg.timestamp * 1_000_000), // seconds -> microseconds
-          duration: msg.duration ? Math.round(msg.duration * 1_000_000) : undefined,
-          data: chunkData
-        });
-
-        // Set up a promise to wait for the decoded frame
-        const bitmapPromise = new Promise((resolve, reject) => {
-          const timeout = setTimeout(() => {
-            resolvePending(null, new Error("decode timeout"));
-          }, 10000);
-
-          pendingDecode = { resolve, reject, timeout };
-        });
-
-        decoder.decode(chunk);
-        await decoder.flush();
-
-        const bitmap = await bitmapPromise;
-
-        if (bitmap) {
-          reply({ type: "decode-ok", reqId, imageBitmap: bitmap }, [bitmap]);
-        } else {
-          reply({ type: "decode-err", reqId, error: "No frame produced" });
-        }
-      } catch (err) {
-        reply({ type: "decode-err", reqId, error: formatErr(err) });
-      }
-      return;
-    }
-
-    /* ----- scan-segment: parse media segment + decode keyframes ----- */
-    if (msg.type === "scan-segment") {
-      try {
-        if (!mp4) throw new Error("mp4demux not loaded");
-        if (!decoder || decoder.state !== "configured") {
-          throw new Error("Decoder not configured");
-        }
-        if (!codecInfo) throw new Error("No codec info");
-
-        const mediaBuffer = msg.mediaSegment;
-        if (!(mediaBuffer instanceof ArrayBuffer)) throw new Error("mediaSegment must be ArrayBuffer");
-
-        let samples;
-        if (codecInfo.container === "webm") {
-          samples = mp4.parseWebMClusters(mediaBuffer, { timestampScale: codecInfo.timescale });
-        } else {
-          samples = mp4.parseMediaSegment(mediaBuffer, {
-            timescale: codecInfo.timescale,
-            defaultSampleDuration: 0,
-            defaultSampleSize: 0,
-            defaultSampleFlags: 0
-          });
-        }
-
-        const minTime = msg.minTime ?? -Infinity;
-        const sampleInterval = msg.sampleInterval ?? 5;
-
-        // Filter to keyframes beyond minTime, spaced by sampleInterval
-        const keyframes = [];
-        let lastKfTime = -Infinity;
-        let totalKeyframes = 0;
-        let firstSampleTs = null;
-        let lastSampleTs = null;
-        for (const s of samples) {
-          if (firstSampleTs === null) firstSampleTs = s.timestamp;
-          lastSampleTs = s.timestamp;
-          if (s.isKeyframe) totalKeyframes += 1;
-          if (s.isKeyframe && s.timestamp > minTime && s.timestamp > lastKfTime + sampleInterval) {
-            keyframes.push(s);
-            lastKfTime = s.timestamp;
-          }
-        }
-
-        // Diagnostic: when a media segment yields zero samples, surface the
-        // top-level box types so we can tell whether it's pure indexing
-        // (styp/sidx), a SABR-wrapped chunk, or a parser miss.
-        let topBoxes = null;
-        if (samples.length === 0 && codecInfo.container === "mp4") {
-          const u8 = new Uint8Array(mediaBuffer);
-          const seen = [];
-          let pos = 0;
-          while (pos + 8 <= u8.length && seen.length < 6) {
-            const size = (u8[pos] << 24) | (u8[pos + 1] << 16) | (u8[pos + 2] << 8) | u8[pos + 3];
-            const type = String.fromCharCode(u8[pos + 4], u8[pos + 5], u8[pos + 6], u8[pos + 7]);
-            seen.push(`${type}(${size >>> 0})`);
-            if (size < 8 || pos + size > u8.length) break;
-            pos += size;
-          }
-          topBoxes = seen.join(", ") || "(none)";
-        }
-
-        console.info(TAG, "scan-segment parse:", {
-          samples: samples.length,
-          keyframesTotal: totalKeyframes,
-          keyframesKept: keyframes.length,
-          minTime: Number.isFinite(minTime) ? minTime.toFixed(2) : minTime,
-          tsRange: firstSampleTs !== null ? `${firstSampleTs.toFixed(2)}..${lastSampleTs.toFixed(2)}` : "(empty)",
-          container: codecInfo.container,
-          ...(topBoxes !== null && { bufBytes: mediaBuffer.byteLength, topBoxes })
-        });
-
-        // Decode each keyframe and collect bitmaps
-        const results = [];
-        let decodeFailures = 0;
-        for (const kf of keyframes) {
-          try {
-            const chunk = new EncodedVideoChunk({
-              type: "key",
-              timestamp: Math.round(kf.timestamp * 1_000_000),
-              duration: kf.duration ? Math.round(kf.duration * 1_000_000) : undefined,
-              data: kf.data
-            });
-
-            const bitmapPromise = new Promise((resolve, reject) => {
-              const timeout = setTimeout(() => {
-                resolvePending(null, new Error("decode timeout"));
-              }, 10000);
-              pendingDecode = { resolve, reject, timeout };
-            });
-
-            decoder.decode(chunk);
-            await decoder.flush();
-
-            const bitmap = await bitmapPromise;
-            if (bitmap) {
-              results.push({ timestamp: kf.timestamp, duration: kf.duration, imageBitmap: bitmap });
-            } else {
-              decodeFailures += 1;
-            }
-          } catch (err) {
-            decodeFailures += 1;
-            console.warn(TAG, "keyframe decode failed", { ts: kf.timestamp, err: formatErr(err) });
-          }
-        }
-
-        if (decodeFailures > 0) {
-          console.warn(TAG, `scan-segment: ${decodeFailures}/${keyframes.length} keyframes failed to decode`);
-        }
-
-        // Transfer all bitmaps back
-        const transferList = results.map((r) => r.imageBitmap);
-        reply({
-          type: "scan-segment-ok",
-          reqId,
-          frames: results.map((r) => ({
-            timestamp: r.timestamp,
-            duration: r.duration,
-            imageBitmap: r.imageBitmap
-          }))
-        }, transferList);
-      } catch (err) {
-        reply({ type: "scan-segment-err", reqId, error: formatErr(err) });
-      }
-      return;
-    }
-
-    /* ----- reset ----- */
-    if (msg.type === "reset") {
-      destroyDecoder();
-      reply({ type: "reset-ok", reqId });
-      return;
-    }
-
-    /* ----- terminate ----- */
-    if (msg.type === "terminate") {
-      destroyDecoder();
-      reply({ type: "terminate-ok", reqId });
+    try {
+      const { __transfer, ...payload } = await handler(msg);
+      reply({ type: `${msg.type}-ok`, reqId: msg.reqId, ...payload }, __transfer);
+    } catch (error) {
+      reply({ type: `${msg.type}-err`, reqId: msg.reqId, error: formatError(error) });
     }
   });
 
-  // Signal readiness
   window.parent.postMessage({ channel: CHANNEL, type: "sandbox-ready" }, "*");
   console.info(TAG, "Decoder sandbox ready.");
 })();

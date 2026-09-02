@@ -1,5 +1,7 @@
 # no_add_extension
 
+> ⚠️ **Ce README décrit une architecture antérieure** (lecteur fantôme / `GhostAnalyzer`), abandonnée depuis. Pour l'état réel du système, voir [ARCHITECTURE.md](ARCHITECTURE.md) (référence technique), [GUIDE.md](GUIDE.md) (vulgarisation) et [DEV-NOTES.md](DEV-NOTES.md) (journal des mesures). Sa réécriture est le point `F1` de la revue de code.
+
 Prototype d’extension Chromium (Chrome/Brave) qui tente de détecter et sauter automatiquement les segments de **collaboration commerciale** sur YouTube, en privilégiant une logique **en direct dès la première lecture**.
 
 ---
