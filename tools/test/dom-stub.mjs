@@ -104,8 +104,16 @@ export function installDomStub({ href = "https://www.youtube.com/watch?v=test", 
     }
   };
 
-  globalThis.setInterval = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
-  globalThis.clearInterval = () => {};
+  // Les intervalles sont tracés, pas seulement comptés : un composant qui fuit
+  // laisse le sien vivant, ce qui est observable.
+  globalThis.setInterval = (fn, ms) => {
+    timers.push({ fn, ms, cleared: false });
+    return timers.length;
+  };
+  globalThis.clearInterval = (id) => {
+    const timer = timers[id - 1];
+    if (timer) timer.cleared = true;
+  };
   // Les timeouts ne se déclenchent pas : aucun test ne dépend d'un délai.
   globalThis.setTimeout = () => 0;
   globalThis.clearTimeout = () => {};

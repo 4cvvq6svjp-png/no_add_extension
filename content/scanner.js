@@ -211,7 +211,7 @@
         // En sonde : on vise le bord du buffer, puis on bissecte.
         const probe = this.probe;
         const segmentEntry = probe ? probe.pickSegment() : this.buffer.nextUnscanned();
-        this.dropProbeIfResolved();
+        this.dropProbeIfFinished();
         if (!segmentEntry) return false;
 
         segmentEntry.scanned = true;
@@ -271,7 +271,7 @@
 
         if (probe) {
           probe.consumeResult(segmentEntry, frame.timestamp, detection);
-          this.dropProbeIfResolved();
+          this.dropProbeIfFinished();
         } else {
           this.consumeDetection(detection, segmentEntry);
           this.lastScannedTime = frame.timestamp;
@@ -296,10 +296,15 @@
       }
     }
 
-    /** La sonde a encadré la fin : on reprend le balayage séquentiel après elle. */
-    dropProbeIfResolved() {
-      if (!this.probe?.resolved) return;
-      this.lastScannedTime = this.probe.firstNegativeTime;
+    /**
+     * La sonde a fini — fin localisée, ou abandonnée faute de borne fiable.
+     * Dans les deux cas elle indique où le balayage séquentiel doit reprendre.
+     */
+    dropProbeIfFinished() {
+      if (!this.probe?.finished) return;
+      if (Number.isFinite(this.probe.resumeTime)) {
+        this.lastScannedTime = this.probe.resumeTime;
+      }
       this.probe = null;
     }
 

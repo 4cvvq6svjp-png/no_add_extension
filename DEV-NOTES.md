@@ -269,6 +269,73 @@ Le volume de code augmente (1 947 → ~2 590 lignes réparties) : en-têtes de
 classe et documentation. L'objectif de ce lot est la lisibilité, pas la
 concision.
 
+### 2.9 Correctifs E1 à E3 *(2026-09-02)*
+
+Trois défauts relevés par la revue de code, tous latents : aucun ne se
+manifeste sur un run nominal, tous mordent dans des conditions réelles.
+
+**E1 — deux sessions concurrentes.** `content/main.js`. Trois sources
+déclenchent une navigation (`yt-navigate-finish`, `popstate`, watcher d'URL à
+900 ms) et la garde était `videoId === this.currentVideoId` — or
+`currentVideoId` n'était posé qu'**après** `await waitForVideoElement`, dont le
+délai va jusqu'à 20 s. Deux déclenchements rapprochés construisaient chacun
+leur `AheadScanner` et leur `SkipController` ; seul le dernier restait
+référencé, le premier tournait indéfiniment (écouteur MSE actif, boucle de scan
+active, OCR en double, deux contrôleurs écrivant `currentTime`).
+**Fix** : jeton de session incrémenté à l'entrée, revalidé après chaque
+`await`. Les composants sont montés en **variables locales** et ne deviennent la
+session courante qu'après revalidation — jamais publiés à moitié ; si le jeton
+a changé pendant le montage, ils sont démontés au lieu d'être abandonnés en
+vol. Le démontage est factorisé dans `stopSessionComponents()`.
+
+**E2 — borne basse évincée.** `content/probe.js`. `indexOfSeq()` renvoie `-1`
+quand le segment cherché est sorti de la file (au-delà de
+`maxCapturedSegments`), et le `Math.max(0, …)` transformait cet « introuvable »
+en indice 0 : la bissection repartait du plus vieux segment du buffer, sur un
+intervalle faux, sans aucun signal.
+**Fix** : abandon explicite. La sonde distingue désormais `finished` (terminée),
+`resolved` (fin réellement localisée) et `resumeTime` (où le séquentiel
+reprend : le premier négatif si résolue, le dernier positif si abandonnée). Le
+scanner lit `resumeTime` au lieu de `firstNegativeTime`, qui valait `Infinity`
+sur un abandon et aurait bloqué le balayage.
+
+**E3 — `addSegment` mentait sur son retour.** `content/segments.js`. Un segment
+entièrement absorbé par un existant renvoyait `true`, donc `extendAdEnd`
+loguait « fin de pub étendue » alors que rien n'avait bougé — un diagnostic faux
+sur le mécanisme le plus délicat du système.
+**Fix** : comparaison d'une empreinte du store avant/après fusion. Une
+absorption qui ajoute une source compte comme un changement, une absorption
+sans effet non.
+
+**Vérification.** 33 → 41 tests. Les correctifs neutralisés, **5 des 8 nouveaux
+tests échouent** ; les 3 autres couvrent des comportements déjà corrects et
+gardent contre une régression du correctif lui-même. Le test E1 est observable
+plutôt que tautologique : il compte les intervalles de heartbeat encore vivants,
+donc un scanner orphelin est détecté par sa trace runtime.
+
+| | n | pub vue (médiane) | sauts | dépassement | cadence | OCR |
+|---|---|---|---|---|---|---|
+| août | 6 | 12,5s [7,6–22,9] | 6 | +3,7s | 1,7s | 84 % |
+| après A/B/C | 4 | 5,0s [4,7–8,8] | 4 | +0,4s | 2,1s | 84 % |
+| après D | 2 | 4,4s [4,1–4,6] | 3 | +0,4s | 2,0s | 78 % |
+| **après E1-E3** | 3 | 5,3s [4,8–7,6] | 3 | +0,4s | 2,1s | 81 % |
+
+3 runs `SKIP`, aucun avertissement ni erreur de l'extension. La médiane monte
+de 4,4 à 5,3s par rapport aux 2 runs post-D, mais **ce n'est pas une
+régression** — et on peut le montrer plutôt que l'affirmer :
+
+- le chemin d'abandon de E2 **n'a jamais été atteint** sur ces runs (aucun log
+  `Sonde: abandon`) ;
+- la valeur de retour de E3 n'est consommée qu'en `if (added) logInfo(...)` sur
+  ses trois sites d'appel — elle ne pilote aucun contrôle ;
+- E1 ne joue que sur une navigation concurrente, et le harness n'en fait qu'une.
+
+Les trois correctifs sont donc **inertes** sur ce scénario. L'écart vient du run
+`03-48-33` (7,6s, 7 sauts fragmentés) : le motif « le playhead chasse la sonde »
+décrit en §4.1, quand un seek vide le buffer MSE et rapproche la frontière
+atteignable. Les deux autres runs donnent 4,8s et 5,3s avec 3 sauts, alignés
+sur post-D.
+
 ---
 
 ## 3. Résultats validés (vidéo de réf `vRAPfDSmBGM`, pub 3:49–4:57)

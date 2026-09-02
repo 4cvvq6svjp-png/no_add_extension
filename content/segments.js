@@ -36,6 +36,7 @@
         confidence: Number(segment?.confidence ?? 0.5)
       };
 
+      const before = this.signature();
       this.segments.push(normalizedSegment);
       this.segments.sort((a, b) => a.start - b.start);
 
@@ -61,7 +62,19 @@
       }
 
       this.segments = merged;
-      return true;
+      // Un segment entièrement absorbé par un existant ne change rien : le
+      // signaler comme ajouté faisait loguer « fin de pub étendue » à tort.
+      return this.signature() !== before;
+    }
+
+    /**
+     * Empreinte des bornes et des sources, pour distinguer une insertion qui
+     * change réellement le store d'une absorption sans effet.
+     */
+    signature() {
+      return this.segments
+        .map((segment) => `${segment.start}:${segment.end}:${segment.source}`)
+        .join("|");
     }
 
     findSegmentForTime(time) {

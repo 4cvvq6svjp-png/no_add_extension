@@ -50,8 +50,12 @@
       this.positiveCount = 1;
       this.probes = 0;
 
-      /** Passe à true quand la fin est encadrée ; l'appelant abandonne la sonde. */
+      /** true quand la sonde a fini son travail — fin localisée OU abandonnée. */
+      this.finished = false;
+      /** true seulement si la fin a réellement été encadrée. */
       this.resolved = false;
+      /** Temps à partir duquel le balayage séquentiel doit reprendre. */
+      this.resumeTime = startTime;
     }
 
     /** Résumé une ligne pour le heartbeat. */
@@ -72,7 +76,17 @@
      */
     pickSegment() {
       const segments = this.buffer.segments;
-      const positiveIndex = Math.max(0, this.buffer.indexOfSeq(this.lastPositiveSeq));
+      const positiveIndex = this.buffer.indexOfSeq(this.lastPositiveSeq);
+
+      if (positiveIndex < 0) {
+        // Le segment du dernier positif a été évincé de la file. Sa position
+        // est la borne BASSE de la bissection : sans elle, l'ancien
+        // `Math.max(0, -1)` repartait silencieusement du plus vieux segment du
+        // buffer, sur un intervalle faux. On rend la main au séquentiel.
+        this.abandon("borne basse évincée du buffer");
+        return null;
+      }
+
       const confirmedIndex = this.firstNegativeSeq === null
         ? -1
         : this.buffer.indexOfSeq(this.firstNegativeSeq);
@@ -119,7 +133,7 @@
     }
 
     consumeResult(entry, time, detection) {
-      if (this.resolved || !Number.isFinite(time)) return;
+      if (this.finished || !Number.isFinite(time)) return;
 
       if (detection.hasCommercialKeyword) {
         if (time > this.lastPositiveTime) {
@@ -250,6 +264,24 @@
       });
 
       this.resolved = true;
+      this.finished = true;
+      this.resumeTime = this.firstNegativeTime;
+    }
+
+    /**
+     * Termine la sonde sans avoir localisé la fin. Le balayage séquentiel
+     * reprend au dernier point vérifié « encore pub » : c'est la dernière
+     * information sûre dont on dispose.
+     */
+    abandon(reason) {
+      logInfo("Sonde: abandon", {
+        raison: reason,
+        dernierPositif: this.lastPositiveTime.toFixed(1),
+        sondes: this.probes
+      });
+
+      this.finished = true;
+      this.resumeTime = this.lastPositiveTime;
     }
   }
 
