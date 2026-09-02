@@ -26,9 +26,14 @@
         logger: () => {}
       })
         .then(async (worker) => {
+          // PSM 11 = SPARSE_TEXT: find as much text as possible regardless of
+          // layout. Right tool for a video frame where we just want to surface
+          // any disclosure keyword wherever it appears (top, bottom, badge,
+          // overlay corner...). PSM 6 (SINGLE_BLOCK, the previous setting)
+          // assumed one uniform paragraph and bailed early on multi-region UI.
           await worker.setParameters({
             tessedit_pageseg_mode: String(
-              self.Tesseract?.PSM?.SINGLE_BLOCK ?? "6"
+              self.Tesseract?.PSM?.SPARSE_TEXT ?? "11"
             )
           });
           return worker;

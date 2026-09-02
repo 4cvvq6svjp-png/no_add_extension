@@ -8,16 +8,33 @@
   const OCR_MESSAGE_CHANNEL = "no-add-extension-ocr";
 
   const CONFIG = {
-    frameSampleSeconds: 5,
+    frameSampleSeconds: 4,
     minSegmentSeconds: 3,
-    mergeGapSeconds: 2,
-    noMatchGraceSeconds: 8,
+    // Le texte de disclosure est présent PENDANT TOUTE la pub : une détection
+    // signale un état continu « pub en cours ». On fusionne donc agressivement
+    // les détections espacées pour couvrir l'intégralité du segment.
+    mergeGapSeconds: 20,
+    noMatchGraceSeconds: 25,
     skipMarginSeconds: 0.4,
     skipCooldownMs: 900,
     analysisPollMs: 1200,
     canvasWidth: 1280,
     canvasHeight: 720,
-    ocrRoiTopFraction: 0.25,
+    // OCR ciblé : le texte de disclosure (« Publicité »…) est petit et niché
+    // dans un coin. On crope SERRÉ chaque coin (petite fraction) et on l'upscale
+    // fortement dans une grande cellule → le texte devient assez gros pour que
+    // Tesseract le lise de façon fiable sur (presque) chaque frame, en 1 passe.
+    ocrCornerWidthFraction: 0.30,
+    ocrCornerHeightFraction: 0.18,
+    ocrCompositeWidth: 1600,
+    ocrCompositeHeight: 900,
+    // Binarisation : le texte de disclosure est quasi-blanc. On ne garde que
+    // les pixels très clairs (texte) → noir sur blanc, lisible par Tesseract.
+    ocrBinarizeThreshold: 190,
+    // Commit proactif d'un segment autour de chaque détection (look-ahead) :
+    // marge avant + fenêtre en avant, fusionnées au fil des détections.
+    segmentStartPadSeconds: 8,
+    segmentForwardSeconds: 12,
     overlayPollMs: 750,
     initTimeoutMs: 20000
   };
@@ -410,12 +427,12 @@
       this.canvas.height = CONFIG.canvasHeight;
       this.ctx = this.canvas.getContext("2d", { willReadFrequently: false });
 
-      // ROI canvas: only the top portion where overlay text appears
-      this.roiHeight = Math.round(CONFIG.canvasHeight * CONFIG.ocrRoiTopFraction);
+      // ROI canvas: composite 2×2 des 4 coins (upscalés) de la frame, là où le
+      // texte de disclosure apparaît. Un seul canvas → un seul appel OCR.
       this.roiCanvas = document.createElement("canvas");
-      this.roiCanvas.width = CONFIG.canvasWidth;
-      this.roiCanvas.height = this.roiHeight;
-      this.roiCtx = this.roiCanvas.getContext("2d", { willReadFrequently: false });
+      this.roiCanvas.width = CONFIG.ocrCompositeWidth;
+      this.roiCanvas.height = CONFIG.ocrCompositeHeight;
+      this.roiCtx = this.roiCanvas.getContext("2d", { willReadFrequently: true });
       this.textDetector = null;
       if ("TextDetector" in window) {
         try {
@@ -451,16 +468,44 @@
     }
 
     /**
-     * Copy the top portion of the full-frame canvas into the smaller ROI
-     * canvas.  This dramatically reduces the pixel count sent to Tesseract
-     * since the "collaboration commerciale" overlay always appears at the top.
+     * Build a 2×2 composite of the frame's four corners, each cropped from the
+     * full-resolution frame and UPSCALED into its cell. The disclosure text
+     * ("Publicité", "collaboration commerciale"…) sits in a corner and is tiny
+     * relative to 1280×720 — full-frame OCR mostly returns noise. Cropping +
+     * upscaling each corner makes the text large enough for Tesseract to read
+     * reliably on (almost) every frame, in a single OCR pass.
      */
     prepareRoiCanvas() {
-      this.roiCtx.drawImage(
-        this.canvas,
-        0, 0, this.canvas.width, this.roiHeight,   // source rect
-        0, 0, this.roiCanvas.width, this.roiHeight  // dest rect
-      );
+      const g = this.roiCtx;
+      const W = this.canvas.width;
+      const H = this.canvas.height;
+      const sw = Math.round(W * CONFIG.ocrCornerWidthFraction);
+      const sh = Math.round(H * CONFIG.ocrCornerHeightFraction);
+      const cw = this.roiCanvas.width / 2;   // cell width
+      const ch = this.roiCanvas.height / 2;  // cell height
+
+      g.imageSmoothingEnabled = true;
+      g.imageSmoothingQuality = "high";
+      g.fillStyle = "#000";
+      g.fillRect(0, 0, this.roiCanvas.width, this.roiCanvas.height);
+
+      // src (corner of full frame) → dst (grid cell), upscaled.
+      g.drawImage(this.canvas, 0,      0,      sw, sh, 0,  0,  cw, ch); // haut-gauche
+      g.drawImage(this.canvas, W - sw, 0,      sw, sh, cw, 0,  cw, ch); // haut-droit
+      g.drawImage(this.canvas, 0,      H - sh, sw, sh, 0,  ch, cw, ch); // bas-gauche
+      g.drawImage(this.canvas, W - sw, H - sh, sw, sh, cw, ch, cw, ch); // bas-droit
+
+      // Binarisation : ne garder que les pixels quasi-blancs (le texte) → noir
+      // sur fond blanc. Isole la disclosure fine du bruit de la vidéo.
+      const T = CONFIG.ocrBinarizeThreshold;
+      const img = g.getImageData(0, 0, this.roiCanvas.width, this.roiCanvas.height);
+      const d = img.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        const v = lum >= T ? 0 : 255; // texte clair → noir ; reste → blanc
+        d[i] = d[i + 1] = d[i + 2] = v;
+      }
+      g.putImageData(img, 0, 0);
     }
 
     async ensureOcrIframe() {
@@ -970,18 +1015,7 @@
         this.heartbeatInterval = null;
       }
 
-      // Flush pending commercial segment
-      if (this.activeCommercialStart !== null) {
-        const end = Number(this.lastPositiveSample ?? this.activeCommercialStart);
-        this.segmentStore.addSegment({
-          start: this.activeCommercialStart,
-          end: end + CONFIG.frameSampleSeconds * 0.7,
-          source: this.ocrSourceTag,
-          confidence: 0.75
-        });
-      }
-
-      this.activeCommercialStart = null;
+      // (Commit proactif : plus de segment "en attente" à flusher ici.)
       this.lastPositiveSample = null;
       this.lastScannedTime = -Infinity;
       this.pendingScan = false;
@@ -1017,6 +1051,7 @@
         // New video — reset state
         this.initSegment = null;
         this.capturedSegments = [];
+        this._mp4Accum = null;
         this.lastScannedTime = -Infinity;
         this.decoderConfigured = false;
         logInfo("AheadScanner: nouveau MediaSource détecté, reset.");
@@ -1039,6 +1074,7 @@
         this.initSegment = msg.data;
         this.initSegmentContainer = msg.container || "mp4";
         this.initSegmentMime = msg.mime || "";
+        this._mp4Accum = null;
         this.decoderConfigured = false;
         this.useFallback = false;
         this.configureFailures = 0;
@@ -1056,17 +1092,99 @@
       if (msg.type === "media-segment") {
         if (!this.initSegment) return; // Ignore media without init
 
-        this.capturedSegments.push({
-          data: msg.data,
-          timestampOffset: msg.timestampOffset ?? 0,
-          receivedAt: Date.now()
-        });
         this.totalMediaSegmentsReceived += 1;
+
+        const isWebm = (this.initSegmentContainer ?? "mp4") === "webm";
+        if (isWebm) {
+          // WebM: the cluster parser flat-scans, so a per-append push is fine.
+          this.capturedSegments.push({
+            data: msg.data,
+            timestampOffset: msg.timestampOffset ?? 0,
+            receivedAt: Date.now()
+          });
+        } else {
+          // fMP4: YouTube may split one media segment (moof+mdat) across several
+          // appendBuffer() calls. Reassemble the byte stream and only enqueue
+          // COMPLETE moof+mdat units, otherwise parseMediaSegment sees a
+          // truncated mdat and returns 0 samples.
+          this.accumulateMp4Chunk(msg.data, msg.timestampOffset ?? 0);
+        }
 
         // Evict old segments (behind main video position - 10s)
         this.evictOldSegments();
         return;
       }
+    }
+
+    /**
+     * Append a raw appendBuffer() chunk to the fMP4 reassembly buffer and
+     * extract every complete moof+mdat unit into capturedSegments.
+     */
+    accumulateMp4Chunk(chunkBuffer, timestampOffset) {
+      const incoming = new Uint8Array(chunkBuffer);
+
+      // A timestampOffset change signals a discontinuity (e.g. a seek): drop any
+      // dangling partial bytes so we don't merge across timelines.
+      if (this._mp4Accum && this._mp4Accum.length > 0 &&
+          this._mp4AccumTsOffset !== timestampOffset) {
+        this._mp4Accum = null;
+      }
+      this._mp4AccumTsOffset = timestampOffset;
+
+      if (!this._mp4Accum || this._mp4Accum.length === 0) {
+        this._mp4Accum = incoming.slice(); // own copy (starts at a box boundary)
+      } else {
+        const merged = new Uint8Array(this._mp4Accum.length + incoming.length);
+        merged.set(this._mp4Accum, 0);
+        merged.set(incoming, this._mp4Accum.length);
+        this._mp4Accum = merged;
+      }
+
+      this.extractMp4Segments(timestampOffset);
+    }
+
+    /** Walk the reassembly buffer, emitting complete moof+mdat units. */
+    extractMp4Segments(timestampOffset) {
+      const u8 = this._mp4Accum;
+      let pos = 0;
+      let unitStart = 0;
+      let sawMoof = false;
+
+      while (pos + 8 <= u8.length) {
+        let size = ((u8[pos] << 24) | (u8[pos + 1] << 16) | (u8[pos + 2] << 8) | u8[pos + 3]) >>> 0;
+        let headerSize = 8;
+        if (size === 1) {
+          if (pos + 16 > u8.length) break; // need more bytes for 64-bit size
+          size = Number(
+            (BigInt(((u8[pos + 8] << 24) | (u8[pos + 9] << 16) | (u8[pos + 10] << 8) | u8[pos + 11]) >>> 0) << 32n) |
+            BigInt(((u8[pos + 12] << 24) | (u8[pos + 13] << 16) | (u8[pos + 14] << 8) | u8[pos + 15]) >>> 0)
+          );
+          headerSize = 16;
+        } else if (size === 0) {
+          break; // box runs to end-of-stream — cannot delimit, wait for more
+        }
+        if (size < headerSize) break; // corrupt/misaligned — stop (leftover kept)
+        if (pos + size > u8.length) break; // incomplete box — wait for more
+
+        const type = String.fromCharCode(u8[pos + 4], u8[pos + 5], u8[pos + 6], u8[pos + 7]);
+        if (type === "moof") sawMoof = true;
+        if (type === "mdat" && sawMoof) {
+          const unit = u8.slice(unitStart, pos + size); // own ArrayBuffer copy
+          this.capturedSegments.push({
+            data: unit.buffer,
+            timestampOffset,
+            receivedAt: Date.now()
+          });
+          unitStart = pos + size;
+          sawMoof = false;
+        }
+        pos += size;
+      }
+
+      // Keep only the unconsumed tail for the next chunk.
+      this._mp4Accum = unitStart > 0 ? u8.slice(unitStart) : u8;
+      // Safety valve: never let the buffer grow unbounded on persistent misalign.
+      if (this._mp4Accum.length > 8_000_000) this._mp4Accum = new Uint8Array(0);
     }
 
     evictOldSegments() {
@@ -1343,28 +1461,17 @@
       const t = Number(detection.sampleTime ?? 0);
       if (!Number.isFinite(t)) return;
 
-      if (detection.hasCommercialKeyword) {
-        if (this.activeCommercialStart === null) {
-          this.activeCommercialStart = Math.max(
-            0,
-            t - CONFIG.frameSampleSeconds * 0.6
-          );
-        }
-        this.lastPositiveSample = t;
-        return;
-      }
+      // Seules les détections positives comptent. Commit PROACTIF : dès qu'un
+      // mot-clé commercial est vu (souvent en avance via le look-ahead), on
+      // insère immédiatement un segment [t-marge, t+fenêtre]. Les détections
+      // successives se fusionnent (mergeGapSeconds) en un segment qui couvre
+      // toute la pub, et le SkipController peut couper dès le DÉBUT — sans
+      // attendre la fin + une période de grâce comme auparavant.
+      if (!detection.hasCommercialKeyword) return;
 
-      if (this.activeCommercialStart === null || this.lastPositiveSample === null) {
-        return;
-      }
-
-      const gap = t - this.lastPositiveSample;
-      if (gap < CONFIG.noMatchGraceSeconds) return;
-
-      const start = this.activeCommercialStart;
-      const end = this.lastPositiveSample + CONFIG.frameSampleSeconds * 0.7;
-      this.activeCommercialStart = null;
-      this.lastPositiveSample = null;
+      const start = Math.max(0, t - CONFIG.segmentStartPadSeconds);
+      const end = t + CONFIG.segmentForwardSeconds;
+      this.lastPositiveSample = t;
 
       const added = this.segmentStore.addSegment({
         start,
@@ -1374,7 +1481,7 @@
       });
 
       if (added) {
-        logInfo("Segment OCR ajouté", { start, end, source: this.ocrSourceTag });
+        logInfo("Segment OCR ajouté/étendu", { start, end, source: this.ocrSourceTag });
       }
     }
   }

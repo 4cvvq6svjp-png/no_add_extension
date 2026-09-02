@@ -1,0 +1,7 @@
+# Dev-only tooling (harness de capture des logs)
+tools/node_modules/
+tools/.profile/
+logs/
+
+# Artefact de packaging
+no_add_extension.zip
