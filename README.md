@@ -52,7 +52,7 @@ YouTube appelle SourceBuffer.appendBuffer(segment)
         │
         ├─ mseInterceptor.js   (monde MAIN)      copie les octets au passage
         ▼
-   mainContent.js              (monde ISOLATED)  orchestration
+   content/*.js                (monde ISOLATED)  orchestration
         │
         ├─ decoder-sandbox     (iframe)          démuxage + WebCodecs
         │      └─ keyframes décodées
@@ -87,9 +87,21 @@ Quatre points méritent une explication, détaillée dans
 no_add_extension/
 ├── manifest.json              Manifest V3 : content scripts, CSP, ressources
 ├── package.json               Script `pack`
-├── content/
+├── content/                   Monde ISOLATED, sauf mseInterceptor
 │   ├── mseInterceptor.js      Monde MAIN, document_start. Patche appendBuffer.
-│   └── mainContent.js         Monde ISOLATED. Orchestration, OCR, skip.
+│   ├── config.js              CONFIG, mots-clés, noms de canaux
+│   ├── util.js                Logs, normalisation de texte, helpers DOM
+│   ├── segments.js            SegmentStore
+│   ├── ui.js                  PlayerNotifier
+│   ├── sandbox.js             SandboxBridge (pont vers les iframes)
+│   ├── overlay.js             OverlayDetector (repli DOM)
+│   ├── ocr.js                 RoiComposer, TesseractOcr, FrameClassifier
+│   ├── mse-buffer.js          MseSegmentBuffer (réassemblage fMP4)
+│   ├── decoder.js             DecoderSandbox
+│   ├── probe.js               AdEndProbe (sonde de fin de pub)
+│   ├── scanner.js             AheadScanner (orchestration du look-ahead)
+│   ├── skip.js                SkipController
+│   └── main.js                Cycle de vie d'une session + amorçage
 ├── pages/
 │   ├── decoder-sandbox.{html,js}   WebCodecs VideoDecoder
 │   └── ocr-sandbox.{html,js}       Tesseract.js
@@ -101,18 +113,23 @@ no_add_extension/
     └── test/                  Tests unitaires (sans navigateur)
 ```
 
-`mainContent.js` contient `NoAddYouTubeController` (cycle de vie d'une session,
-navigation SPA), `AheadScanner` (interception MSE, décodage, sonde de fin de
-pub), `FrameClassifier` (OCR), `SandboxBridge` (pont vers les iframes),
-`OverlayDetector` (détection DOM, réactive), `SegmentStore`, `SkipController` et
-`PlayerNotifier`.
+Les modules du monde ISOLATED sont chargés dans l'ordre déclaré par
+`manifest.json` et publient leurs classes dans un objet `NoAdd` partagé. Chaque
+fichier commence par la liste de ce qu'il y prend :
+
+```js
+const { CONFIG, logInfo, formatError } = NoAdd;
+```
+
+Cet ordre est une dépendance réelle : un module placé avant celui dont il
+dépend échouerait. Un test le vérifie (`npm test`).
 
 ---
 
 ## Réglages
 
-Tous les paramètres sont dans l'objet `CONFIG`, en tête de
-`content/mainContent.js`. Les plus utiles :
+Tous les paramètres sont dans l'objet `CONFIG`, dans `content/config.js`.
+Les plus utiles :
 
 | Paramètre | Défaut | Rôle |
 |---|---|---|

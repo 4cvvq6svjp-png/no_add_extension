@@ -46,7 +46,7 @@ YouTube Page
 │       → postMessage → ISOLATED world
 │
 └── ISOLATED world (document_idle)
-    └── mainContent.js
+    └── content/*.js  (config, util, ocr, scanner, probe…)
         ├── OverlayDetector    (DOM fallback, reactive)
         ├── AheadScanner       (MSE path, predictive)
         │   ├── decoder-sandbox iframe
@@ -92,9 +92,28 @@ YouTube Page
 
 ---
 
-### 4.2 `content/mainContent.js` — ISOLATED world, `document_idle`
+### 4.2 `content/*.js` — ISOLATED world, `document_idle`
 
-This is the orchestration layer. It contains four major classes and a top-level bootstrap function.
+This is the orchestration layer, split across one module per concept. The files
+are plain scripts listed in `manifest.json`; they share the isolated world's
+scope and publish their classes into a `NoAdd` namespace, so each file opens
+with the list of what it takes from it — an import list in all but name.
+
+| File | Holds |
+|---|---|
+| `config.js` | `CONFIG`, keyword list, channel names |
+| `util.js` | logging, text normalization, keyword matching, DOM helpers |
+| `segments.js` | `SegmentStore` |
+| `ui.js` | `PlayerNotifier` |
+| `sandbox.js` | `SandboxBridge` |
+| `overlay.js` | `OverlayDetector` |
+| `ocr.js` | `RoiComposer`, `TesseractOcr`, `FrameClassifier` |
+| `mse-buffer.js` | `MseSegmentBuffer` |
+| `decoder.js` | `DecoderSandbox` |
+| `probe.js` | `AdEndProbe` |
+| `scanner.js` | `AheadScanner` |
+| `skip.js` | `SkipController` |
+| `main.js` | `NoAddYouTubeController` and the bootstrap |
 
 #### 4.2.1 `SegmentStore`
 
@@ -218,7 +237,7 @@ The caller (`AheadScanner.ensureDecoderConfigured`) snapshots `initSegment` / `c
 
 ### 6. `libs/mp4demux.js` — Container Parser Library
 
-**Role:** Pure JS library for parsing fMP4 (ISO BMFF) and WebM (EBML/Matroska) container formats. Loaded **both** inside the decoder iframe and in the isolated world (declared before `mainContent.js` in the manifest), so `AheadScanner`'s fMP4 reassembly reads box headers with the same `readBoxHeader` as the demuxer rather than its own copy.
+**Role:** Pure JS library for parsing fMP4 (ISO BMFF) and WebM (EBML/Matroska) container formats. Loaded **both** inside the decoder iframe and in the isolated world (declared first in the manifest's content-script list), so `AheadScanner`'s fMP4 reassembly reads box headers with the same `readBoxHeader` as the demuxer rather than its own copy.
 
 #### 6.1 fMP4 functions
 
@@ -270,19 +289,19 @@ The extension operates across four JS execution contexts. All communication uses
 ```
 MAIN world (mseInterceptor.js)
   ↕  channel: "no-add-mse-intercept"
-ISOLATED world (mainContent.js)
+ISOLATED world (content/*.js)
   ↕  channel: "no-add-decoder"
 decoder-sandbox iframe (decoder-sandbox.js)
   (decoder-sandbox.js calls mp4demux.js internally)
 
-ISOLATED world (mainContent.js / FrameClassifier)
+ISOLATED world (content/ocr.js)
   ↕  channel: "no-add-extension-ocr"
 ocr-sandbox iframe (ocr-sandbox.js + Tesseract.js)
 ```
 
 **ArrayBuffer transfers:** Raw segment data is transferred (not copied) between the ISOLATED world and the decoder iframe using `postMessage`'s `transferList`. This is a zero-copy operation but **neuters the source buffer** — once sent, `segmentEntry.data` is a detached 0-byte ArrayBuffer. This is acceptable because the data is no longer needed after scanning.
 
-**Request IDs:** Every message from `mainContent.js` to its iframes includes a `reqId` (`${Date.now()}-${random}`). The reply listener filters on `reqId` to match responses to requests, allowing concurrent requests without cross-talk.
+**Request IDs:** Every message from `SandboxBridge` to its iframes includes a `reqId` (`${Date.now()}-${random}`). The reply listener filters on `reqId` to match responses to requests, allowing concurrent requests without cross-talk.
 
 ---
 
@@ -291,7 +310,7 @@ ocr-sandbox iframe (ocr-sandbox.js + Tesseract.js)
 On page load at `https://www.youtube.com/watch`:
 
 1. `mseInterceptor.js` installs patches synchronously at `document_start` (before any YouTube JS runs).
-2. `mainContent.js` runs at `document_idle`. It:
+2. The ISOLATED-world modules run at `document_idle`, in manifest order. `content/main.js` comes last and:
    a. Checks for duplicate load (`window.__NO_ADD_EXTENSION_LOADED__`).
    b. Waits up to 20s for a `<video>` element to appear in the DOM.
    c. Constructs `SegmentStore`, `PlayerNotifier`, `FrameClassifier`, `AheadScanner`, `OverlayDetector`, `SkipController`.
@@ -308,7 +327,7 @@ On page load at `https://www.youtube.com/watch`:
 
 ### 10. Configuration Parameters
 
-All tuneable constants are in the `CONFIG` object at the top of `mainContent.js`:
+All tuneable constants are in the `CONFIG` object in `content/config.js`:
 
 All timing constants live in `CONFIG` too — sandbox timeouts, poll cadences and give-up thresholds were hard-coded until the A/B/C cleanup.
 

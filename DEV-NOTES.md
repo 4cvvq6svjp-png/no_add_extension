@@ -1,7 +1,11 @@
 # Notes de développement — détection & outillage
 
 Journal des travaux sur la fiabilité de la détection/skip et l'outillage de test.
-Voir aussi `tools/README.md` (harness de capture des logs).
+Voir aussi `tools/README.md` (tests unitaires et harness de capture des logs).
+
+> Les entrées antérieures au découpage (§2.8) citent `content/mainContent.js` :
+> ce fichier a depuis été éclaté en modules sous `content/`. Les noms de
+> fonctions, eux, sont inchangés.
 
 ---
 
@@ -207,6 +211,130 @@ mais pas pour le débit. Le levier est ailleurs, voir §4.5.
 
 **Reste à faire** : le découpage (lot D), les défauts du lot E — dont la
 ré-entrance de `setupSession` — et la réécriture du README (F1, faite).
+
+### 2.8 Découpage en modules *(2026-09-02)*
+
+`content/mainContent.js` faisait 1 947 lignes en une seule IIFE, dont **824
+pour `AheadScanner`** qui portait huit responsabilités : on ne pouvait pas lire
+la sonde sans traverser le réassemblage fMP4. Aucun test ne pouvait atteindre
+ces unités.
+
+**Trois étapes, trois commits**, pour que chaque diff soit relisible :
+extractions dans le fichier unique (la logique bouge), puis découpage en
+fichiers (de simples déplacements), puis restructuration du harness.
+
+`AheadScanner` devient `MseSegmentBuffer` (messages MSE, réassemblage moof+mdat,
+éviction, `seq`), `DecoderSandbox` (configure + scan-segment), `AdEndProbe` (la
+sonde) et un `AheadScanner` réduit à l'orchestration. `FrameClassifier` devient
+`RoiComposer`, `TesseractOcr` et un `FrameClassifier` réduit au choix de
+backend.
+
+**L'algorithme de la sonde n'est pas retouché.** Son raisonnement par *indices*
+est correct : le temps d'un segment n'est connu qu'APRÈS décodage, la sélection
+du prochain segment à sonder ne peut donc être que positionnelle.
+
+**Mécanisme de découpage.** 13 fichiers sous `content/`, listés dans
+`manifest.json` ; ils partagent le monde isolé et publient dans un objet
+`NoAdd`. Chaque fichier commence par ce qu'il y prend :
+
+```js
+const { CONFIG, logInfo, formatError } = NoAdd;
+```
+
+Une liste d'imports en tout sauf le nom, sans changer le modèle de chargement
+(synchrone, pas de `web_accessible_resources` supplémentaire, résistant à une
+double injection). Basculable vers de vrais modules ES plus tard sans
+re-découper.
+
+**Ce que ça débloque, concrètement.** Les tests chargent désormais les modules
+**dans l'ordre du manifeste** et lisent le namespace : le contournement qui
+greffait une ligne d'export sur l'IIFE a disparu, et un module mal placé dans
+l'ordre échouerait au test comme dans le navigateur. 14 tests ajoutés sur des
+unités jusque-là inatteignables — réassemblage fMP4 (chunk coupé au milieu d'un
+`mdat`, deux unités dans un chunk, discontinuité de `timestampOffset`,
+stabilité des `seq` sous éviction) et les deux garde-fous de la sonde (deux
+négatifs consécutifs, invalidation par un positif postérieur, seuil de
+confirmation sur grand saut). **33 tests, < 1 s, sans navigateur.**
+
+**Harness.** `main()` faisait 340 lignes et enchaînait lancement du navigateur,
+branchement des consoles, mode `--login`, mode `--screenshot`, boucle de
+jugement et résumé. Découpé en `createRecorder`, `attachLogging`,
+`launchBrowser`, `runLoginMode`, `runScreenshotMode`, `judge`, `judgeAdWindow`,
+`judgeAllAdWindows` et `printSummary` — **main() tombe à 77 lignes**. Au
+passage : `opts._verdicts` disparaît (l'objet d'options servait de canal de
+retour), la logique de verdict écrite deux fois est unifiée dans `judge()`, et
+le branchement service worker devenu mort depuis §2.7 est retiré.
+
+Le volume de code augmente (1 947 → ~2 590 lignes réparties) : en-têtes de
+classe et documentation. L'objectif de ce lot est la lisibilité, pas la
+concision.
+
+### 2.9 Correctifs E1 à E3 *(2026-09-02)*
+
+Trois défauts relevés par la revue de code, tous latents : aucun ne se
+manifeste sur un run nominal, tous mordent dans des conditions réelles.
+
+**E1 — deux sessions concurrentes.** `content/main.js`. Trois sources
+déclenchent une navigation (`yt-navigate-finish`, `popstate`, watcher d'URL à
+900 ms) et la garde était `videoId === this.currentVideoId` — or
+`currentVideoId` n'était posé qu'**après** `await waitForVideoElement`, dont le
+délai va jusqu'à 20 s. Deux déclenchements rapprochés construisaient chacun
+leur `AheadScanner` et leur `SkipController` ; seul le dernier restait
+référencé, le premier tournait indéfiniment (écouteur MSE actif, boucle de scan
+active, OCR en double, deux contrôleurs écrivant `currentTime`).
+**Fix** : jeton de session incrémenté à l'entrée, revalidé après chaque
+`await`. Les composants sont montés en **variables locales** et ne deviennent la
+session courante qu'après revalidation — jamais publiés à moitié ; si le jeton
+a changé pendant le montage, ils sont démontés au lieu d'être abandonnés en
+vol. Le démontage est factorisé dans `stopSessionComponents()`.
+
+**E2 — borne basse évincée.** `content/probe.js`. `indexOfSeq()` renvoie `-1`
+quand le segment cherché est sorti de la file (au-delà de
+`maxCapturedSegments`), et le `Math.max(0, …)` transformait cet « introuvable »
+en indice 0 : la bissection repartait du plus vieux segment du buffer, sur un
+intervalle faux, sans aucun signal.
+**Fix** : abandon explicite. La sonde distingue désormais `finished` (terminée),
+`resolved` (fin réellement localisée) et `resumeTime` (où le séquentiel
+reprend : le premier négatif si résolue, le dernier positif si abandonnée). Le
+scanner lit `resumeTime` au lieu de `firstNegativeTime`, qui valait `Infinity`
+sur un abandon et aurait bloqué le balayage.
+
+**E3 — `addSegment` mentait sur son retour.** `content/segments.js`. Un segment
+entièrement absorbé par un existant renvoyait `true`, donc `extendAdEnd`
+loguait « fin de pub étendue » alors que rien n'avait bougé — un diagnostic faux
+sur le mécanisme le plus délicat du système.
+**Fix** : comparaison d'une empreinte du store avant/après fusion. Une
+absorption qui ajoute une source compte comme un changement, une absorption
+sans effet non.
+
+**Vérification.** 33 → 41 tests. Les correctifs neutralisés, **5 des 8 nouveaux
+tests échouent** ; les 3 autres couvrent des comportements déjà corrects et
+gardent contre une régression du correctif lui-même. Le test E1 est observable
+plutôt que tautologique : il compte les intervalles de heartbeat encore vivants,
+donc un scanner orphelin est détecté par sa trace runtime.
+
+| | n | pub vue (médiane) | sauts | dépassement | cadence | OCR |
+|---|---|---|---|---|---|---|
+| août | 6 | 12,5s [7,6–22,9] | 6 | +3,7s | 1,7s | 84 % |
+| après A/B/C | 4 | 5,0s [4,7–8,8] | 4 | +0,4s | 2,1s | 84 % |
+| après D | 2 | 4,4s [4,1–4,6] | 3 | +0,4s | 2,0s | 78 % |
+| **après E1-E3** | 3 | 5,3s [4,8–7,6] | 3 | +0,4s | 2,1s | 81 % |
+
+3 runs `SKIP`, aucun avertissement ni erreur de l'extension. La médiane monte
+de 4,4 à 5,3s par rapport aux 2 runs post-D, mais **ce n'est pas une
+régression** — et on peut le montrer plutôt que l'affirmer :
+
+- le chemin d'abandon de E2 **n'a jamais été atteint** sur ces runs (aucun log
+  `Sonde: abandon`) ;
+- la valeur de retour de E3 n'est consommée qu'en `if (added) logInfo(...)` sur
+  ses trois sites d'appel — elle ne pilote aucun contrôle ;
+- E1 ne joue que sur une navigation concurrente, et le harness n'en fait qu'une.
+
+Les trois correctifs sont donc **inertes** sur ce scénario. L'écart vient du run
+`03-48-33` (7,6s, 7 sauts fragmentés) : le motif « le playhead chasse la sonde »
+décrit en §4.1, quand un seek vide le buffer MSE et rapproche la frontière
+atteignable. Les deux autres runs donnent 4,8s et 5,3s avec 3 sauts, alignés
+sur post-D.
 
 ---
 

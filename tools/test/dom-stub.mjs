@@ -104,8 +104,16 @@ export function installDomStub({ href = "https://www.youtube.com/watch?v=test", 
     }
   };
 
-  globalThis.setInterval = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
-  globalThis.clearInterval = () => {};
+  // Les intervalles sont tracés, pas seulement comptés : un composant qui fuit
+  // laisse le sien vivant, ce qui est observable.
+  globalThis.setInterval = (fn, ms) => {
+    timers.push({ fn, ms, cleared: false });
+    return timers.length;
+  };
+  globalThis.clearInterval = (id) => {
+    const timer = timers[id - 1];
+    if (timer) timer.cleared = true;
+  };
   // Les timeouts ne se déclenchent pas : aucun test ne dépend d'un délai.
   globalThis.setTimeout = () => 0;
   globalThis.clearTimeout = () => {};
@@ -125,26 +133,21 @@ export function loadMp4Demux() {
 }
 
 /**
- * Évalue le content script et expose ses classes internes.
+ * Évalue les modules du content script, dans l'ordre déclaré par le manifeste,
+ * et renvoie le namespace qu'ils publient.
  *
- * Le fichier est une IIFE sans exports : on lui greffe une ligne d'export
- * juste avant sa fermeture. Ce contournement disparaîtra avec le découpage
- * en modules (lot D3 de la revue).
+ * Les tests exercent donc le vrai ordre de chargement : un module qui
+ * dépendrait d'un autre chargé après lui échouerait ici comme dans le
+ * navigateur.
  */
 export function loadContentScript() {
-  loadMp4Demux();
+  const manifest = JSON.parse(readFileSync(join(REPO_ROOT, "manifest.json"), "utf8"));
+  const isolated = manifest.content_scripts.find((entry) => entry.world !== "MAIN");
 
-  const source = readFileSync(join(REPO_ROOT, "content/mainContent.js"), "utf8");
-  const exportLine =
-    "\n  globalThis.__CONTENT_INTERNALS__ = { CONFIG, SegmentStore, FrameClassifier, " +
-    "SkipController, OverlayDetector, AheadScanner, SandboxBridge, " +
-    "extractCommercialKeywords, combineSources, normalizeText };\n})();\n";
-
-  const closing = /\n\}\)\(\);\s*$/;
-  if (!closing.test(source)) {
-    throw new Error("content/mainContent.js ne se termine plus par une IIFE — adapter loadContentScript()");
+  globalThis.window ??= globalThis;
+  for (const file of isolated.js) {
+    new Function(readFileSync(join(REPO_ROOT, file), "utf8"))();
   }
 
-  new Function(source.replace(closing, exportLine))();
-  return globalThis.__CONTENT_INTERNALS__;
+  return globalThis.__NoAdd;
 }

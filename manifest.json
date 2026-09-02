@@ -4,7 +4,9 @@
   "description": "Prototype qui détecte et saute en direct les segments de collaboration commerciale sur YouTube.",
   "version": "0.1.0",
   "minimum_chrome_version": "114",
-  "host_permissions": ["https://www.youtube.com/*"],
+  "host_permissions": [
+    "https://www.youtube.com/*"
+  ],
   "action": {
     "default_title": "No Add Extension"
   },
@@ -13,14 +15,35 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://www.youtube.com/*"],
-      "js": ["content/mseInterceptor.js"],
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "content/mseInterceptor.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": ["https://www.youtube.com/*"],
-      "js": ["libs/mp4demux.js", "content/mainContent.js"],
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "libs/mp4demux.js",
+        "content/config.js",
+        "content/util.js",
+        "content/segments.js",
+        "content/ui.js",
+        "content/sandbox.js",
+        "content/overlay.js",
+        "content/ocr.js",
+        "content/mse-buffer.js",
+        "content/decoder.js",
+        "content/probe.js",
+        "content/scanner.js",
+        "content/skip.js",
+        "content/main.js"
+      ],
       "run_at": "document_idle"
     }
   ],
@@ -34,7 +57,9 @@
         "libs/tesseract/*",
         "libs/mp4demux.js"
       ],
-      "matches": ["https://www.youtube.com/*"]
+      "matches": [
+        "https://www.youtube.com/*"
+      ]
     }
   ]
 }

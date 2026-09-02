@@ -7,7 +7,7 @@ const dom = installDomStub();
 const {
   CONFIG,
   SegmentStore,
-  FrameClassifier,
+  RoiComposer,
   extractCommercialKeywords,
   combineSources
 } = loadContentScript();
@@ -34,15 +34,29 @@ test("les cadences périodiques viennent toutes de CONFIG", () => {
   ].sort((a, b) => a - b));
 });
 
+test("chaque module trouve ses dépendances dans l'ordre du manifeste", () => {
+  const expected = [
+    "CONFIG", "COMMERCIAL_KEYWORDS", "logInfo", "logWarn", "normalizeText",
+    "extractCommercialKeywords", "combineSources", "sleep", "formatError",
+    "waitForVideoElement", "getVideoIdFromCurrentUrl", "noDetection",
+    "SegmentStore", "PlayerNotifier", "SandboxBridge", "OverlayDetector",
+    "RoiComposer", "TesseractOcr", "FrameClassifier", "MseSegmentBuffer",
+    "DecoderSandbox", "AdEndProbe", "AheadScanner", "SkipController"
+  ];
+
+  const missing = expected.filter((name) => globalThis.__NoAdd[name] === undefined);
+  assert.deepEqual(missing, [], "un module publie moins que prévu");
+});
+
 /* --------------------------------------------------------------------- */
 /*  Composite OCR                                                         */
 /* --------------------------------------------------------------------- */
 
 test("le composite OCR conserve le ratio du crop", () => {
-  const classifier = new FrameClassifier();
-  assert.equal(classifier.composeCorners({ width: 1920, height: 1080 }), true);
+  const composer = new RoiComposer();
+  assert.equal(composer.compose({ width: 1920, height: 1080 }), true);
 
-  const draws = classifier.roiCtx.draws;
+  const draws = composer.ctx.draws;
   assert.equal(draws.length, 4, "un dessin par coin");
 
   const [first] = draws;
@@ -56,14 +70,14 @@ test("le composite OCR conserve le ratio du crop", () => {
 });
 
 test("les coins sont lus à la résolution native de la source", () => {
-  const classifier = new FrameClassifier();
-  classifier.composeCorners({ width: 1920, height: 1080 });
+  const composer = new RoiComposer();
+  composer.compose({ width: 1920, height: 1080 });
 
   const cropWidth = Math.round(1920 * CONFIG.ocrCornerWidthFraction);
   const cropHeight = Math.round(1080 * CONFIG.ocrCornerHeightFraction);
 
   assert.deepEqual(
-    classifier.roiCtx.draws.map((draw) => [draw.sx, draw.sy, draw.sw, draw.sh]),
+    composer.ctx.draws.map((draw) => [draw.sx, draw.sy, draw.sw, draw.sh]),
     [
       [0, 0, cropWidth, cropHeight],
       [1920 - cropWidth, 0, cropWidth, cropHeight],
@@ -74,13 +88,13 @@ test("les coins sont lus à la résolution native de la source", () => {
 });
 
 test("le composite s'adapte à la définition de la source", () => {
-  const classifier = new FrameClassifier();
+  const composer = new RoiComposer();
 
-  classifier.composeCorners({ width: 1920, height: 1080 });
-  const fullHd = [classifier.roiCanvas.width, classifier.roiCanvas.height];
+  composer.compose({ width: 1920, height: 1080 });
+  const fullHd = [composer.canvas.width, composer.canvas.height];
 
-  classifier.composeCorners({ width: 640, height: 480 });
-  const smallSource = [classifier.roiCanvas.width, classifier.roiCanvas.height];
+  composer.compose({ width: 640, height: 480 });
+  const smallSource = [composer.canvas.width, composer.canvas.height];
 
   assert.equal(fullHd[0], CONFIG.ocrCompositeWidth);
   assert.equal(smallSource[0], CONFIG.ocrCompositeWidth);
@@ -88,8 +102,8 @@ test("le composite s'adapte à la définition de la source", () => {
 });
 
 test("une source sans dimensions est refusée au lieu d'être analysée", () => {
-  const classifier = new FrameClassifier();
-  assert.equal(classifier.composeCorners({ width: 0, height: 0 }), false);
+  const composer = new RoiComposer();
+  assert.equal(composer.compose({ width: 0, height: 0 }), false);
 });
 
 /* --------------------------------------------------------------------- */
