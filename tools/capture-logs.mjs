@@ -47,6 +47,33 @@ function parseTimecode(str) {
   return parts.reduce((acc, n) => acc * 60 + n, 0);
 }
 
+/** Sort en code 2 comme `--ad` le fait déjà, plutôt que de propager un NaN. */
+function requireNumber(flag, raw, { min = 0 } = {}) {
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < min) {
+    console.error(`Valeur invalide pour ${flag} : "${raw}" (nombre >= ${min} attendu).`);
+    process.exit(2);
+  }
+  return value;
+}
+
+function requireTimecode(flag, raw) {
+  const value = parseTimecode(raw);
+  if (!Number.isFinite(value) || value < 0) {
+    console.error(`Timecode invalide pour ${flag} : "${raw}" (attendu 125, 2:05 ou 1:02:05).`);
+    process.exit(2);
+  }
+  return value;
+}
+
+function requireValue(flag, raw) {
+  if (raw === undefined || String(raw).startsWith("--")) {
+    console.error(`Argument manquant pour ${flag}.`);
+    process.exit(2);
+  }
+  return raw;
+}
+
 function parseArgs(argv) {
   const opts = {
     url: TEST_VIDEO_URL,
@@ -67,18 +94,18 @@ function parseArgs(argv) {
     const a = argv[i];
     const next = () => argv[++i];
     switch (a) {
-      case "--url": opts.url = next(); break;
-      case "--seconds": opts.seconds = Number(next()); break;
-      case "--seek-lead": opts.seekLead = Number(next()); break;
-      case "--grace": opts.grace = Number(next()); break;
-      case "--out": opts.out = next(); break;
+      case "--url": opts.url = requireValue(a, next()); break;
+      case "--seconds": opts.seconds = requireNumber(a, next(), { min: 1 }); break;
+      case "--seek-lead": opts.seekLead = requireNumber(a, next()); break;
+      case "--grace": opts.grace = requireNumber(a, next()); break;
+      case "--out": opts.out = requireValue(a, next()); break;
       case "--headless": opts.headless = true; break;
       case "--no-extension": opts.noExtension = true; break;
       case "--passive": opts.passive = true; break;
       case "--login": opts.login = true; break;
       case "--no-seek": opts.noSeek = true; break;
       case "--full-window": opts.fullWindow = true; break;
-      case "--screenshot": opts.screenshot = parseTimecode(next()); break;
+      case "--screenshot": opts.screenshot = requireTimecode(a, next()); break;
       case "--ad": {
         const [s, e] = String(next()).split("-");
         const start = parseTimecode(s);
@@ -115,9 +142,7 @@ function parseArgs(argv) {
 
 const DETECTION_PATTERNS = [
   { kind: "skip",          re: /Skip appliqué/ },
-  { kind: "overlay-dom",   re: /Overlay commercial détecté/ },
-  { kind: "segment-ocr",   re: /Segment OCR ajouté/ },
-  { kind: "segment-overlay", re: /Segment overlay ajouté/ }
+  { kind: "segment-ocr",   re: /Segment OCR ajouté/ }
 ];
 
 /** Détermine si un message console signale une détection positive. */
@@ -248,6 +273,11 @@ function createRecorder(outPath) {
     bySource: Object.create(null),
     errors: [],
 
+    /**
+     * `entry.ts` l'emporte quand l'appelant connaît la date d'émission : le
+     * déballage des arguments d'un message console fait un aller-retour vers
+     * le navigateur, donc l'heure d'écriture n'est pas l'heure d'émission.
+     */
     write(entry) {
       stream.write(JSON.stringify({ ts: Date.now(), ...entry }) + "\n");
     },
@@ -266,6 +296,9 @@ function createRecorder(outPath) {
 /** Branche la console de tous les contextes (page + iframes sandbox). */
 function attachLogging(page, recorder) {
   page.on("console", async (msg) => {
+    // Pris AVANT tout await : c'est ce qui attribue une détection à une fenêtre
+    // de pub, et le déballage ci-dessous coûte un aller-retour CDP.
+    const emittedAt = Date.now();
     const text = msg.text();
     let argsValues = [];
     try {
@@ -279,12 +312,12 @@ function attachLogging(page, recorder) {
     if (/decoder-sandbox/.test(frameUrl)) source = "decoder-sandbox";
     else if (/ocr-sandbox/.test(frameUrl)) source = "ocr-sandbox";
 
-    recorder.write({ source, level: msg.type(), text, args: argsValues });
+    recorder.write({ ts: emittedAt, source, level: msg.type(), text, args: argsValues });
     recorder.totalEntries++;
     recorder.bySource[source] = (recorder.bySource[source] ?? 0) + 1;
 
     const detection = classifyDetection(text, argsValues);
-    if (detection) recorder.detections.push({ atWall: Date.now(), ...detection });
+    if (detection) recorder.detections.push({ atWall: emittedAt, ...detection });
 
     const heartbeat = extractHeartbeat(text, argsValues);
     if (heartbeat) {

@@ -185,7 +185,7 @@
         this.disabled = true;
         logWarn(
           `Tesseract désactivé après ${CONFIG.maxTesseractFailures} échecs consécutifs — ` +
-          "OCR via WebCodecs neutralisé, seule la détection DOM reste active."
+          "plus aucune détection n'est possible sur cette vidéo."
         );
       }
     }

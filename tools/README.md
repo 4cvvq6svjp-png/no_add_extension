@@ -101,8 +101,7 @@ Pour chaque `--ad [start,end]`, le harness **seek à `start − seek-lead`**, la
 jouer à travers la fenêtre, et cherche un signal de détection de l'extension :
 
 - `Skip appliqué` (skip effectif),
-- `Overlay commercial détecté` (détection DOM),
-- `Segment OCR ajouté` / `Segment overlay ajouté` (segment stocké),
+- `Segment OCR ajouté` (segment stocké),
 - `AheadScanner: frame analysée` avec `keyword: true` (match OCR look-ahead).
 
 - **HIT** : un signal apparaît → on passe immédiatement à la fenêtre suivante.

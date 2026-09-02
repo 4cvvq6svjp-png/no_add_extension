@@ -336,6 +336,89 @@ décrit en §4.1, quand un seek vide le buffer MSE et rapproche la frontière
 atteignable. Les deux autres runs donnent 4,8s et 5,3s avec 3 sauts, alignés
 sur post-D.
 
+### 2.10 Suppression de la détection par overlay DOM, + E4 et E6 *(2026-09-02)*
+
+**Décision produit : l'OCR devient le seul mécanisme de détection.** Le
+détecteur DOM lisait `.ytp-paid-content-overlay`, l'élément que YouTube injecte
+quand un créateur *déclare* une promotion payante. En pratique les créateurs
+incrustent le mot dans l'image plutôt que de le déclarer. La mesure tranche :
+sur **quinze runs archivés, ce chemin n'a jamais produit un seul segment**. Il
+s'est déclenché une fois, en août, et c'était le faux positif sur une pub
+pré-roll que §2.7 a corrigé ; depuis, plus rien sur neuf runs. Les 36 sauts de
+septembre viennent tous de `ahead-ocr`.
+
+`content/overlay.js` est supprimé, avec son entrée de manifeste, les deux clés
+`CONFIG` qui le servaient, et les deux motifs de détection correspondants dans
+le harness. Bilan : −199 lignes pour +82.
+
+**La contrepartie est explicite** : quand l'OCR tombe, plus rien ne détecte. Ce
+cas était mal servi par le code, et la question « pourquoi l'OCR serait-il
+indisponible ? » a révélé que le garde `isAvailable()` protège une situation
+qui n'arrive jamais tout en ratant celles qui arrivent :
+
+- `isAvailable()` n'est faux que si aucun backend n'a été choisi, ce qui exige
+  l'absence simultanée de `TextDetector` **et** de `chrome.runtime.getURL` —
+  impossible dans un content script.
+- Les vrais cas sont ailleurs et laissent `isAvailable()` à `true` : le modèle
+  `fra` qui ne se télécharge pas (dépendance réseau au premier usage), et le
+  worker Tesseract qui plante cinq fois d'affilée et se désactive. Dans les deux
+  cas l'extension affiche « actif sur cette vidéo » et ne détecte plus rien ;
+  seul le heartbeat (`tesseractDisabled`, `ocrMatches`) le révèle.
+
+Le message de désactivation, qui affirmait « seule la détection DOM reste
+active », est corrigé — il était devenu faux.
+
+**Défaut repéré au passage, non corrigé.** Quand l'initialisation de Tesseract
+échoue, `ensureReady()` remet `this.ready` à `null` dans son `catch` : la frame
+suivante relance une initialisation complète, indéfiniment. Avec
+`ocrInitTimeoutMs` à 120 s, une initialisation qui *pend* bloque la boucle de
+scan deux minutes par tentative. Et ce chemin n'incrémente jamais `errorCount`,
+donc il ne se désactive jamais. À traiter.
+
+**E4 — horodatage du harness.** L'horodatage était pris après le déballage des
+arguments du message console, qui coûte un aller-retour vers le navigateur ; il
+est maintenant pris à l'entrée du handler. Mesure préalable : le heartbeat étant
+émis par un `setInterval` de 5 000 ms, l'écart entre deux heartbeats
+*enregistrés* mesure la variation du délai. Sur 54 intervalles : médiane 5 000
+ms, écart-type 7 ms, extrêmes 4 980 et 5 026. **Le décalage réel était de ±26
+ms**, donc sans effet sur des fenêtres de plusieurs dizaines de secondes. Le
+correctif est une garantie, pas une amélioration : le délai n'est pas borné et
+grandirait sur un run beaucoup plus bavard.
+
+**E6 — validation des arguments.** `--seconds`, `--seek-lead`, `--grace`,
+`--screenshot`, `--url` et `--out` sont validés comme `--ad` l'était déjà :
+message explicite et code retour 2. Avant, `--seconds abc` rendait la date
+limite `NaN`, la boucle d'observation ne s'exécutait jamais et le harness
+rendait un `TIMEOUT` en une fraction de seconde sans expliquer pourquoi.
+
+### Ce que 11 runs disent de la méthode de mesure
+
+| | n | verdicts | pub vue (médiane) | sauts | dépass. | cadence | OCR |
+|---|---|---|---|---|---|---|---|
+| après A/B/C | 4 | SKIP | 5,0s [4,7–8,8] | 4 | +0,4s | 2,1s | 84 % |
+| après D | 2 | SKIP | 4,4s [4,1–4,6] | 3 | +0,4s | 2,0s | 78 % |
+| après E1-E3 | 3 | SKIP | 5,3s [4,8–7,6] | 3 | +0,4s | 2,1s | 81 % |
+| sans overlay + E4/E6 | 3 | SKIP | 5,5s [4,8–10,1] | 3 | +0,4s | 2,1s | 79 % |
+
+Regroupés autrement, les 11 runs de septembre sont **bimodaux** :
+
+| | runs | pub vue |
+|---|---|---|
+| net (≤ 4 sauts) | 9 | 4,8s [4,1–5,5] |
+| fragmenté (≥ 5 sauts) | 3 | 8,8s [7,6–10,1] |
+
+Un run sur quatre environ tombe dans le mode fragmenté : le playhead chasse la
+sonde extension par extension, exactement le motif de §4.1 quand un seek vide le
+buffer MSE et rapproche la frontière atteignable.
+
+**Conséquence méthodologique : la variance run-à-run (4,1 à 10,1s) dépasse tout
+écart mesuré entre les versions de septembre (médianes 4,4 à 5,5s).** Aucune des
+comparaisons D contre E contre « sans overlay » n'est concluante, et il ne faut
+pas les lire comme telles — 3 runs par version sont sous le plancher de bruit.
+Le gain d'août à septembre (12,5 → 5,0s), lui, reste bien au-dessus.
+Pour départager deux versions il faudrait une dizaine de runs chacune, ou
+supprimer la source de variance en attaquant §4.1.
+
 ---
 
 ## 3. Résultats validés (vidéo de réf `vRAPfDSmBGM`, pub 3:49–4:57)

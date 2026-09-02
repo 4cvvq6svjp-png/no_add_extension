@@ -19,7 +19,9 @@ The extension specifically targets the YouTube player and works on french-langua
 
 ### 2.1 The naive approach (DOM scraping) is insufficient
 
-YouTube's player injects the `.ytp-paid-content-overlay` element when the video timeline reaches the marked position — meaning DOM detection is reactive, not predictive. It also relies on YouTube continuing to emit that element, which could change at any time.
+YouTube's player injects the `.ytp-paid-content-overlay` element when the video timeline reaches the marked position — meaning DOM detection is reactive, not predictive. It also relies on YouTube continuing to emit that element.
+
+**Update (2026-09-02): the DOM path was removed entirely.** It was kept as a reactive fallback until measurement settled the question: across fifteen archived harness runs it never produced a single stored segment. The element only appears when a creator *declares* the paid promotion to YouTube, whereas in practice creators burn the wording into the video image. The extension now detects exclusively by reading the frame. The trade-off is explicit: when OCR fails, nothing detects.
 
 ### 2.2 The "ghost video" approach was abandoned
 
@@ -47,7 +49,6 @@ YouTube Page
 │
 └── ISOLATED world (document_idle)
     └── content/*.js  (config, util, ocr, scanner, probe…)
-        ├── OverlayDetector    (DOM fallback, reactive)
         ├── AheadScanner       (MSE path, predictive)
         │   ├── decoder-sandbox iframe
         │   │   ├── decoder-sandbox.js  (WebCodecs VideoDecoder)
@@ -106,7 +107,6 @@ with the list of what it takes from it — an import list in all but name.
 | `segments.js` | `SegmentStore` |
 | `ui.js` | `PlayerNotifier` |
 | `sandbox.js` | `SandboxBridge` |
-| `overlay.js` | `OverlayDetector` |
 | `ocr.js` | `RoiComposer`, `TesseractOcr`, `FrameClassifier` |
 | `mse-buffer.js` | `MseSegmentBuffer` |
 | `decoder.js` | `DecoderSandbox` |
@@ -123,19 +123,7 @@ A simple sorted list of `{ start, end, source, confidence }` objects representin
 
 A UI element: a small semi-transparent overlay injected into `#movie_player` that shows toast-style messages like "Segment publicitaire détecté — passage à…".
 
-#### 4.2.3 `OverlayDetector`
-
-**Role:** Reactive fallback detection using the DOM.
-
-**How it works:**
-- Polls YouTube's player DOM every `overlayPollMs = 750ms` and also watches for DOM mutations.
-- Queries elements like `.ytp-paid-content-overlay`, `.ytp-paid-content-overlay-text`, `.ytp-impression-link`, and inspects their text content.
-- When commercial keywords are found in the text, records the start time. When they disappear, records the end time and calls `onSegmentDetected`.
-- Confidence: 0.9 (high, because it's reading YouTube's own disclosure element).
-
-**Limitation:** This is reactive — it fires when the overlay is on screen, not before. So the user sees the first second or two of the commercial segment before the skip fires.
-
-#### 4.2.4 `FrameClassifier`
+#### 4.2.3 `FrameClassifier`
 
 **Role:** OCR engine that takes a video frame (from a `<video>` element or an `ImageBitmap`) and returns whether it contains commercial keywords.
 
@@ -158,7 +146,7 @@ A UI element: a small semi-transparent overlay injected into `#movie_player` tha
 
 **Text normalization:** Accents are stripped (NFD normalization + remove combining diacritics) and text is lowercased before keyword matching. This handles "Collaboration commerciale" → "collaboration commerciale" → match.
 
-#### 4.2.5 `AheadScanner`
+#### 4.2.4 `AheadScanner`
 
 **Role:** The main prediction engine. Decodes future video frames from raw MSE segments ahead of playback.
 
@@ -185,7 +173,7 @@ A UI element: a small semi-transparent overlay injected into `#movie_player` tha
 4. **`consumeDetection()`**: Commits proactively — every positive detection immediately stores `[t - segmentStartPadSeconds, t + segmentForwardSeconds]`, and successive detections merge (`mergeGapSeconds`). The real end of the ad is then located by the bisection probe (see DEV-NOTES §2.6), not by waiting out a grace period.
 5. **Fallback mode**: If `useFallback = true`, `startFallbackPolling()` creates an interval that calls `fallbackTick()` every 1200ms. This reads frames directly from the visible `<video>` element using `detectFromVideo()` — same OCR path, no decoder needed.
 
-#### 4.2.6 `SkipController`
+#### 4.2.5 `SkipController`
 
 **Role:** Executes skips when playback reaches a known commercial segment.
 
@@ -313,8 +301,8 @@ On page load at `https://www.youtube.com/watch`:
 2. The ISOLATED-world modules run at `document_idle`, in manifest order. `content/main.js` comes last and:
    a. Checks for duplicate load (`window.__NO_ADD_EXTENSION_LOADED__`).
    b. Waits up to 20s for a `<video>` element to appear in the DOM.
-   c. Constructs `SegmentStore`, `PlayerNotifier`, `FrameClassifier`, `AheadScanner`, `OverlayDetector`, `SkipController`.
-   d. Calls `aheadScanner.start()`, `overlayDetector.start()`, `skipController.start()`.
+   c. Constructs `SegmentStore`, `PlayerNotifier`, `FrameClassifier`, `AheadScanner`, `SkipController` — in local variables, published only once the session token still matches.
+   d. Calls `aheadScanner.start()` then `skipController.start()`.
    e. `AheadScanner.start()` sends `request-replay` to get any segments already buffered.
 3. YouTube starts appending fMP4/WebM segments. The interceptor forwards each one.
 4. On the first init segment, `AheadScanner` cancels the fallback timer, stores the segment.
@@ -343,7 +331,6 @@ All timing constants live in `CONFIG` too — sandbox timeouts, poll cadences an
 | `ocrCornerHeightFraction` | 0.18 | Height of each corner crop |
 | `ocrCompositeWidth` | 1600 | Composite width; the height is derived from the crop ratio |
 | `ocrBinarizeThreshold` | 190 | Luminance above which a pixel is treated as text |
-| `overlayPollMs` | 750 | DOM overlay check interval |
 | `initTimeoutMs` | 20000 | Max wait for `<video>` element |
 
 ---
@@ -383,7 +370,7 @@ To make end-to-end pipeline failures debuggable from the DevTools console alone,
 | `AheadScanner` | per analyzed frame | `frame analysée { time, keyword, matched, ocrSource, textPreview, lead }` | The exact text the OCR returned for each keyframe, which keywords (if any) matched, and how far ahead of playback the scan is. `textPreview` is truncated to 80 chars. |
 | `AheadScanner` | per empty scan | `scan-segment OK mais aucune keyframe utile { minTime, bufferBytes }` | The scan completed but the decoder sandbox returned no usable frames — either no keyframes in this segment, or they were all below `minTime`. |
 | `SkipController` | every 10 s, throttled | `aucun segment ne couvre currentTime { currentTime, storeSize, firstSegments }` | The store has detected segments but `currentTime` is outside all of them. Useful to confirm whether detections are landing in the wrong time range (e.g. after playback already passed them, or pointing into the future the user hasn't reached). |
-| `SkipController` | per skip | `Skip appliqué { from, to, source }` | Confirms a successful skip and identifies which detection source (`dom-overlay`, `ahead-ocr`, `main-video-ocr`) produced the segment. |
+| `SkipController` | per skip | `Skip appliqué { from, to, source }` | Confirms a successful skip and identifies which detection source (`ahead-ocr` for the look-ahead path, `main-video-ocr` for the visible-player fallback) produced the segment. |
 
 **Reading order during triage.** Start with the `heartbeat`. If `mediaSegmentsReceived` is 0, the MSE patch failed (check MAIN-world install). If it is non-zero but `scansRun` is 0, the decoder configure is failing — look upward for `échec configuration decoder`. If `scansRun > 0` but `framesDecoded` is 0, look for `scan-segment parse:` lines to see whether the demuxer returns samples. If `framesDecoded > 0` but `ocrMatches` is 0, inspect `textPreview` in `frame analysée` to see what the OCR actually reads (the overlay may be cropped out, or YouTube may have changed the disclosure wording).
 

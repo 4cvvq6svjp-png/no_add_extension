@@ -94,7 +94,6 @@ no_add_extension/
 │   ├── segments.js            SegmentStore
 │   ├── ui.js                  PlayerNotifier
 │   ├── sandbox.js             SandboxBridge (pont vers les iframes)
-│   ├── overlay.js             OverlayDetector (repli DOM)
 │   ├── ocr.js                 RoiComposer, TesseractOcr, FrameClassifier
 │   ├── mse-buffer.js          MseSegmentBuffer (réassemblage fMP4)
 │   ├── decoder.js             DecoderSandbox
@@ -193,8 +192,12 @@ AheadScanner heartbeat { currentTime, bufferedAhead, decoderConfigured,
 - **L'OCR rate environ une image sur onze** sur la vidéo de référence. C'est ce
   qui impose les garde-fous de la sonde (DEV-NOTES §2.6 et §4.2).
 - **AV1 en WebM** n'est pas géré ; AV1 en fMP4 l'est (chemin courant sous Linux).
-- **La détection DOM est réactive** : elle ne voit l'overlay qu'une fois à
-  l'écran. C'est un filet, pas le mécanisme principal.
+- **L'OCR est le seul mécanisme de détection.** L'extension lisait aussi
+  l'overlay de divulgation que YouTube injecte dans le DOM ; sur quinze runs
+  archivés ce chemin n'a jamais produit un seul segment, parce que les
+  créateurs incrustent le texte dans l'image plutôt que de déclarer la
+  promotion à YouTube. Il a été retiré. Conséquence : si l'OCR tombe, plus
+  rien ne détecte.
 - **YouTube peut changer** le format de ses flux, ses types MIME ou la
   formulation de ses divulgations à tout moment.
 
@@ -209,9 +212,12 @@ de l'extension. Le content script lui envoie des `ImageBitmap` par
 `postMessage`. Une erreur `Creating a worker from 'blob:…' violates … Content
 Security Policy` signale que ce contournement n'a pas été emprunté.
 
-**Aucun moteur OCR.** Si ni `TextDetector` ni Tesseract ne démarrent, seule la
-détection DOM reste active. Vérifier le champ `ocrBackend` du heartbeat. Le
-premier run peut être long : le modèle `fra` est téléchargé une fois.
+**L'OCR ne détecte plus rien.** L'OCR étant le seul mécanisme, sa panne rend
+l'extension muette — et elle continue pourtant d'afficher qu'elle est active.
+Le heartbeat est ce qui le révèle : `ocrBackend` dit quel moteur a été choisi,
+`tesseractDisabled` passe à `true` après cinq échecs consécutifs, et
+`ocrMatches` reste à zéro. La cause la plus fréquente est le téléchargement du
+modèle `fra`, qui a besoin du réseau au premier usage.
 
 **`googlevideo … 403 (Forbidden)` en boucle.** La pile d'appels mentionne
 souvent `kevlar_base_module` : c'est du code YouTube, pas l'extension. Dans le

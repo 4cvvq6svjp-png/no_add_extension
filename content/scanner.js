@@ -72,7 +72,9 @@
 
     async start() {
       if (!this.frameClassifier.isAvailable()) {
-        logWarn("Aucun moteur OCR disponible, AheadScanner désactivé.");
+        // Depuis la suppression de la détection par overlay DOM, l'OCR est le
+        // seul mécanisme de détection : sans lui, l'extension ne fait rien.
+        logWarn("Aucun moteur OCR disponible — l'extension est inactive sur cette plateforme.");
         return;
       }
 

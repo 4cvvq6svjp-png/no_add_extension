@@ -52,7 +52,6 @@
     // isolé ne peut donc pas faire sauter du contenu légitime.
     bigJumpThresholdSeconds: 20,
     probeMinPositivesForBigJump: 2,
-    overlayPollMs: 750,
     initTimeoutMs: 20000,
 
     /* --- Cadences et délais ------------------------------------------ */
@@ -61,7 +60,6 @@
     skipPollMs: 220,
     skipDiagnosticThrottleMs: 10000,
     urlWatchPollMs: 900,
-    overlayMutationThrottleMs: 150,
     notifierTimeoutMs: 2500,
 
     /* --- Plafonds et seuils d'abandon --------------------------------- */

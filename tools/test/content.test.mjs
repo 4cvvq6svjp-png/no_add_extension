@@ -28,7 +28,6 @@ test("les cadences périodiques viennent toutes de CONFIG", () => {
   const cadences = dom.timers.map((timer) => timer.ms).sort((a, b) => a - b);
   assert.deepEqual(cadences, [
     CONFIG.skipPollMs,
-    CONFIG.overlayPollMs,
     CONFIG.urlWatchPollMs,
     CONFIG.heartbeatMs
   ].sort((a, b) => a - b));
@@ -39,7 +38,7 @@ test("chaque module trouve ses dépendances dans l'ordre du manifeste", () => {
     "CONFIG", "COMMERCIAL_KEYWORDS", "logInfo", "logWarn", "normalizeText",
     "extractCommercialKeywords", "combineSources", "sleep", "formatError",
     "waitForVideoElement", "getVideoIdFromCurrentUrl", "noDetection",
-    "SegmentStore", "PlayerNotifier", "SandboxBridge", "OverlayDetector",
+    "SegmentStore", "PlayerNotifier", "SandboxBridge",
     "RoiComposer", "TesseractOcr", "FrameClassifier", "MseSegmentBuffer",
     "DecoderSandbox", "AdEndProbe", "AheadScanner", "SkipController"
   ];
@@ -141,11 +140,11 @@ test("un segment plus court que minSegmentSeconds est rejeté", () => {
 test("les segments proches fusionnent et cumulent leurs sources", () => {
   const store = new SegmentStore({ mergeGapSeconds: 20, minSegmentSeconds: 3 });
   store.addSegment({ start: 100, end: 110, source: "ahead-ocr" });
-  store.addSegment({ start: 125, end: 140, source: "dom-overlay" });
+  store.addSegment({ start: 125, end: 140, source: "main-video-ocr" });
 
   assert.deepEqual(
     store.getAll().map((segment) => [segment.start, segment.end, segment.source]),
-    [[100, 140, "ahead-ocr+dom-overlay"]]
+    [[100, 140, "ahead-ocr+main-video-ocr"]]
   );
 });
 

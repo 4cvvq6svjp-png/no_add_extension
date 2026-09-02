@@ -155,7 +155,6 @@ Pendant que le spectateur regarde la vidéo normalement, un petit surveillant (`
 - L'interception de la vidéo : on capture bien les morceaux que YouTube reçoit.
 - Le décodage MP4 (Windows/Mac) : on extrait correctement les images.
 - L'OCR : la lecture du texte sur les images fonctionne.
-- La détection par DOM (méthode de secours) : si le texte de divulgation est dans la page HTML, on le lit aussi.
 - Le saut automatique : quand une zone est enregistrée, le saut se déclenche bien.
 
 ### Ce qui vient d'être réparé

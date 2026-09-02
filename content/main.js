@@ -10,8 +10,8 @@
 
   const NoAdd = (window.__NoAdd ??= {});
   const {
-    CONFIG, SegmentStore, PlayerNotifier, OverlayDetector, FrameClassifier,
-    AheadScanner, SkipController, logInfo, logWarn, waitForVideoElement,
+    CONFIG, SegmentStore, PlayerNotifier, FrameClassifier, AheadScanner,
+    SkipController, logInfo, logWarn, waitForVideoElement,
     getVideoIdFromCurrentUrl
   } = NoAdd;
 
@@ -32,7 +32,6 @@
     if (components.frameClassifier) {
       void components.frameClassifier.terminate();
     }
-    components.overlayDetector?.stop();
     components.notifier?.destroy();
     components.segmentStore?.clear();
   }
@@ -43,7 +42,6 @@
       this.currentVideo = null;
       this.segmentStore = null;
       this.notifier = null;
-      this.overlayDetector = null;
       this.aheadScanner = null;
       this.frameClassifier = null;
       this.skipController = null;
@@ -123,15 +121,6 @@
         minSegmentSeconds: CONFIG.minSegmentSeconds
       });
       const notifier = new PlayerNotifier();
-      const overlayDetector = new OverlayDetector({
-        video,
-        onSegmentDetected: (segment) => {
-          const added = segmentStore.addSegment(segment);
-          if (added) {
-            logInfo("Segment overlay ajouté", segment);
-          }
-        }
-      });
       const frameClassifier = new FrameClassifier();
       const aheadScanner = new AheadScanner({
         mainVideo: video,
@@ -140,15 +129,13 @@
       });
       const skipController = new SkipController({ video, segmentStore, notifier });
 
-      overlayDetector.start();
       await aheadScanner.start();
 
       if (token !== this.sessionToken) {
         // Remplacée pendant le démarrage : on démonte au lieu de publier, sinon
         // ces composants tourneraient sans que rien ne les référence.
         stopSessionComponents({
-          skipController, aheadScanner, frameClassifier,
-          overlayDetector, notifier, segmentStore
+          skipController, aheadScanner, frameClassifier, notifier, segmentStore
         });
         return;
       }
@@ -157,14 +144,15 @@
       this.currentVideo = video;
       this.segmentStore = segmentStore;
       this.notifier = notifier;
-      this.overlayDetector = overlayDetector;
       this.frameClassifier = frameClassifier;
       this.aheadScanner = aheadScanner;
       this.skipController = skipController;
 
       skipController.start();
-      notifier.show("No Add Extension actif sur cette vidéo.");
-      logInfo("Session initialisée", { videoId });
+      if (frameClassifier.isAvailable()) {
+        notifier.show("No Add Extension actif sur cette vidéo.");
+      }
+      logInfo("Session initialisée", { videoId, ocr: frameClassifier.getBackendLabel() });
     }
 
     teardownSession() {
@@ -175,7 +163,6 @@
         skipController: this.skipController,
         aheadScanner: this.aheadScanner,
         frameClassifier: this.frameClassifier,
-        overlayDetector: this.overlayDetector,
         notifier: this.notifier,
         segmentStore: this.segmentStore
       });
@@ -183,7 +170,6 @@
       this.skipController = null;
       this.aheadScanner = null;
       this.frameClassifier = null;
-      this.overlayDetector = null;
       this.notifier = null;
       this.segmentStore = null;
     }
