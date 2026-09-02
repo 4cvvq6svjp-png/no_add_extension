@@ -1,10 +1,48 @@
-# tools/ — Harness de capture des logs (dev-only)
+# tools/ — Outillage de test (dev-only)
 
-Outillage de test qui charge **No Add Extension** dans une instance Chrome dédiée,
-ouvre une vidéo YouTube et capture **tous les logs** (page + iframes sandbox
-décodeur/OCR + service worker) vers un fichier JSONL, avec un résumé sur stdout.
+Deux niveaux de vérification, du plus rapide au plus réaliste :
 
-Ce dossier est **hors de l'extension livrée** (gitignoré, exclu du `npm run pack`).
+| | Commande | Ce que ça couvre | Durée |
+|---|---|---|---|
+| **Tests unitaires** | `npm test` | Logique pure du content script et des parseurs, sans navigateur. | < 1 s |
+| **Harness** | `node capture-logs.mjs …` | Chaîne complète dans un vrai Chromium sur une vraie vidéo. | minutes |
+
+Ce dossier est **hors de l'extension livrée** (exclu du `npm run pack`).
+
+---
+
+## Tests unitaires (`test/`)
+
+```bash
+cd tools && npm test
+```
+
+Exécutent le content script et `mp4demux.js` sous un DOM factice
+(`test/dom-stub.mjs`) — aucun navigateur, aucun réseau. Ils couvrent ce qui se
+vérifie sans lecture vidéo :
+
+- **`content.test.mjs`** — amorçage d'une session, cadences périodiques lues
+  dans `CONFIG`, géométrie du composite OCR (ratio des cellules, crop à la
+  résolution native, adaptation à la définition source), liste de mots-clés,
+  fusion et recherche dans `SegmentStore`.
+- **`mp4demux.test.mjs`** — parsing d'un init segment fMP4 synthétique (codec
+  pris dans le MIME, dimensions, `description`, timescale) et lecture des
+  entêtes de boîtes, taille étendue 64 bits comprise.
+
+Ce qui n'y est **pas** couvert et reste du ressort du harness : décodage
+WebCodecs, OCR Tesseract, interception MSE, sonde de fin de pub, skip réel.
+
+> `test/dom-stub.mjs` greffe une ligne d'export sur l'IIFE de `mainContent.js`
+> pour atteindre ses classes. Ce contournement disparaîtra avec le découpage en
+> modules (lot D3 de la revue de code).
+
+---
+
+## Harness de capture des logs
+
+Charge **No Add Extension** dans une instance Chromium dédiée, ouvre une vidéo
+YouTube et capture **tous les logs** (page + iframes sandbox décodeur/OCR +
+réseau) vers un fichier JSONL, avec un résumé sur stdout.
 
 ## Prérequis
 
@@ -54,7 +92,7 @@ donc c'est à faire une seule fois.
 | `--seek-lead` | 30     | Avance (s) avant chaque pub pour stabiliser le buffering/OCR. |
 | `--grace`     | 2      | Marge (s) après la fin d'une pub avant de déclarer MISS. |
 | `--out`       | `logs/run-<ts>.jsonl` | Fichier de sortie. |
-| `--headless`  | off    | Mode headless (`--headless=new`). |
+| `--headless`  | off    | Mode headless. |
 
 ## Comment ça juge une pub (HIT/MISS)
 

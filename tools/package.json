@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Harness de test/capture des logs (dev-only) pour No Add Extension.",
   "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
     "capture": "node capture-logs.mjs",
     "install-browser": "playwright install chromium"
   },
