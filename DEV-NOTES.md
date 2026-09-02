@@ -256,6 +256,15 @@ stabilité des `seq` sous éviction) et les deux garde-fous de la sonde (deux
 négatifs consécutifs, invalidation par un positif postérieur, seuil de
 confirmation sur grand saut). **33 tests, < 1 s, sans navigateur.**
 
+**Harness.** `main()` faisait 340 lignes et enchaînait lancement du navigateur,
+branchement des consoles, mode `--login`, mode `--screenshot`, boucle de
+jugement et résumé. Découpé en `createRecorder`, `attachLogging`,
+`launchBrowser`, `runLoginMode`, `runScreenshotMode`, `judge`, `judgeAdWindow`,
+`judgeAllAdWindows` et `printSummary` — **main() tombe à 77 lignes**. Au
+passage : `opts._verdicts` disparaît (l'objet d'options servait de canal de
+retour), la logique de verdict écrite deux fois est unifiée dans `judge()`, et
+le branchement service worker devenu mort depuis §2.7 est retiré.
+
 Le volume de code augmente (1 947 → ~2 590 lignes réparties) : en-têtes de
 classe et documentation. L'objectif de ce lot est la lisibilité, pas la
 concision.

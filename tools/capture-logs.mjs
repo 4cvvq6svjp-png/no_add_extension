@@ -34,6 +34,8 @@ const TEST_VIDEO_URL = "https://www.youtube.com/watch?v=vRAPfDSmBGM";
 /* Fenêtres de pub par défaut (appliquées si --url == TEST_VIDEO_URL et aucun --ad). */
 const DEFAULT_ADS = [{ start: 229, end: 297 }];
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 /* --------------------------------------------------------------------- */
 /*  Parsing des arguments                                                 */
 /* --------------------------------------------------------------------- */
@@ -229,43 +231,87 @@ async function dismissConsent(page) {
   } catch { /* ignore */ }
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 /* --------------------------------------------------------------------- */
-/*  Programme principal                                                   */
+/*  Enregistrement des logs                                               */
 /* --------------------------------------------------------------------- */
 
-async function main() {
-  const opts = parseArgs(process.argv);
+/** Collecte tout ce que le run produit : JSONL, compteurs, détections. */
+function createRecorder(outPath) {
+  const stream = createWriteStream(outPath, { flags: "w" });
 
-  if (!opts.url) {
-    console.error("Aucune URL. Fournis --url <video> (ou renseigne TEST_VIDEO_URL dans le script).");
-    process.exit(2);
-  }
+  return {
+    outPath,
+    detections: [],   // { atWall, kind, detail }
+    lastHeartbeat: null,
+    heartbeatCount: 0,
+    totalEntries: 0,
+    bySource: Object.create(null),
+    errors: [],
 
-  mkdirSync(LOGS_DIR, { recursive: true });
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const outPath = opts.out ? resolve(opts.out) : join(LOGS_DIR, `run-${stamp}.jsonl`);
-  const out = createWriteStream(outPath, { flags: "w" });
+    write(entry) {
+      stream.write(JSON.stringify({ ts: Date.now(), ...entry }) + "\n");
+    },
 
-  const write = (entry) => out.write(JSON.stringify({ ts: Date.now(), ...entry }) + "\n");
+    noteError(message, source = "harness") {
+      this.errors.push(message);
+      this.write({ source, level: "error", text: message });
+    },
 
-  // État partagé alimenté par le handler console.
-  const detections = []; // { atWall, kind, detail }
-  let lastHeartbeat = null;
-  let heartbeatCount = 0;
-  let totalEntries = 0;
-  const bySource = Object.create(null);
-  const errors = [];
+    close() {
+      stream.end();
+    }
+  };
+}
 
-  console.log(`▶ Extension : ${REPO_ROOT}`);
-  console.log(`▶ Profil    : ${PROFILE_DIR}`);
-  console.log(`▶ Sortie    : ${outPath}`);
-  console.log(`▶ URL       : ${opts.url}`);
-  if (opts.ads.length) {
-    console.log(`▶ Pubs      : ${opts.ads.map((a) => `${a.start}-${a.end}s`).join(", ")} (seek-lead ${opts.seekLead}s, grâce ${opts.grace}s)`);
-  }
+/** Branche la console de tous les contextes (page + iframes sandbox). */
+function attachLogging(page, recorder) {
+  page.on("console", async (msg) => {
+    const text = msg.text();
+    let argsValues = [];
+    try {
+      argsValues = await Promise.all(
+        msg.args().map((handle) => handle.jsonValue().catch(() => undefined))
+      );
+    } catch { /* args non sérialisables */ }
 
+    const frameUrl = msg.location?.()?.url ?? "";
+    let source = "page";
+    if (/decoder-sandbox/.test(frameUrl)) source = "decoder-sandbox";
+    else if (/ocr-sandbox/.test(frameUrl)) source = "ocr-sandbox";
+
+    recorder.write({ source, level: msg.type(), text, args: argsValues });
+    recorder.totalEntries++;
+    recorder.bySource[source] = (recorder.bySource[source] ?? 0) + 1;
+
+    const detection = classifyDetection(text, argsValues);
+    if (detection) recorder.detections.push({ atWall: Date.now(), ...detection });
+
+    const heartbeat = extractHeartbeat(text, argsValues);
+    if (heartbeat) {
+      recorder.lastHeartbeat = heartbeat;
+      recorder.heartbeatCount++;
+    }
+  });
+
+  page.on("pageerror", (err) => recorder.noteError(err.message, "page"));
+  page.on("crash", () => recorder.noteError("PAGE CRASH (renderer gone)", "page"));
+
+  page.on("requestfailed", (req) => {
+    const url = req.url();
+    if (!/tessdata|traineddata|googlevideo|\.m4s|videoplayback/.test(url)) return;
+    recorder.write({
+      source: "network",
+      level: "requestfailed",
+      text: `${req.failure()?.errorText ?? "?"} ${url}`
+    });
+  });
+}
+
+/* --------------------------------------------------------------------- */
+/*  Lancement du navigateur                                               */
+/* --------------------------------------------------------------------- */
+
+async function launchBrowser(opts) {
   const extensionArgs = opts.noExtension ? [] : [
     `--disable-extensions-except=${REPO_ROOT}`,
     `--load-extension=${REPO_ROOT}`
@@ -302,79 +348,253 @@ async function main() {
     try { Object.defineProperty(navigator, "webdriver", { get: () => undefined }); } catch { /* ignore */ }
   }).catch(() => {});
 
-  // Capture de la console de tous les contextes (page + frames enfants).
-  const attachConsole = (source) => async (msg) => {
-    const text = msg.text();
-    let argsValues = [];
-    try {
-      argsValues = await Promise.all(
-        msg.args().map((h) => h.jsonValue().catch(() => undefined))
-      );
-    } catch { /* args non sérialisables */ }
+  return context;
+}
 
-    const loc = msg.location?.() ?? {};
-    const frameUrl = loc.url || "";
-    let frameLabel = source;
-    if (/decoder-sandbox/.test(frameUrl)) frameLabel = "decoder-sandbox";
-    else if (/ocr-sandbox/.test(frameUrl)) frameLabel = "ocr-sandbox";
-    else if (/youtube\.com/.test(frameUrl)) frameLabel = "page";
+/* --------------------------------------------------------------------- */
+/*  Modes à sortie immédiate                                              */
+/* --------------------------------------------------------------------- */
 
-    write({ source: frameLabel, level: msg.type(), text, args: argsValues });
-    totalEntries++;
-    bySource[frameLabel] = (bySource[frameLabel] ?? 0) + 1;
+/**
+ * Ouvre YouTube et attend que l'utilisateur se connecte (avatar présent).
+ * Le profil persistant conserve ensuite la session.
+ */
+async function runLoginMode(page) {
+  console.log("\n🔑 Mode --login : connecte-toi à YouTube dans la fenêtre ouverte.");
+  console.log("   (détection auto de la connexion, sinon fermeture auto dans 5 min)");
 
-    const det = classifyDetection(text, argsValues);
-    if (det) detections.push({ atWall: Date.now(), ...det });
+  await page.goto("https://www.youtube.com", { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
 
-    const hb = extractHeartbeat(text, argsValues);
-    if (hb) { lastHeartbeat = hb; heartbeatCount++; }
-  };
-
-  const page = context.pages()[0] ?? (await context.newPage());
-  page.on("console", attachConsole("page"));
-  page.on("pageerror", (err) => {
-    errors.push(err.message);
-    write({ source: "page", level: "pageerror", text: err.message });
-  });
-  page.on("crash", () => {
-    errors.push("PAGE CRASH (renderer gone)");
-    write({ source: "page", level: "crash", text: "PAGE CRASH (renderer gone)" });
-  });
-  page.on("requestfailed", (req) => {
-    const url = req.url();
-    if (/tessdata|traineddata|googlevideo|\.m4s|videoplayback/.test(url)) {
-      write({ source: "network", level: "requestfailed", text: `${req.failure()?.errorText ?? "?"} ${url}` });
-    }
-  });
-
-  // Service worker (aujourd'hui muet, mais on branche ce qu'on peut).
-  const attachWorker = (worker) => {
-    write({ source: "service-worker", level: "info", text: `worker: ${worker.url()}` });
-    try { worker.on("console", attachConsole("service-worker")); } catch { /* non supporté selon version */ }
-  };
-  context.serviceWorkers().forEach(attachWorker);
-  context.on("serviceworker", attachWorker);
-
-  // Mode connexion : ouvre YouTube, attend que l'utilisateur se connecte
-  // (avatar présent), puis ferme. Le profil persistant conserve la session.
-  if (opts.login) {
-    console.log("\n🔑 Mode --login : connecte-toi à YouTube dans la fenêtre ouverte.");
-    console.log("   (détection auto de la connexion, sinon fermeture auto dans 5 min)");
-    await page.goto("https://www.youtube.com", { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
-    const loginDeadline = Date.now() + 300000;
-    let signedIn = false;
-    while (Date.now() < loginDeadline) {
-      await sleep(3000);
-      signedIn = await page.evaluate(() => !!document.querySelector("#avatar-btn, ytd-topbar-menu-button-renderer #avatar")).catch(() => false);
-      if (signedIn) break;
-    }
-    console.log(signedIn ? "✅ Connexion détectée — session enregistrée dans le profil." : "⏱ Délai écoulé (session enregistrée si tu t'es connecté).");
+  const deadline = Date.now() + 300000;
+  let signedIn = false;
+  while (Date.now() < deadline) {
     await sleep(3000);
+    signedIn = await page
+      .evaluate(() => !!document.querySelector("#avatar-btn, ytd-topbar-menu-button-renderer #avatar"))
+      .catch(() => false);
+    if (signedIn) break;
+  }
+
+  console.log(signedIn
+    ? "✅ Connexion détectée — session enregistrée dans le profil."
+    : "⏱ Délai écoulé (session enregistrée si tu t'es connecté).");
+  await sleep(3000);
+
+  return signedIn;
+}
+
+/** Seek au timestamp voulu, laisse s'afficher, capture la frame. */
+async function runScreenshotMode(page, opts, stamp) {
+  await seekAndConfirm(page, opts.screenshot);
+  await sleep(2500);
+
+  const shotPath = join(LOGS_DIR, `frame-${Math.round(opts.screenshot)}s-${stamp}.png`);
+  await page.screenshot({ path: shotPath });
+  console.log(`Capture: ${shotPath}`);
+}
+
+/* --------------------------------------------------------------------- */
+/*  Jugement d'une fenêtre de pub                                         */
+/* --------------------------------------------------------------------- */
+
+/**
+ * Verdict d'une fenêtre à partir des signaux observés depuis le seek.
+ * Un skip prime sur une simple détection.
+ */
+function judge(windowDetections, playhead, { reachedEnd }) {
+  const skips = windowDetections.filter((d) => d.kind === "skip");
+
+  if (skips.length) {
+    return {
+      verdict: "SKIP",
+      detail: { ct: playhead, kind: "skip", detail: reachedEnd ? `${skips.length} skip(s)` : skips[0].detail }
+    };
+  }
+  if (windowDetections.length) {
+    return {
+      verdict: reachedEnd ? "DÉTECTÉ (sans skip)" : "HIT",
+      detail: { ct: playhead, kind: windowDetections[0].kind, detail: windowDetections[0].detail }
+    };
+  }
+  return reachedEnd ? { verdict: "MISS", detail: { ct: playhead } } : null;
+}
+
+/**
+ * Amène la lecture sur une fenêtre de pub et observe jusqu'à un verdict.
+ *
+ * En mode normal on s'arrête au premier signal ; en `--full-window` on laisse
+ * jouer toute la fenêtre pour compter tous les sauts et juger la couverture.
+ */
+async function judgeAdWindow(page, ad, opts, recorder, globalDeadline) {
+  const { start, end } = ad;
+  const seekTarget = Math.max(0, start - opts.seekLead);
+
+  if (opts.noSeek) {
+    console.log(`\n▶ Pub [${start}-${end}s] — lecture continue (--no-seek), on attend que le playhead y arrive…`);
+    // Absorbe la/les pub(s) YouTube pré-roll avant de compter le temps.
+    if (await handleAds(page, 90000)) console.log("  ⏭ pub YouTube pré-roll passée.");
+    await ensurePlaying(page);
+  } else {
+    console.log(`\n⏩ Pub [${start}-${end}s] — seek à ${seekTarget}s…`);
+    const landed = await seekAndConfirm(page, seekTarget);
+    if (!landed) console.log("  ⚠ seek non confirmé (pub persistante ?) — observation quand même.");
+  }
+
+  const observeStart = Date.now();
+  let lastProgressWall = Date.now();
+  let lastCt = await getCurrentTime(page);
+
+  while (Date.now() < globalDeadline) {
+    await sleep(500);
+    const ct = await getCurrentTime(page);
+    const windowDetections = recorder.detections.filter((d) => d.atWall >= observeStart);
+
+    if (!opts.fullWindow) {
+      const early = judge(windowDetections, ct, { reachedEnd: false });
+      if (early) return early;
+    }
+
+    if (ct !== null && ct > end + opts.grace) {
+      return judge(windowDetections, ct, { reachedEnd: true });
+    }
+
+    // Pub YouTube en cours : on la passe. Le playhead du contenu ne bouge pas
+    // pendant une pub → ne pas compter ça comme un blocage.
+    if (await isAdShowing(page)) {
+      await handleAds(page);
+      await ensurePlaying(page);
+      lastProgressWall = Date.now();
+      lastCt = await getCurrentTime(page);
+      continue;
+    }
+
+    // Mode seek uniquement : lecture réinitialisée sous la fenêtre → re-seek.
+    if (!opts.noSeek && ct !== null && ct < seekTarget - 10) {
+      console.log(`  ↻ reset détecté (t=${ct}s) — re-seek à ${seekTarget}s…`);
+      await seekAndConfirm(page, seekTarget);
+      lastProgressWall = Date.now();
+      lastCt = await getCurrentTime(page);
+      continue;
+    }
+
+    if (ct !== null && lastCt !== null && ct > lastCt + 0.3) {
+      lastProgressWall = Date.now();
+      lastCt = ct;
+    }
+
+    // STALLED : aucune progression du playhead depuis 45s malgré tout.
+    if (Date.now() - lastProgressWall > 45000) {
+      return {
+        verdict: ct !== null && ct > end ? "MISS" : "STALLED",
+        detail: { ct }
+      };
+    }
+  }
+
+  return { verdict: "TIMEOUT", detail: {} };
+}
+
+/** Traite les fenêtres l'une après l'autre ; s'arrête après la dernière. */
+async function judgeAllAdWindows(page, opts, recorder, globalDeadline) {
+  const verdicts = [];
+
+  for (const ad of opts.ads) {
+    const { verdict, detail } = await judgeAdWindow(page, ad, opts, recorder, globalDeadline);
+    verdicts.push({ ...ad, verdict, ...detail });
+
+    const positive = verdict === "HIT" || verdict === "SKIP" || verdict.startsWith("DÉTECTÉ");
+    const line = positive
+      ? `✅ ${verdict} pub[${ad.start}-${ad.end}] — ${detail.kind ?? ""}${detail.detail ? ` (${detail.detail})` : ""} @playhead=${detail.ct ?? "?"}s`
+      : `❌ ${verdict} pub[${ad.start}-${ad.end}] — playhead=${detail.ct ?? "?"}s sans détection`;
+    console.log(line);
+    recorder.write({ source: "harness", level: "verdict", text: line, ad, verdict });
+  }
+
+  return verdicts;
+}
+
+/* --------------------------------------------------------------------- */
+/*  Résumé stdout                                                         */
+/* --------------------------------------------------------------------- */
+
+function printSummary(recorder, verdicts, stopReason) {
+  console.log("\n" + "═".repeat(64));
+  console.log("RÉSUMÉ");
+  console.log("═".repeat(64));
+  console.log(`Raison d'arrêt : ${stopReason}`);
+
+  const breakdown = Object.entries(recorder.bySource)
+    .map(([source, count]) => `${source}=${count}`).join(", ") || "(aucune)";
+  console.log(`Logs capturés  : ${recorder.totalEntries} [${breakdown}]`);
+
+  if (verdicts.length) {
+    console.log("\nVerdicts pub :");
+    for (const v of verdicts) {
+      console.log(`  [${v.start}-${v.end}s] → ${v.verdict}` + (v.kind ? ` (${v.kind})` : ""));
+    }
+  }
+
+  console.log(`\nHeartbeats reçus : ${recorder.heartbeatCount}`);
+  if (recorder.lastHeartbeat) {
+    console.log("Dernier heartbeat (état pipeline) :");
+    for (const field of [
+      "mediaSegmentsReceived", "scansRun", "framesDecoded", "ocrMatches",
+      "ocrBackend", "useFallback", "tesseractDisabled", "storeSize", "capturedSegments"
+    ]) {
+      console.log(`  ${field.padEnd(21)} : ${recorder.lastHeartbeat[field]}`);
+    }
+  } else {
+    console.log("⚠ Aucun heartbeat capturé — l'AheadScanner n'a peut-être pas démarré.");
+  }
+
+  const skips = recorder.detections.filter((d) => d.kind === "skip").length;
+  const ocrHits = recorder.detections.filter((d) => d.kind === "ocr-keyword").length;
+  console.log(`\nSignaux détectés : ${recorder.detections.length} (skips=${skips}, ocr-keyword=${ocrHits})`);
+
+  if (recorder.errors.length) {
+    console.log(`\nErreurs (${recorder.errors.length}) :`);
+    recorder.errors.slice(0, 5).forEach((e) => console.log(`  - ${e}`));
+  }
+
+  console.log(`\nLog complet : ${recorder.outPath}`);
+}
+
+/* --------------------------------------------------------------------- */
+/*  Programme principal                                                   */
+/* --------------------------------------------------------------------- */
+
+async function main() {
+  const opts = parseArgs(process.argv);
+
+  if (!opts.url) {
+    console.error("Aucune URL. Fournis --url <video> (ou renseigne TEST_VIDEO_URL dans le script).");
+    process.exit(2);
+  }
+
+  mkdirSync(LOGS_DIR, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const recorder = createRecorder(opts.out ? resolve(opts.out) : join(LOGS_DIR, `run-${stamp}.jsonl`));
+
+  console.log(`▶ Extension : ${REPO_ROOT}`);
+  console.log(`▶ Profil    : ${PROFILE_DIR}`);
+  console.log(`▶ Sortie    : ${recorder.outPath}`);
+  console.log(`▶ URL       : ${opts.url}`);
+  if (opts.ads.length) {
+    console.log(`▶ Pubs      : ${opts.ads.map((a) => `${a.start}-${a.end}s`).join(", ")} (seek-lead ${opts.seekLead}s, grâce ${opts.grace}s)`);
+  }
+
+  const context = await launchBrowser(opts);
+  const page = context.pages()[0] ?? (await context.newPage());
+  attachLogging(page, recorder);
+
+  if (opts.login) {
+    const signedIn = await runLoginMode(page);
     await context.close().catch(() => {});
-    out.end();
+    recorder.close();
     process.exit(signedIn ? 0 : 1);
   }
 
+  let verdicts = [];
   let stopReason = "timeout";
 
   try {
@@ -385,192 +605,38 @@ async function main() {
     await page.waitForSelector("video", { timeout: 30000 });
     await ensurePlaying(page);
 
-    // Mode capture : seek au timestamp voulu, laisse s'afficher, screenshot.
     if (opts.screenshot !== null) {
-      await seekAndConfirm(page, opts.screenshot);
-      await sleep(2500);
-      const shotPath = join(LOGS_DIR, `frame-${Math.round(opts.screenshot)}s-${stamp}.png`);
-      await page.screenshot({ path: shotPath });
-      console.log(`Capture: ${shotPath}`);
+      await runScreenshotMode(page, opts, stamp);
       await context.close().catch(() => {});
-      out.end();
+      recorder.close();
       process.exit(0);
     }
 
     const globalDeadline = Date.now() + opts.seconds * 1000;
 
     if (opts.ads.length === 0) {
-      // Pas d'annotation : capture passive jusqu'au plafond.
       console.log("Aucune fenêtre --ad : capture passive jusqu'au timeout.");
       while (Date.now() < globalDeadline) await sleep(1000);
       stopReason = "timeout";
     } else {
-      // Traitement séquentiel des fenêtres de pub, avec seek + verdict.
-      const verdicts = [];
-      let missed = false;
-
-      for (let idx = 0; idx < opts.ads.length; idx++) {
-        const { start, end } = opts.ads[idx];
-        const seekTarget = Math.max(0, start - opts.seekLead);
-        if (opts.noSeek) {
-          console.log(`\n▶ Pub ${idx + 1}/${opts.ads.length} [${start}-${end}s] — lecture continue (--no-seek), on attend que le playhead y arrive…`);
-          // Absorbe la/les pub(s) YouTube pré-roll avant de compter le temps.
-          if (await handleAds(page, 90000)) console.log("  ⏭ pub YouTube pré-roll passée.");
-          await ensurePlaying(page);
-        } else {
-          console.log(`\n⏩ Pub ${idx + 1}/${opts.ads.length} [${start}-${end}s] — seek à ${seekTarget}s…`);
-          const landed = await seekAndConfirm(page, seekTarget);
-          if (!landed) console.log("  ⚠ seek non confirmé (pub persistante ?) — observation quand même.");
-        }
-
-        const observeStart = Date.now();
-        let verdict = null;
-        let detailAt = null;
-        let lastProgressWall = Date.now();
-        let lastCt = await getCurrentTime(page);
-
-        // On observe jusqu'à ce que le playhead dépasse end+grace, ou détection.
-        while (Date.now() < globalDeadline) {
-          await sleep(500);
-          const ct = await getCurrentTime(page);
-
-          // Signaux de détection attribués à cette fenêtre (depuis le seek).
-          const windowDetections = detections.filter((d) => d.atWall >= observeStart);
-          const skipSigs = windowDetections.filter((d) => d.kind === "skip");
-          // Mode normal : on s'arrête au 1er signal (skip prioritaire = SKIP,
-          // sinon HIT). Mode --full-window : on NE s'arrête PAS, on laisse jouer
-          // toute la fenêtre pour compter tous les skips et juger la couverture.
-          if (!opts.fullWindow) {
-            if (skipSigs.length) {
-              verdict = "SKIP";
-              detailAt = { ct, kind: "skip", detail: skipSigs[0].detail };
-              break;
-            }
-            if (windowDetections.length > 0) {
-              verdict = "HIT";
-              detailAt = { ct, kind: windowDetections[0].kind, detail: windowDetections[0].detail };
-              break;
-            }
-          }
-          if (ct !== null && ct > end + opts.grace) {
-            if (skipSigs.length) {
-              verdict = "SKIP";
-              detailAt = { ct, kind: "skip", detail: `${skipSigs.length} skip(s)` };
-            } else if (windowDetections.length) {
-              verdict = "DÉTECTÉ (sans skip)";
-              detailAt = { ct, kind: windowDetections[0].kind, detail: windowDetections[0].detail };
-            } else {
-              verdict = "MISS";
-              detailAt = { ct };
-            }
-            break;
-          }
-          // Pub YouTube en cours : on la passe. Le playhead du contenu ne bouge
-          // pas pendant une pub → ne pas compter ça comme un blocage.
-          if (await isAdShowing(page)) {
-            await handleAds(page);
-            await ensurePlaying(page);
-            lastProgressWall = Date.now();
-            lastCt = await getCurrentTime(page);
-            continue;
-          }
-          // Mode seek uniquement : lecture réinitialisée sous la fenêtre → re-seek.
-          if (!opts.noSeek && ct !== null && ct < seekTarget - 10) {
-            console.log(`  ↻ reset détecté (t=${ct}s) — re-seek à ${seekTarget}s…`);
-            await seekAndConfirm(page, seekTarget);
-            lastProgressWall = Date.now();
-            lastCt = await getCurrentTime(page);
-            continue;
-          }
-          // Progression réelle ? (sinon on considère bloqué)
-          if (ct !== null && lastCt !== null && ct > lastCt + 0.3) {
-            lastProgressWall = Date.now();
-            lastCt = ct;
-          }
-          // STALLED : aucune progression du playhead depuis 45s malgré tout.
-          if (Date.now() - lastProgressWall > 45000) {
-            verdict = ct !== null && ct > end ? "MISS" : "STALLED";
-            detailAt = { ct };
-            break;
-          }
-        }
-        if (verdict === null) verdict = "TIMEOUT";
-
-        verdicts.push({ start, end, verdict, ...detailAt });
-        const positive = verdict === "HIT" || verdict === "SKIP" || verdict.startsWith("DÉTECTÉ");
-        const line = positive
-          ? `✅ ${verdict} pub[${start}-${end}] — ${detailAt?.kind ?? ""}${detailAt?.detail ? ` (${detailAt.detail})` : ""} @playhead=${detailAt?.ct ?? "?"}s`
-          : `❌ ${verdict} pub[${start}-${end}] — playhead=${detailAt?.ct ?? "?"}s sans détection`;
-        console.log(line);
-        write({ source: "harness", level: "verdict", text: line, ad: { start, end }, verdict });
-
-        if (verdict !== "HIT" && verdict !== "SKIP") missed = true;
-        // Dès qu'une fenêtre est jugée on passe à la suivante (seek) : on ne
-        // laisse jamais la vidéo tourner inutilement.
-      }
-
-      opts._verdicts = verdicts;
-      // Toutes les fenêtres jugées → on s'arrête, sans attendre --seconds.
+      verdicts = await judgeAllAdWindows(page, opts, recorder, globalDeadline);
+      const missed = verdicts.some((v) => v.verdict !== "HIT" && v.verdict !== "SKIP");
       stopReason = missed ? "toutes fenêtres jugées (au moins un MISS)" : "toutes fenêtres HIT";
       if (Date.now() >= globalDeadline) stopReason = "timeout (plafond --seconds atteint)";
     }
   } catch (err) {
-    errors.push(err.message);
-    write({ source: "harness", level: "error", text: err.message });
+    recorder.noteError(err.message);
     stopReason = `erreur: ${err.message}`;
   } finally {
     await context.close().catch(() => {});
-    out.end();
+    recorder.close();
   }
 
-  /* ----------------------------------------------------------------- */
-  /*  Résumé stdout                                                     */
-  /* ----------------------------------------------------------------- */
-  console.log("\n" + "═".repeat(64));
-  console.log("RÉSUMÉ");
-  console.log("═".repeat(64));
-  console.log(`Raison d'arrêt : ${stopReason}`);
-
-  const sourceBreakdown = Object.entries(bySource)
-    .map(([s, n]) => `${s}=${n}`).join(", ") || "(aucune)";
-  console.log(`Logs capturés  : ${totalEntries} [${sourceBreakdown}]`);
-
-  if (opts._verdicts?.length) {
-    console.log("\nVerdicts pub :");
-    for (const v of opts._verdicts) {
-      console.log(`  [${v.start}-${v.end}s] → ${v.verdict}` + (v.kind ? ` (${v.kind})` : ""));
-    }
-  }
-
-  console.log(`\nHeartbeats reçus : ${heartbeatCount}`);
-  if (lastHeartbeat) {
-    const h = lastHeartbeat;
-    console.log("Dernier heartbeat (état pipeline) :");
-    console.log(`  mediaSegmentsReceived : ${h.mediaSegmentsReceived}`);
-    console.log(`  scansRun              : ${h.scansRun}`);
-    console.log(`  framesDecoded         : ${h.framesDecoded}`);
-    console.log(`  ocrMatches            : ${h.ocrMatches}`);
-    console.log(`  ocrBackend            : ${h.ocrBackend}`);
-    console.log(`  useFallback           : ${h.useFallback}`);
-    console.log(`  tesseractDisabled     : ${h.tesseractDisabled}`);
-    console.log(`  storeSize             : ${h.storeSize}`);
-    console.log(`  capturedSegments      : ${h.capturedSegments}`);
-  } else {
-    console.log("⚠ Aucun heartbeat capturé — l'AheadScanner n'a peut-être pas démarré.");
-  }
-
-  const skips = detections.filter((d) => d.kind === "skip").length;
-  const ocrHits = detections.filter((d) => d.kind === "ocr-keyword").length;
-  console.log(`\nSignaux détectés : ${detections.length} (skips=${skips}, ocr-keyword=${ocrHits})`);
-  if (errors.length) {
-    console.log(`\nErreurs (${errors.length}) :`);
-    errors.slice(0, 5).forEach((e) => console.log(`  - ${e}`));
-  }
-  console.log(`\nLog complet : ${outPath}`);
+  printSummary(recorder, verdicts, stopReason);
 
   // Code retour : non-zéro si erreur ou verdict non concluant (ni HIT ni SKIP).
-  const failed = errors.length > 0 ||
-    opts._verdicts?.some((v) => v.verdict !== "HIT" && v.verdict !== "SKIP");
+  const failed = recorder.errors.length > 0 ||
+    verdicts.some((v) => v.verdict !== "HIT" && v.verdict !== "SKIP");
   process.exit(failed ? 1 : 0);
 }
 
