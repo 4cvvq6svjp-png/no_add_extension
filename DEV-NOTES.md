@@ -169,8 +169,44 @@ le monde isolé pour que le réassemblage fMP4 s'en serve.
 - *`CONFIG` redevient la source de vérité* : les ~16 constantes de temps codées
   en dur (cadences, timeouts sandbox, seuils d'abandon) y sont remontées.
 
+**Mesure sur la vidéo de référence** (4 runs `--full-window` après nettoyage,
+comparés aux 6 runs d'août ; toutes les métriques recalculées à l'identique
+depuis les JSONL, pas reprises du tableau §3) :
+
+| | août (n=6) | sept. après A/B/C (n=4) |
+|---|---|---|
+| Pub vue (médiane) | 12,5s **[7,6 – 22,9]** | **5,0s [4,7 – 8,8]** |
+| Sauts (médiane) | 6 | 4 |
+| Dépassement | +0,4 à +12,4s | +0,4s sur 3 runs /4 |
+| Cadence | 1,7s/frame | **2,1s/frame** |
+| Lecture OCR dans la pub | 57/68 (84 %) | 31/37 (84 %) |
+| Avance max de la sonde | 29,0s | **39,6s** |
+| Frames analysées dans la pub | 12 | **9** |
+
+Les distributions de « pub vue » se recouvrent à peine : 3 runs sur 4 sont sous
+le **meilleur** run d'août. L'amélioration est donc réelle, mais **son mécanisme
+n'est pas établi** :
+
+- ce n'est pas le débit — la cadence par frame a *empiré* (1,7 → 2,1s) ;
+- ce n'est pas le taux de lecture OCR — identique à 84 % avant/après.
+
+Ce que la mesure montre, c'est que la sonde **va chercher plus loin** (avance max
+29 → 39,6s) et couvre la pub en **moins de frames** (12 → 9). Hypothèse la plus
+plausible pour la cadence : le composite non déformé donne à Tesseract un texte
+réellement lisible, donc plus long à transcrire — les `textPreview` sont
+visiblement plus riches qu'en août. À confirmer en instrumentant la durée d'un
+appel OCR.
+
+**Pourquoi le flush par lot ne rapporte rien ici.** Mesuré sur un run
+post-nettoyage : 20 scans sur 21 ne décodent **que 0 ou 1 keyframe**, parce
+qu'un segment média YouTube n'en contient qu'une (17 scans sur 21 voient
+`keyframesTotal: 1`). Le lot est donc de taille 1, et un flush par lot *est* un
+flush par keyframe. Le changement reste utile pour la **correction** — une frame
+perdue ne peut plus décaler les bitmaps suivantes sur la mauvaise keyframe —
+mais pas pour le débit. Le levier est ailleurs, voir §4.5.
+
 **Reste à faire** : le découpage (lot D), les défauts du lot E — dont la
-ré-entrance de `setupSession` — et la réécriture du README (F1).
+ré-entrance de `setupSession` — et la réécriture du README (F1, faite).
 
 ---
 
@@ -228,6 +264,20 @@ est bien présent mais non lu). C'est ce qui impose le garde-fou d'adjacence de
   au lieu des 4 coins fixes.
 - Scanner plus en avance / plus vite (l'OCR Tesseract est le goulot ; backlog de
   segments non scannés visible dans le heartbeat).
+
+### 4.5 Où est vraiment le débit *(mesuré, §2.7)*
+Le flush par lot ne peut rien apporter : un segment média YouTube ne porte
+qu'**une** keyframe, donc le lot est toujours de taille 1. Le heartbeat de fin
+de run montre par ailleurs `28 capturés (8 non scannés)` — le scanner reste le
+goulot, mais frame par frame.
+
+Deux pistes qui s'attaquent au bon terme :
+- **Paralléliser les scans** : plusieurs `scan-segment` en vol (le pont supporte
+  déjà des `reqId` concurrents), ou une seconde sandbox OCR. Le décodage est
+  rapide ; c'est l'appel Tesseract qui domine.
+- **Réduire le coût d'un appel Tesseract** : le composite est passé de
+  1600×900 à 1600×538 (§2.7), mais rien ne dit que 1600 de large soit
+  nécessaire. À balayer.
 
 ### 4.3 Généralisation multi-vidéos
 Le coin exact et l'intitulé varient selon les créateurs (« Publicité »,
