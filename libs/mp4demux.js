@@ -1,12 +1,19 @@
 /**
- * Minimal fMP4 (ISO BMFF) demuxer for extracting codec configuration from
- * init segments and encoded frame data from media segments.
+ * Minimal fMP4 (ISO BMFF) and WebM (EBML) demuxer.
  *
  * Only the subset of boxes used by YouTube's DASH streams is handled:
  *   Init  : ftyp, moov > trak > mdia > minf > stbl > stsd > (avc1|vp09|av01)
  *   Media : moof > traf > (tfhd + tfdt + trun) + mdat
  *
- * Designed to be loaded in any JS context (content script, iframe, worker).
+ * The WebCodecs *codec string* is read from the SourceBuffer MIME type rather
+ * than rebuilt from codec-configuration bits: the MIME already carries a valid
+ * string (e.g. `av01.0.04M.08.0.110.05.01.06.0`) and rebuilding it by hand was
+ * a recurring source of "codec not supported" failures. Binary parsing is kept
+ * only for what the MIME cannot provide: coded dimensions, timescale, and the
+ * raw codec-configuration bytes WebCodecs needs as `description`.
+ *
+ * Loaded both in the decoder iframe and in the content script (isolated world),
+ * so the ISO BMFF box reader is shared instead of reimplemented per context.
  */
 (() => {
   "use strict";
@@ -16,39 +23,63 @@
   /* ================================================================== */
 
   /**
-   * Iterate over top-level boxes in a DataView.
+   * Read the ISO BMFF box header at `pos`.
+   *
+   * Returns null when the header itself is not fully present, so a caller
+   * reassembling a byte stream can tell "not yet" from "malformed".
+   * A 32-bit size of 0 means "this box runs to the end of the stream": the
+   * size cannot be known from the header alone, so it is reported through
+   * `extendsToEnd` and each caller applies its own policy.
+   *
+   * @param {Uint8Array} bytes
+   * @param {number} pos
+   * @returns {{ type: string, size: number, headerSize: number, extendsToEnd: boolean } | null}
+   */
+  function readBoxHeader(bytes, pos) {
+    if (pos + 8 > bytes.length) return null;
+
+    const rawSize =
+      ((bytes[pos] << 24) | (bytes[pos + 1] << 16) | (bytes[pos + 2] << 8) | bytes[pos + 3]) >>> 0;
+    const type = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]);
+
+    if (rawSize === 1) {
+      // 64-bit extended size, stored right after the header.
+      if (pos + 16 > bytes.length) return null;
+      const high =
+        ((bytes[pos + 8] << 24) | (bytes[pos + 9] << 16) | (bytes[pos + 10] << 8) | bytes[pos + 11]) >>> 0;
+      const low =
+        ((bytes[pos + 12] << 24) | (bytes[pos + 13] << 16) | (bytes[pos + 14] << 8) | bytes[pos + 15]) >>> 0;
+      return { type, size: high * 2 ** 32 + low, headerSize: 16, extendsToEnd: false };
+    }
+
+    if (rawSize === 0) {
+      return { type, size: 0, headerSize: 8, extendsToEnd: true };
+    }
+
+    return { type, size: rawSize, headerSize: 8, extendsToEnd: false };
+  }
+
+  /**
+   * Iterate over the boxes of a DataView.
    * Yields { type, offset, size, dataOffset, dataSize }.
    */
   function* iterateBoxes(view, baseOffset = 0) {
+    const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
     let pos = 0;
-    while (pos + 8 <= view.byteLength) {
-      let size = view.getUint32(pos);
-      const type = String.fromCharCode(
-        view.getUint8(pos + 4),
-        view.getUint8(pos + 5),
-        view.getUint8(pos + 6),
-        view.getUint8(pos + 7)
-      );
 
-      let headerSize = 8;
-      if (size === 1) {
-        // 64-bit extended size
-        if (pos + 16 > view.byteLength) break;
-        size = Number(view.getBigUint64(pos + 8));
-        headerSize = 16;
-      } else if (size === 0) {
-        // Box extends to end of buffer
-        size = view.byteLength - pos;
-      }
+    while (pos < bytes.length) {
+      const header = readBoxHeader(bytes, pos);
+      if (!header) break;
 
-      if (size < headerSize || pos + size > view.byteLength) break;
+      const size = header.extendsToEnd ? bytes.length - pos : header.size;
+      if (size < header.headerSize || pos + size > bytes.length) break;
 
       yield {
-        type,
+        type: header.type,
         offset: baseOffset + pos,
         size,
-        dataOffset: pos + headerSize,
-        dataSize: size - headerSize
+        dataOffset: pos + header.headerSize,
+        dataSize: size - header.headerSize
       };
 
       pos += size;
@@ -72,6 +103,15 @@
     );
   }
 
+  /** Copy a box's payload bytes out of its parent view. */
+  function copyBoxData(parentView, box) {
+    return new Uint8Array(
+      parentView.buffer,
+      parentView.byteOffset + box.dataOffset,
+      box.dataSize
+    ).slice();
+  }
+
   /** Walk a path of nested box types and return the innermost DataView. */
   function drillDown(view, path) {
     let current = view;
@@ -84,6 +124,27 @@
   }
 
   /* ================================================================== */
+  /*  Codec string                                                       */
+  /* ================================================================== */
+
+  /**
+   * Extract the `codecs` parameter of a MIME type.
+   * `video/mp4; codecs="av01.0.04M.08.0.110.05.01.06.0"` -> that string.
+   *
+   * Case is preserved: AV1 encodes its tier as an uppercase `M`/`H`.
+   */
+  function codecFromMime(mime) {
+    if (!mime) return null;
+    const match = String(mime).match(/codecs\s*=\s*"?([^";,]+)/i);
+    if (!match) return null;
+    const codec = match[1].trim();
+    return codec.length > 0 ? codec : null;
+  }
+
+  /** Codec-configuration boxes WebCodecs accepts as `description`. */
+  const CODEC_CONFIG_BOX_TYPES = new Set(["avcC", "hvcC", "vpcC", "av1C"]);
+
+  /* ================================================================== */
   /*  Init segment parsing                                               */
   /* ================================================================== */
 
@@ -91,160 +152,51 @@
    * Parse an fMP4 init segment (ftyp + moov).
    *
    * @param {ArrayBuffer} buffer
-   * @returns {{ codec: string, codedWidth: number, codedHeight: number, description: Uint8Array } | null}
+   * @param {string} mimeString SourceBuffer MIME, source of the codec string.
+   * @returns {{ codec: string, codedWidth: number, codedHeight: number, description: Uint8Array | null } | null}
    */
-  function parseInitSegment(buffer) {
+  function parseInitSegment(buffer, mimeString) {
+    const codec = codecFromMime(mimeString);
+    if (!codec) return null;
+
     const root = new DataView(buffer);
     const stsd = drillDown(root, ["moov", "trak", "mdia", "minf", "stbl", "stsd"]);
     if (!stsd) return null;
 
     // stsd: version(1) + flags(3) + entryCount(4) = 8 bytes header
     if (stsd.byteLength < 16) return null;
+    if (stsd.getUint32(4) === 0) return null;
 
-    const entryCount = stsd.getUint32(4);
-    if (entryCount === 0) return null;
-
-    // First sample entry starts at offset 8
+    // The first sample entry starts right after that header, whatever its type
+    // (avc1, avc3, vp09, av01, hvc1...).
     const entryView = new DataView(stsd.buffer, stsd.byteOffset + 8, stsd.byteLength - 8);
-    // Iterate to get the first box regardless of type
-    let sampleEntry = null;
-    for (const box of iterateBoxes(entryView)) {
-      sampleEntry = box;
-      break;
-    }
+    const sampleEntry = iterateBoxes(entryView).next().value ?? null;
     if (!sampleEntry) return null;
 
-    const entryType = sampleEntry.type; // avc1, avc3, vp09, av01, etc.
     const entryData = childView(entryView, sampleEntry);
 
-    // Visual sample entry: 6 reserved + 2 dataRefIdx + ... + 2 width + 2 height
-    // Minimum 78 bytes for visual sample entry before codec-specific boxes
+    // Visual sample entry: 78 bytes of fixed fields (width at 24, height at 26)
+    // before the codec-specific configuration boxes.
     if (entryData.byteLength < 78) return null;
 
     const codedWidth = entryData.getUint16(24);
     const codedHeight = entryData.getUint16(26);
 
-    // Codec-specific config box starts after the 78-byte visual sample entry header
     const configView = new DataView(
       entryData.buffer,
       entryData.byteOffset + 78,
       entryData.byteLength - 78
     );
 
-    let codec = null;
     let description = null;
-
-    if (entryType === "avc1" || entryType === "avc3") {
-      const result = parseAvcC(configView, entryType);
-      if (result) {
-        codec = result.codec;
-        description = result.description;
-      }
-    } else if (entryType === "vp09") {
-      const result = parseVpcC(configView);
-      if (result) {
-        codec = result.codec;
-        description = result.description;
-      }
-    } else if (entryType === "av01") {
-      const result = parseAv1C(configView);
-      if (result) {
-        codec = result.codec;
-        description = result.description;
+    for (const box of iterateBoxes(configView)) {
+      if (CODEC_CONFIG_BOX_TYPES.has(box.type)) {
+        description = copyBoxData(configView, box);
+        break;
       }
     }
-
-    if (!codec) return null;
 
     return { codec, codedWidth, codedHeight, description };
-  }
-
-  /** Parse avcC box -> codec string + raw description bytes. */
-  function parseAvcC(view, entryType) {
-    const box = findBox(view, "avcC");
-    if (!box || box.dataSize < 4) return null;
-
-    const data = childView(view, box);
-    // avcC: configVersion(1) + profile(1) + profileCompat(1) + level(1)
-    const profile = data.getUint8(1);
-    const compat = data.getUint8(2);
-    const level = data.getUint8(3);
-
-    const codec = `${entryType}.${hex(profile)}${hex(compat)}${hex(level)}`;
-
-    const description = new Uint8Array(
-      view.buffer,
-      view.byteOffset + box.dataOffset,
-      box.dataSize
-    ).slice();
-
-    return { codec, description };
-  }
-
-  /** Parse vpcC box -> codec string. */
-  function parseVpcC(view) {
-    const box = findBox(view, "vpcC");
-    if (!box || box.dataSize < 8) return null;
-
-    const data = childView(view, box);
-    // vpcC version 1: version(1) + flags(3) + profile(1) + level(1) + bitDepth:4|chromaSub:3|videoFullRange:1 + ...
-    const version = data.getUint8(0);
-    let profile, level, bitDepth;
-
-    if (version === 1) {
-      profile = data.getUint8(4);
-      level = data.getUint8(5);
-      bitDepth = (data.getUint8(6) >> 4) & 0x0f;
-    } else {
-      profile = data.getUint8(4);
-      level = data.getUint8(5);
-      bitDepth = (data.getUint8(6) >> 4) & 0x0f;
-    }
-
-    const codec = `vp09.${pad2(profile)}.${pad2(level)}.${pad2(bitDepth)}`;
-
-    const description = new Uint8Array(
-      view.buffer,
-      view.byteOffset + box.dataOffset,
-      box.dataSize
-    ).slice();
-
-    return { codec, description };
-  }
-
-  /** Parse av1C box -> codec string. */
-  function parseAv1C(view) {
-    const box = findBox(view, "av1C");
-    if (!box || box.dataSize < 4) return null;
-
-    const data = childView(view, box);
-    // av1C: marker:1|version:7 | seqProfile:3|seqLevelIdx0:5 | seqTier0:1|highBitdepth:1|twelveBit:1|monochrome:1|chromaSubX:1|chromaSubY:1|chromaSamplePos:2
-    const byte1 = data.getUint8(1);
-    const byte2 = data.getUint8(2);
-
-    const seqProfile = (byte1 >> 5) & 0x07;
-    const seqLevelIdx0 = byte1 & 0x1f;
-    const seqTier0 = (byte2 >> 7) & 0x01;
-    const highBitdepth = (byte2 >> 6) & 0x01;
-    const twelveBit = (byte2 >> 5) & 0x01;
-    const bitDepth = highBitdepth ? (twelveBit ? 12 : 10) : 8;
-    const monochrome = (byte2 >> 4) & 0x01;
-    const chromaSubX = (byte2 >> 3) & 0x01;
-    const chromaSubY = (byte2 >> 2) & 0x01;
-    const chromaSamplePos = byte2 & 0x03;
-
-    const tier = seqTier0 === 0 ? "M" : "H";
-    // AV1 codecs parameter (ISO BMFF): av01.<profile>.<level><tier>.<bitDepth>.<monochrome>.<subX><subY><samplePos>
-    const chromaTriplet = monochrome ? "000" : `${chromaSubX}${chromaSubY}${chromaSamplePos}`;
-    const codec = `av01.${seqProfile}.${pad2(seqLevelIdx0)}${tier}.${pad2(bitDepth)}.${monochrome}.${chromaTriplet}`;
-
-    const description = new Uint8Array(
-      view.buffer,
-      view.byteOffset + box.dataOffset,
-      box.dataSize
-    ).slice();
-
-    return { codec, description };
   }
 
   /* ================================================================== */
@@ -336,10 +288,10 @@
       pos += 4; // first-sample-flags (we read per-sample flags below)
     }
 
-    const hasDuration    = Boolean(trunFlags & 0x000100);
-    const hasSize        = Boolean(trunFlags & 0x000200);
-    const hasFlags       = Boolean(trunFlags & 0x000400);
-    const hasCTO         = Boolean(trunFlags & 0x000800);
+    const hasDuration = Boolean(trunFlags & 0x000100);
+    const hasSize     = Boolean(trunFlags & 0x000200);
+    const hasFlags    = Boolean(trunFlags & 0x000400);
+    const hasCTO      = Boolean(trunFlags & 0x000800);
 
     // First sample flags override
     const firstSampleFlags = (trunFlags & 0x000004) ? trun.getUint32(8) : null;
@@ -386,11 +338,10 @@
       const presentationTime = (currentDecodeTime + compositionOffset) / timescale;
       const durationSeconds = duration / timescale;
 
-      // Extract sample data from buffer
-      const sampleStart = currentDataOffset - (root.byteOffset ?? 0);
-      if (sampleStart >= 0 && sampleStart + size <= buffer.byteLength) {
+      // Box offsets are absolute in `buffer`: the root DataView spans it whole.
+      if (currentDataOffset >= 0 && currentDataOffset + size <= buffer.byteLength) {
         samples.push({
-          data: buffer.slice(sampleStart, sampleStart + size),
+          data: buffer.slice(currentDataOffset, currentDataOffset + size),
           timestamp: presentationTime,
           duration: durationSeconds,
           isKeyframe
@@ -424,18 +375,6 @@
     }
     // version 0: 4 creationTime + 4 modificationTime + 4 timescale
     return mdhd.byteLength >= 16 ? mdhd.getUint32(12) : 90000;
-  }
-
-  /* ================================================================== */
-  /*  Formatting helpers                                                 */
-  /* ================================================================== */
-
-  function hex(n) {
-    return n.toString(16).padStart(2, "0");
-  }
-
-  function pad2(n) {
-    return String(n).padStart(2, "0");
   }
 
   /* ================================================================== */
@@ -577,11 +516,20 @@
   };
 
   /**
+   * WebCodecs codec string for a WebM SourceBuffer.
+   * The EBML CodecID (`V_VP9`) is not a valid WebCodecs identifier, and a bare
+   * `vp9` needs expanding into a full `vp09.PP.LL.DD` string.
+   */
+  function webmCodecFromMime(mimeString) {
+    const codec = codecFromMime(mimeString)?.toLowerCase();
+    if (!codec) return "vp8";
+    if (codec.startsWith("vp9") && !codec.startsWith("vp09")) return "vp09.00.41.08";
+    return codec;
+  }
+
+  /**
    * Parse a WebM init segment (EBML header + Segment + Tracks).
    * Returns { codec, codedWidth, codedHeight, description: null, timestampScale, container: "webm" }
-   *
-   * The codec string comes from the MIME parameter — the EBML CodecID
-   * (`V_VP9`) is not a valid WebCodecs identifier.
    *
    * Dimensions and timestamp scale are located by flat-scanning the buffer
    * for known IDs. This is intentional: YouTube delivers a streaming
@@ -591,19 +539,7 @@
    */
   function parseWebMInitSegment(buffer, mimeString) {
     const u8 = new Uint8Array(buffer);
-
-    let codec = "vp8";
-    if (mimeString) {
-      const m = mimeString.match(/codecs\s*=\s*"?([^";,]+)/i);
-      if (m) {
-        const c = m[1].trim().toLowerCase();
-        if (c.startsWith("vp9") && !c.startsWith("vp09")) {
-          codec = "vp09.00.41.08";
-        } else {
-          codec = c;
-        }
-      }
-    }
+    const codec = webmCodecFromMime(mimeString);
 
     let timestampScale = 1000000;
     const info = findEbml(u8, EBML_ID.Info, 0, u8.length);
@@ -660,17 +596,14 @@
     const timestampScale = initInfo.timestampScale || 1000000; // ns per unit
     const samples = [];
 
-    // Find all Cluster elements at the top level (or inside Segment)
-    // YouTube WebM segments often start directly with a Cluster
+    // YouTube WebM segments often start directly with a Cluster; when the EBML
+    // header is present, skip it and the Segment header to reach the clusters.
     let searchStart = 0;
-
-    // Check if buffer starts with EBML header — if so, skip to Segment content
     const firstIdResult = ebmlReadId(u8, 0);
     if (firstIdResult && firstIdResult.id === EBML_ID.EBML) {
       const firstSizeResult = ebmlReadSize(u8, firstIdResult.nextPos);
       if (firstSizeResult) {
         searchStart = firstSizeResult.nextPos + firstSizeResult.size;
-        // Now skip Segment header
         const segIdResult = ebmlReadId(u8, searchStart);
         if (segIdResult && segIdResult.id === EBML_ID.Segment) {
           const segSizeResult = ebmlReadSize(u8, segIdResult.nextPos);
@@ -741,13 +674,13 @@
   /*  Exports                                                            */
   /* ================================================================== */
 
-  // Make available globally for use in iframe sandboxes or content scripts.
-  const mp4demux = { parseInitSegment, parseMediaSegment, parseTimescale, parseWebMInitSegment, parseWebMClusters };
-
-  if (typeof globalThis !== "undefined") {
-    globalThis.__mp4demux = mp4demux;
-  }
-  if (typeof window !== "undefined") {
-    window.__mp4demux = mp4demux;
-  }
+  globalThis.__mp4demux = {
+    readBoxHeader,
+    codecFromMime,
+    parseInitSegment,
+    parseMediaSegment,
+    parseTimescale,
+    parseWebMInitSegment,
+    parseWebMClusters
+  };
 })();

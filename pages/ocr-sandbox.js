@@ -1,17 +1,26 @@
+/**
+ * OCR Sandbox — Tesseract.js running inside an extension iframe.
+ *
+ * YouTube's CSP forbids the WASM worker Tesseract needs, so the engine lives
+ * in a chrome-extension:// page, which is governed by the extension's own CSP.
+ * The content script sends ImageBitmaps in and gets recognised text back.
+ *
+ * Communication channel: "no-add-extension-ocr"
+ *
+ *   init       — start (or reuse) the Tesseract worker
+ *   recognize  — { imageBitmap } -> { text }
+ *   terminate  — release the worker
+ */
 (() => {
+  "use strict";
+
   const CHANNEL = "no-add-extension-ocr";
 
   let workerPromise = null;
 
-  function formatErr(error) {
-    if (error instanceof Error) {
-      return error.message || error.name || "Error";
-    }
+  function formatError(error) {
+    if (error instanceof Error) return error.message || error.name || "Error";
     return String(error);
-  }
-
-  function replyToParent(eventSource, payload) {
-    eventSource.postMessage({ channel: CHANNEL, ...payload }, "*");
   }
 
   async function getWorker() {
@@ -46,82 +55,64 @@
     return workerPromise;
   }
 
-  window.addEventListener("message", async (event) => {
-    if (event.source !== window.parent) {
-      return;
+  /**
+   * Tesseract.js' internal Web Worker fails with "Error attempting to read
+   * image" when handed a raw ImageBitmap that has already been transferred via
+   * postMessage. Reify it into a PNG Blob — the input type most widely
+   * supported across Tesseract.js versions.
+   */
+  async function toRecognizableInput(source) {
+    if (typeof ImageBitmap === "undefined" || !(source instanceof ImageBitmap)) {
+      return source;
     }
+
+    const canvas = new OffscreenCanvas(source.width, source.height);
+    canvas.getContext("2d").drawImage(source, 0, 0);
+    try { source.close(); } catch { /* ignore */ }
+    return canvas.convertToBlob({ type: "image/png" });
+  }
+
+  /** One handler per message type; the return value becomes the reply payload. */
+  const HANDLERS = {
+    async init() {
+      await getWorker();
+      return {};
+    },
+
+    async recognize(msg) {
+      const worker = await getWorker();
+      const input = await toRecognizableInput(msg.imageBitmap);
+      const { data: { text } } = await worker.recognize(input);
+      return { text: text ?? "" };
+    },
+
+    async terminate() {
+      const pending = workerPromise;
+      workerPromise = null;
+      const worker = pending ? await pending.catch(() => null) : null;
+      if (worker) {
+        await worker.terminate().catch(() => {});
+      }
+      return {};
+    }
+  };
+
+  window.addEventListener("message", async (event) => {
+    if (event.source !== window.parent) return;
 
     const msg = event.data;
-    if (!msg || msg.channel !== CHANNEL) {
-      return;
-    }
+    if (!msg || msg.channel !== CHANNEL) return;
 
-    const answer = (payload) => replyToParent(event.source, payload);
+    const handler = HANDLERS[msg.type];
+    if (!handler) return;
 
-    if (msg.type === "init") {
-      try {
-        await getWorker();
-        answer({ type: "init-ok", reqId: msg.reqId });
-      } catch (error) {
-        answer({
-          type: "init-err",
-          reqId: msg.reqId,
-          error: formatErr(error)
-        });
-      }
-      return;
-    }
+    const reply = (payload) =>
+      event.source.postMessage({ channel: CHANNEL, reqId: msg.reqId, ...payload }, "*");
 
-    if (msg.type === "recognize") {
-      try {
-        const worker = await getWorker();
-
-        // Tesseract.js' internal Web Worker fails with
-        // "Error attempting to read image" when handed a raw ImageBitmap
-        // that has already been transferred via postMessage. Reify it into a
-        // Blob (PNG) through an OffscreenCanvas — Blob is the most widely
-        // supported input across Tesseract.js versions.
-        let input = msg.imageBitmap;
-        if (typeof ImageBitmap !== "undefined" && input instanceof ImageBitmap) {
-          const canvas = new OffscreenCanvas(input.width, input.height);
-          const ctx = canvas.getContext("2d");
-          ctx.drawImage(input, 0, 0);
-          try { input.close(); } catch { /* ignore */ }
-          input = await canvas.convertToBlob({ type: "image/png" });
-        }
-
-        const {
-          data: { text }
-        } = await worker.recognize(input);
-        answer({
-          type: "recognize-ok",
-          reqId: msg.reqId,
-          text: text ?? ""
-        });
-      } catch (error) {
-        answer({
-          type: "recognize-err",
-          reqId: msg.reqId,
-          error: formatErr(error)
-        });
-      }
-      return;
-    }
-
-    if (msg.type === "terminate") {
-      try {
-        const pending = workerPromise;
-        workerPromise = null;
-        if (pending) {
-          const worker = await pending.catch(() => null);
-          if (worker) {
-            await worker.terminate();
-          }
-        }
-      } catch {
-        // best-effort
-      }
-      answer({ type: "terminate-ok", reqId: msg.reqId });
+    try {
+      reply({ type: `${msg.type}-ok`, ...(await handler(msg)) });
+    } catch (error) {
+      reply({ type: `${msg.type}-err`, error: formatError(error) });
     }
   });
 

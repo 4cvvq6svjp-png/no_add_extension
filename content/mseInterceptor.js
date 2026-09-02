@@ -17,33 +17,36 @@
   const CHANNEL = "no-add-mse-intercept";
   const TAG = "[NoAdd-MSE]";
 
+  /** Segments kept so a content script that starts late can replay them. */
+  const MAX_PENDING_SEGMENTS = 20;
+  /** Cadence of the throughput log. */
+  const STATS_LOG_INTERVAL_MS = 5000;
+
   /* ------------------------------------------------------------------ */
   /*  Helpers                                                            */
   /* ------------------------------------------------------------------ */
 
-  /** Read the ISO BMFF box type at byte offset 4 of a buffer. */
+  /** ISO BMFF box type stored at byte offset 4. */
   function peekBoxType(buffer) {
     if (buffer.byteLength < 8) return null;
-    const view = new Uint8Array(buffer instanceof ArrayBuffer ? buffer : buffer.buffer, buffer.byteOffset ?? 0, 8);
-    return String.fromCharCode(view[4], view[5], view[6], view[7]);
+    const head = new Uint8Array(buffer, 0, 8);
+    return String.fromCharCode(head[4], head[5], head[6], head[7]);
+  }
+
+  /** WebM/Matroska streams open with the EBML header magic 0x1A45DFA3. */
+  function startsWithEbmlMagic(buffer) {
+    if (buffer.byteLength < 4) return false;
+    const head = new Uint8Array(buffer, 0, 4);
+    return head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3;
   }
 
   function isInitSegment(buffer) {
     const type = peekBoxType(buffer);
-    if (type === "ftyp" || type === "moov") return true;
-    // WebM/Matroska: starts with EBML header magic 0x1A 0x45 0xDF 0xA3
-    if (buffer.byteLength >= 4) {
-      const view = new Uint8Array(buffer instanceof ArrayBuffer ? buffer : buffer.buffer, buffer.byteOffset ?? 0, 4);
-      if (view[0] === 0x1A && view[1] === 0x45 && view[2] === 0xDF && view[3] === 0xA3) return true;
-    }
-    return false;
+    return type === "ftyp" || type === "moov" || startsWithEbmlMagic(buffer);
   }
 
-  function containerType(mimeOrBuffer) {
-    if (typeof mimeOrBuffer === "string") {
-      return mimeOrBuffer.startsWith("video/webm") ? "webm" : "mp4";
-    }
-    return "mp4";
+  function containerFromMime(mime) {
+    return String(mime ?? "").startsWith("video/webm") ? "webm" : "mp4";
   }
 
   function isVideoMime(mime) {
@@ -61,19 +64,22 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /*  Buffer: keep last init + recent media segments for late listeners  */
+  /*  Replay buffer: last init + recent media segments for late listeners */
   /* ------------------------------------------------------------------ */
 
-  let lastInitSegment = null; // { data, mime, timestampOffset }
-  const pendingMediaSegments = []; // last N media segments before content script is ready
-  const MAX_PENDING = 20;
+  let lastInitSegment = null; // { data, mime, container, timestampOffset }
+  let pendingMediaSegments = [];
+  // The content script asks for a replay once, when its session starts. After
+  // that, holding on to full segments would pin megabytes for the whole video,
+  // so we stop buffering until the next MediaSource (SPA navigation) starts a
+  // new session that will replay again.
+  let bufferingForReplay = true;
 
   // Stats for throttled cadence logging
   let mediaSegmentCount = 0;
   let mediaSegmentBytes = 0;
   let lastStatsLogAt = 0;
 
-  // Listen for "request-replay" from the ISOLATED world content script
   window.addEventListener("message", (event) => {
     const msg = event.data;
     if (!msg || msg.channel !== CHANNEL || msg.type !== "request-replay") return;
@@ -86,20 +92,23 @@
         timestampOffset: lastInitSegment.timestampOffset
       });
     }
-    for (const seg of pendingMediaSegments) {
+    for (const segment of pendingMediaSegments) {
       post("media-segment", {
-        data: seg.data.slice(0),
-        mime: seg.mime,
-        timestampOffset: seg.timestampOffset
+        data: segment.data.slice(0),
+        mime: segment.mime,
+        timestampOffset: segment.timestampOffset
       });
     }
+
+    pendingMediaSegments = [];
+    bufferingForReplay = false;
   });
 
   /* ------------------------------------------------------------------ */
   /*  Track which SourceBuffers carry video                              */
   /* ------------------------------------------------------------------ */
 
-  /** WeakMap<SourceBuffer, { isVideo: boolean, timestampOffset: number }> */
+  /** WeakMap<SourceBuffer, { isVideo: boolean, timestampOffset: number, mime: string }> */
   const sbMeta = new WeakMap();
 
   const origAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
@@ -164,33 +173,37 @@
 
     try {
       if (isInitSegment(copy)) {
-        const container = containerType(meta.mime);
+        const container = containerFromMime(meta.mime);
         lastInitSegment = { data: copy, mime: meta.mime, timestampOffset: meta.timestampOffset, container };
-        pendingMediaSegments.length = 0; // Reset on new init
+        pendingMediaSegments = [];
         post("init-segment", {
           data: copy.slice(0),
           mime: meta.mime,
           container,
           timestampOffset: meta.timestampOffset
         });
-      } else {
+        return;
+      }
+
+      if (bufferingForReplay) {
         pendingMediaSegments.push({ data: copy, mime: meta.mime, timestampOffset: meta.timestampOffset });
-        if (pendingMediaSegments.length > MAX_PENDING) {
+        if (pendingMediaSegments.length > MAX_PENDING_SEGMENTS) {
           pendingMediaSegments.shift();
         }
-        post("media-segment", {
-          data: copy,
-          mime: meta.mime,
-          timestampOffset: meta.timestampOffset
-        });
+      }
 
-        mediaSegmentCount += 1;
-        mediaSegmentBytes += copy.byteLength;
-        const now = Date.now();
-        if (now - lastStatsLogAt > 5000) {
-          console.info(TAG, `media-segments: ${mediaSegmentCount} reçus, ${(mediaSegmentBytes / 1024).toFixed(0)} KB cumulés`);
-          lastStatsLogAt = now;
-        }
+      post("media-segment", {
+        data: copy,
+        mime: meta.mime,
+        timestampOffset: meta.timestampOffset
+      });
+
+      mediaSegmentCount += 1;
+      mediaSegmentBytes += copy.byteLength;
+      const now = Date.now();
+      if (now - lastStatsLogAt > STATS_LOG_INTERVAL_MS) {
+        console.info(TAG, `media-segments: ${mediaSegmentCount} reçus, ${(mediaSegmentBytes / 1024).toFixed(0)} KB cumulés`);
+        lastStatsLogAt = now;
       }
     } catch {
       // Never let interception errors affect playback.
@@ -206,7 +219,9 @@
     const url = origCreateObjectURL.call(this, obj);
     if (obj instanceof MediaSource) {
       lastInitSegment = null;
-      pendingMediaSegments.length = 0;
+      pendingMediaSegments = [];
+      // A new video means a new content-script session, which will replay.
+      bufferingForReplay = true;
       post("new-media-source", { blobUrl: url });
     }
     return url;
