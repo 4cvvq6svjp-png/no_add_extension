@@ -363,6 +363,25 @@
       return this.ocrBackend ?? "none";
     }
 
+    /**
+     * Le moteur peut-il analyser une frame maintenant ? Déclenche le démarrage
+     * si besoin, et renvoie false tant qu'il n'est pas prêt (démarrage en
+     * échec, délai d'attente en cours).
+     *
+     * L'appelant s'en sert pour ne pas consommer de travail qu'il devrait
+     * ensuite jeter : `isAvailable()` ne dit que le backend choisi à la
+     * construction, celui-ci dit l'état réel.
+     */
+    async ensureReady() {
+      if (!this.isAvailable()) {
+        return false;
+      }
+      if (this.ocrBackend === "text-detector") {
+        return true;
+      }
+      return this.tesseract.ensureStarted();
+    }
+
     // Exposés pour le heartbeat de diagnostic.
     get tesseractErrorCount() {
       return this.tesseract?.failures ?? 0;

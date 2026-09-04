@@ -471,7 +471,21 @@ usage ne condamne plus la vidéo entière. `ocrInitTimeoutMs` passe de 120 à 60
 démesuré pour une boucle qui tourne toutes les 2 s.
 
 9 tests couvrent les trois modes, avec une horloge pilotée pour mesurer le
-backoff au lieu de l'attendre. **50 tests au total.**
+backoff au lieu de l'attendre.
+
+**Un quatrième défaut, d'intégration cette fois.** Le moteur corrigé était
+propre, mais la boucle de scan ne lui demandait jamais s'il pouvait travailler.
+`scanNext` marquait le segment `scanned` — donc consommé pour de bon — puis le
+faisait démuxer et décoder, et ce n'est qu'ensuite que l'OCR répondait
+« indisponible ». Pendant un délai d'attente de 60 s à ~2 s par itération, cela
+brûlait une trentaine de segments, soit deux à trois minutes de contenu
+**définitivement non analysées**, en payant le décodage au passage. `scanNext`
+et `fallbackTick` demandent maintenant `frameClassifier.ensureReady()` avant de
+consommer quoi que ce soit : sans OCR, la boucle attend au lieu de gaspiller.
+`isAvailable()` ne dit que le backend choisi à la construction, `ensureReady()`
+dit l'état réel.
+
+**51 tests au total.**
 
 **Lot F — documentation.** ARCHITECTURE décrivait cinq composants sur onze : le
 découpage du lot D en avait créé six que rien ne documentait, dont `AdEndProbe`,

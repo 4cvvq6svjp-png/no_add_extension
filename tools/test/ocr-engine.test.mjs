@@ -261,3 +261,44 @@ test("terminate remet le moteur à son état initial", async () => {
     clock.restore();
   }
 });
+
+/* --------------------------------------------------------------------- */
+/*  Intégration : la boucle de scan ne brûle pas de segment sans OCR      */
+/* --------------------------------------------------------------------- */
+
+const { AheadScanner, MseSegmentBuffer } = loadContentScript();
+
+/** Scanner monté sur un classifieur et un décodeur pilotés. */
+function scannerWith({ ocrReady }) {
+  const decoder = { calls: 0, async ensureConfigured() { this.calls++; return true; },
+                    async scanSegment() { return { frames: [] }; },
+                    invalidateConfiguration() {}, destroy() {}, configured: true };
+  const classifier = {
+    isAvailable: () => true,
+    getBackendLabel: () => "tesseract",
+    async ensureReady() { return ocrReady; },
+    async detect() { return { sampleTime: 0, hasCommercialKeyword: false, matchedKeywords: [], source: "x" }; }
+  };
+  const scanner = new AheadScanner({
+    mainVideo: { currentTime: 0, buffered: { length: 0 } },
+    frameClassifier: classifier,
+    segmentStore: { addSegment: () => true, segments: [] }
+  });
+  scanner.decoder = decoder;
+  scanner.buffer.initSegment = new ArrayBuffer(8);
+  for (let i = 0; i < 4; i++) scanner.buffer.enqueue(new ArrayBuffer(8), 0);
+  return { scanner, decoder };
+}
+
+test("sans OCR prêt, aucun segment n'est consommé ni décodé", async () => {
+  const { scanner, decoder } = scannerWith({ ocrReady: false });
+
+  assert.equal(await scanner.scanNext(), false, "la boucle se met en attente");
+  assert.equal(scanner.buffer.unscannedCount, 4, "les 4 segments restent à analyser");
+  assert.equal(decoder.calls, 0, "on ne décode pas pour jeter ensuite");
+
+  // Le contenu est toujours là quand le moteur revient : rien n'a été perdu.
+  scanner.frameClassifier.ensureReady = async () => true;
+  assert.equal(await scanner.scanNext(), true);
+  assert.equal(scanner.buffer.unscannedCount, 3);
+});
