@@ -117,71 +117,213 @@ with the list of what it takes from it — an import list in all but name.
 
 #### 4.2.1 `SegmentStore`
 
-A simple sorted list of `{ start, end, source, confidence }` objects representing detected commercial segments. On `addSegment`, it merges overlapping or near-adjacent segments (within `mergeGapSeconds = 2s`) and discards segments shorter than `minSegmentSeconds = 3s`.
+A sorted list of `{ start, end, source, confidence }` objects representing detected commercial segments. `addSegment` discards anything shorter than `minSegmentSeconds` (3s), then merges overlapping or near-adjacent ranges — `mergeGapSeconds` is deliberately wide (20s) because the disclosure text is present *throughout* an ad, so successive detections describe one continuous state rather than separate segments.
+
+`addSegment` returns whether the store actually changed: a range entirely absorbed by an existing one returns `false`. Callers use this for logging, and the honest answer matters — the probe used to report "ad end extended" on insertions that changed nothing.
 
 #### 4.2.2 `PlayerNotifier`
 
 A UI element: a small semi-transparent overlay injected into `#movie_player` that shows toast-style messages like "Segment publicitaire détecté — passage à…".
 
-#### 4.2.3 `FrameClassifier`
+#### 4.2.3 `SandboxBridge`
 
-**Role:** OCR engine that takes a video frame (from a `<video>` element or an `ImageBitmap`) and returns whether it contains commercial keywords.
+**Role:** The single mechanism both extension iframes are driven through.
 
-**How it works:**
-- Crops the four corners of the frame **at its native resolution** (no intermediate downscale) and upscales them into a 2×2 composite, so a single OCR pass covers every corner the disclosure may sit in.
-- Each cell keeps the crop's aspect ratio: a free-ratio cell stretched glyphs vertically (×1.66 with the former 1600×900 composite) and cost OCR accuracy.
-- Binarizes the composite (near-white pixels only) and sends it to one of two OCR backends:
+Creating a hidden `chrome-extension://` iframe, waiting for its `sandbox-ready`
+handshake, then issuing requests correlated by `reqId` with a timeout — this was
+written twice, once for OCR and once for the decoder, and the two copies had
+started to diverge. `SandboxBridge` is parameterised by channel, page path and
+the two timeouts; everything else is shared.
 
-**Backend 1: `TextDetector` API (Chrome Shape Detection API)**
-- Native browser API, extremely fast (~5–15ms).
-- Used as the primary backend when available (Chromium 88+, not Firefox, not all platforms).
-- Backend selection is exclusive: when `TextDetector` exists it *is* the backend, otherwise Tesseract is. A `TextDetector` pre-filter in front of Tesseract used to be described here and coded in `detectWithTesseract`, but the two conditions are mutually exclusive so it could never run; the dead branch was removed.
+`ensureReady()` checks `iframe.isConnected` before reusing a sandbox, so an
+iframe that disappeared is rebuilt rather than assumed alive. Replies resolve
+when their `type` ends in `-ok` and reject otherwise, carrying the sandbox's own
+error string.
 
-**Backend 2: Tesseract.js (inside OCR sandbox iframe)**
-- Tesseract is a full OCR engine compiled to WebAssembly (~20MB).
-- YouTube's CSP (`script-src 'self' 'unsafe-eval'` on `youtube.com`) would block WASM execution.
-- The extension loads Tesseract inside a hidden `<iframe>` pointing to `pages/ocr-sandbox.html` (a chrome-extension:// page, which has its own CSP: `'wasm-unsafe-eval'`).
-- Communication via `postMessage` with request IDs.
-- Slow (~200–500ms per frame on a typical machine) but works on all platforms.
+#### 4.2.4 `RoiComposer`
 
-**Text normalization:** Accents are stripped (NFD normalization + remove combining diacritics) and text is lowercased before keyword matching. This handles "Collaboration commerciale" → "collaboration commerciale" → match.
+**Role:** Build the image submitted to OCR.
 
-#### 4.2.4 `AheadScanner`
+Crops the four corners of the frame **at the source's native resolution** and
+upscales each into a cell of a 2×2 composite, then binarizes (near-white pixels
+only, giving black text on white). One canvas, therefore one OCR call per frame.
 
-**Role:** The main prediction engine. Decodes future video frames from raw MSE segments ahead of playback.
+Two properties decide legibility, and both were bugs at some point:
 
-**Key state:**
-- `initSegment`: The last received init segment (fMP4 or WebM).
-- `initSegmentContainer`: `"mp4"` or `"webm"`.
-- `capturedSegments[]`: Up to 30 recent media segments, each with `{ data, timestampOffset, receivedAt, scanned }`.
-- `decoderIframe`: Hidden iframe running `decoder-sandbox.js`.
-- `lastScannedTime`: Prevents re-scanning already-analyzed timestamps.
-- `useFallback`: Set to `true` after 8s if no MSE data arrives (e.g. non-MSE player mode).
+- The source is read as-is. An intermediate 1280×720 canvas used to shrink the
+  frame before it was enlarged again — destroying detail on text that is small
+  to begin with.
+- Each cell keeps the **crop's aspect ratio**. A free-ratio cell stretched
+  glyphs vertically by a factor of 1.66, which is exactly the kind of distortion
+  an OCR engine trained on undistorted text handles badly. The composite height
+  is now derived from the crop, which also cut its area by 40%.
 
-**Lifecycle:**
+#### 4.2.5 `TesseractOcr`
 
-1. **`start()`**: Registers the `message` listener, sends `request-replay`, starts the scan interval (every 1200ms), and starts an 8-second fallback timer.
-2. **MSE messages**: `init-segment` → stores init segment, cancels fallback timer, resets `decoderConfigured`. `media-segment` → appends to `capturedSegments`, evicts if >30 entries.
-3. **`scanNext()`** (called every 1200ms):
-   - Skips if `useFallback` is true, a scan is already pending, or there's no data.
-   - Calls `ensureDecoderConfigured()` which lazily creates the decoder iframe and sends a `configure` message.
-   - Finds the first unscanned segment in `capturedSegments`.
-   - Sends a `scan-segment` message (transferring the raw `ArrayBuffer`) to the decoder sandbox.
-   - Receives back an array of `{ timestamp, imageBitmap }` decoded keyframes.
-   - For each bitmap, calls `frameClassifier.detectFromBitmap()`, then `consumeDetection()`.
-   - Closes each bitmap after use.
-4. **`consumeDetection()`**: Commits proactively — every positive detection immediately stores `[t - segmentStartPadSeconds, t + segmentForwardSeconds]`, and successive detections merge (`mergeGapSeconds`). The real end of the ad is then located by the bisection probe (see DEV-NOTES §2.6), not by waiting out a grace period.
-5. **Fallback mode**: If `useFallback = true`, `startFallbackPolling()` creates an interval that calls `fallbackTick()` every 1200ms. This reads frames directly from the visible `<video>` element using `detectFromVideo()` — same OCR path, no decoder needed.
+**Role:** Own the heavy OCR engine's lifecycle.
 
-#### 4.2.5 `SkipController`
+Startup happens *inside* the scan loop, which awaits it, so its robustness
+governs the whole pipeline. Three rules follow, each answering a failure
+observed in the code:
+
+1. **No latched failure state.** A failed attempt never leaves a cached promise
+   behind; it schedules another attempt. The previous version kept a promise
+   resolving to `false` when the iframe never answered, and therefore never
+   retried again — for the rest of the video.
+2. **One counter for every cause.** Startup and recognition failures feed the
+   same counter, so `disabled` — which the heartbeat exposes — is truthful
+   whatever broke. Startup failures used to bypass it entirely, leaving
+   `tesseractDisabled: false` while nothing worked at all.
+3. **Growing delay between attempts.** Without it a failing startup is retried
+   on every frame; if it *hangs* rather than fails, it freezes the scan loop for
+   the whole timeout, repeatedly. The delay doubles from
+   `ocrRetryBaseDelayMs` up to `ocrRetryMaxDelayMs`.
+
+A retry always starts from a fresh iframe: the sandbox caches its worker, so
+re-sending `init` to a live iframe would hand back the same dead worker. And the
+engine never gives up for good — past the threshold it keeps probing at the
+maximum interval, so a network failure on first use does not condemn the rest of
+the video.
+
+#### 4.2.6 `MseSegmentBuffer`
+
+**Role:** Hold the raw video segments intercepted from MSE.
+
+Receives the MAIN-world messages, reassembles fMP4 units, and keeps the queue of
+segments left to scan. The reassembly is the subtle part: YouTube splits one
+`moof`+`mdat` unit across several `appendBuffer()` calls, and a truncated `mdat`
+makes the demuxer return zero samples — which is what kept the whole look-ahead
+blind before it was found. Only **complete** units are enqueued, and a change of
+`timestampOffset` (a seek) drops any dangling partial bytes rather than stitching
+across two timelines.
+
+Every segment carries a monotonic `seq`. Eviction shifts array indices, so the
+probe needs identifiers that survive it.
+
+#### 4.2.7 `DecoderSandbox`
+
+**Role:** Front the WebCodecs sandbox.
+
+Configures the decoder from the current init segment, then has it decode a media
+segment's keyframes. It snapshots the init segment before the configure
+round-trip and re-checks its identity afterwards: a quality switch mid-flight
+would otherwise leave the decoder marked as configured for stale bytes.
+
+Configure failures are counted per init segment. After `maxConfigureFailures`
+attempts on the same init — the platform genuinely lacking a decoder for the
+codec YouTube advertises — it stops retrying and signals the caller, which
+switches to the visible-player OCR fallback.
+
+#### 4.2.8 `AdEndProbe`
+
+**Role:** Locate the end of an ad by bisection instead of walking through it.
+
+Once a disclosure is detected, scanning the queue segment by segment costs 13
+analyses for a 68s ad and keeps the scanner pinned just ahead of the playhead.
+The probe inverts that: it first samples the **frontier** — the furthest segment
+in the buffer, some 40s ahead — then bisects between the last positive and the
+first negative.
+
+**It reasons on queue indices, not on time, and that is deliberate:** a segment's
+timestamp is only known *after* it has been decoded, so choosing which segment to
+probe next can only be positional. The probe learns time after the fact, from the
+timestamp the decoder returns.
+
+Two guard rails, symmetric and both measured (DEV-NOTES §2.6):
+
+- *Against over-skipping.* A jump beyond `bigJumpThresholdSeconds` requires two
+  distinct positive readings. During a real ad the text is permanent, so
+  confirmation is immediate; an isolated false positive cannot skip legitimate
+  content.
+- *Against ending early.* OCR misses roughly one frame in eleven, so an isolated
+  negative is only a **candidate**. Bounding the ad requires two **consecutive**
+  negative segments, and any later positive invalidates the bound. Adjacency is
+  essential: without it, scattered false negatives end up confirming each other
+  across a positive that separates them.
+
+The probe reports its outcome through `finished` (it is done), `resolved` (the
+end was actually located) and `resumeTime` (where sequential scanning picks up —
+the first negative if resolved, the last positive if abandoned). It abandons when
+its lower bound has been evicted from the queue, rather than silently restarting
+the bisection from the oldest segment on a false interval.
+
+#### 4.2.9 `FrameClassifier`
+
+**Role:** Turn a frame into a verdict. It owns the backend choice and the
+orchestration; the image preparation lives in `RoiComposer` (§4.2.4) and the
+heavy engine's lifecycle in `TesseractOcr` (§4.2.5).
+
+`detect(source, sampleTime)` takes either an `ImageBitmap` from the decoder or
+the visible `<video>` element — `drawImage` accepts both, so there is one entry
+point rather than two near-identical methods.
+
+**Backend selection is exclusive**, decided once in the constructor:
+
+- **`TextDetector`** (Chrome Shape Detection API) when the platform exposes it:
+  native, ~5–15ms per frame. Absent from the Chromium builds used on Linux, so
+  in practice it is rarely the one running.
+- **Tesseract.js** otherwise: a full OCR engine in WebAssembly, ~200–500ms per
+  frame, working everywhere. YouTube's CSP would block its worker, hence the
+  extension iframe.
+
+A `TextDetector` pre-filter in front of Tesseract used to be described here and
+coded in `detectWithTesseract`. The two conditions are mutually exclusive — if
+`TextDetector` exists it *is* the backend — so the branch could never run; it
+was removed.
+
+`tesseractErrorCount` and `tesseractDisabled` are exposed as getters over
+`TesseractOcr`'s state, because the heartbeat is the diagnostic contract the
+harness reads.
+
+**Text normalization:** accents are stripped (NFD + removing combining marks)
+and text lowercased before matching, so "Collaboration commerciale" matches the
+stored `collaboration commerciale`. Matching is by substring, which is why
+`sponsor` alone covers "contenu sponsorisé", "vidéo sponsorisée" and
+"sponsorisé par".
+
+#### 4.2.10 `AheadScanner`
+
+**Role:** Orchestrate the look-ahead. It owns no parsing and no decoding of its
+own — those belong to `MseSegmentBuffer` (§4.2.6) and `DecoderSandbox`
+(§4.2.7) — but it drives the loop, accumulates detections, arms the probe and
+falls back when MSE is silent.
+
+**The scan loop.** Scans run back to back for as long as there is backlog;
+`analysisPollMs` is waited only when there is nothing to do. It is an
+**idle interval, not a throughput ceiling** — a `setInterval` quantised the cycle
+to two ticks, losing half the throughput to waiting while ~25s of content sat in
+the queue (DEV-NOTES §2.5). The loop is stopped when the fallback takes over and
+restarted when a fresh init segment arrives.
+
+**One iteration.** Ask the decoder to be configured; pick the next segment —
+the oldest unscanned one in sequential mode, or the probe's choice while
+probing; mark it scanned; send it for decoding; then OCR each returned keyframe
+and route the result to the probe or to `consumeDetection`.
+
+While probing, `minTime` is `-Infinity`: the probe deliberately targets a
+keyframe *ahead* of everything scanned so far, which the usual filter would
+discard.
+
+**`consumeDetection` commits proactively.** Every positive detection immediately
+stores `[t - segmentStartPadSeconds, t + segmentForwardSeconds]`; successive
+detections merge. The skip can therefore cut from the **start** of the ad
+instead of waiting for its end. The forward projection is blind, hence
+deliberately short (~1 GOP) — establishing the real end is the probe's job.
+
+**Fallback.** If no MSE data arrives within `noMseDataTimeoutMs`, or the
+platform cannot decode the advertised codec, the scanner switches to OCR on the
+visible player: same classifier, no decoder, no look-ahead. Segments recorded
+this way are tagged `main-video-ocr` instead of `ahead-ocr`.
+
+#### 4.2.11 `SkipController`
 
 **Role:** Executes skips when playback reaches a known commercial segment.
 
 **How it works:**
-- Listens to `timeupdate` + `seeked` events and also polls every 220ms.
+- Listens to `timeupdate` + `seeked` events and also polls every `skipPollMs` (220ms).
 - On each tick, calls `segmentStore.findSegmentForTime(video.currentTime)`.
-- If the current time is inside a known segment, seeks to `segment.end + 0.4s` (skip margin).
-- Enforces a 900ms cooldown between skips to avoid seek loops.
+- If the current time is inside a known segment, seeks to `segment.end + skipMarginSeconds` (0.4s).
+- Enforces a `skipCooldownMs` (900ms) cooldown between skips to avoid seek loops.
 - Shows a `PlayerNotifier` message after each skip.
 
 ---
@@ -211,7 +353,7 @@ A UI element: a small semi-transparent overlay injected into `#movie_player` tha
 4. Configures the `VideoDecoder`.
 5. Stores `codecInfo = { ...info, timescale, container }`.
 
-The caller (`AheadScanner.ensureDecoderConfigured`) snapshots `initSegment` / `container` / `mime` before sending `configure`, and after the await checks whether `this.initSegment` still points to the same snapshot. If a fresher init segment arrived during the round-trip (quality switch, ad break), `decoderConfigured` is left `false` so the next `scanNext` reconfigures with the new bytes — preventing the decoder from running with stale init data.
+The caller (`DecoderSandbox.ensureConfigured`) snapshots the init segment before sending `configure`, and after the await checks whether the buffer still holds the same one. If a fresher init segment arrived during the round-trip (quality switch, ad break), `decoderConfigured` is left `false` so the next `scanNext` reconfigures with the new bytes — preventing the decoder from running with stale init data.
 
 **`scan-segment` handler:**
 1. Parses the media segment:
@@ -306,7 +448,7 @@ On page load at `https://www.youtube.com/watch`:
    e. `AheadScanner.start()` sends `request-replay` to get any segments already buffered.
 3. YouTube starts appending fMP4/WebM segments. The interceptor forwards each one.
 4. On the first init segment, `AheadScanner` cancels the fallback timer, stores the segment.
-5. On subsequent media segments, the scanner eventually calls `ensureDecoderConfigured()`, which lazily creates the decoder iframe and sends `configure`.
+5. On subsequent media segments, the scanner calls `DecoderSandbox.ensureConfigured()`, which lazily creates the decoder iframe and sends `configure`.
 6. Each `scanNext()` tick (every 1200ms) sends the next unscanned media segment to the decoder sandbox for keyframe extraction + OCR.
 7. When commercial keywords are detected, a segment range accumulates in `SegmentStore`.
 8. When `video.currentTime` enters a known segment range, `SkipController` seeks past it and shows the notification.
@@ -323,15 +465,36 @@ All timing constants live in `CONFIG` too — sandbox timeouts, poll cadences an
 |-----------|---------|---------|
 | `frameSampleSeconds` | 4 | Minimum gap between analyzed keyframes |
 | `minSegmentSeconds` | 3 | Minimum duration for a segment to be stored |
-| `mergeGapSeconds` | 2 | Merge segments closer than this |
-| `skipMarginSeconds` | 0.4 | Extra seconds to seek past segment end |
-| `skipCooldownMs` | 900 | Minimum ms between consecutive skips |
-| `analysisPollMs` | 1200 | `scanNext` / `fallbackTick` interval |
+| `mergeGapSeconds` | 20 | Merge segments closer than this. Wide on purpose: the disclosure is present *throughout* an ad, so successive detections describe one continuous state |
+| `skipMarginSeconds` | 0.4 | Extra seconds to seek past a segment's end |
+| `skipCooldownMs` | 900 | Minimum delay between consecutive skips, to avoid seek loops |
+| `analysisPollMs` | 1200 | Idle wait when there is nothing to scan — **not** a throughput ceiling |
 | `ocrCornerWidthFraction` | 0.30 | Width of each corner crop, as a fraction of the frame |
 | `ocrCornerHeightFraction` | 0.18 | Height of each corner crop |
-| `ocrCompositeWidth` | 1600 | Composite width; the height is derived from the crop ratio |
+| `ocrCompositeWidth` | 1600 | Composite width; the height is derived from the crop's aspect ratio |
 | `ocrBinarizeThreshold` | 190 | Luminance above which a pixel is treated as text |
-| `initTimeoutMs` | 20000 | Max wait for `<video>` element |
+| `segmentStartPadSeconds` | 8 | Margin added before a detection |
+| `segmentForwardSeconds` | 5 | Blind forward projection on a detection (~1 GOP); the probe establishes the real end |
+| `bigJumpThresholdSeconds` | 20 | Beyond this jump, the probe demands a second positive reading |
+| `probeMinPositivesForBigJump` | 2 | How many positives that confirmation needs |
+| `initTimeoutMs` | 20000 | Max wait for the `<video>` element |
+| `heartbeatMs` | 5000 | Diagnostic snapshot cadence |
+| `noMseDataTimeoutMs` | 8000 | Wait before falling back to visible-player OCR |
+| `skipPollMs` | 220 | `SkipController` poll interval |
+| `skipDiagnosticThrottleMs` | 10000 | Throttle on the "no segment covers currentTime" log |
+| `urlWatchPollMs` | 900 | SPA navigation watcher interval |
+| `notifierTimeoutMs` | 2500 | How long a toast stays visible |
+| `maxCapturedSegments` | 30 | Queue cap, by count — not by time behind playback |
+| `maxMp4AccumBytes` | 8 000 000 | Safety valve on the fMP4 reassembly buffer |
+| `maxConfigureFailures` | 3 | Configure attempts on one init segment before falling back |
+| `maxTesseractFailures` | 5 | Consecutive OCR failures before the engine reports itself disabled |
+| `decoderReadyTimeoutMs` | 15000 | Decoder sandbox handshake timeout |
+| `decoderRequestTimeoutMs` | 30000 | Decoder request timeout |
+| `ocrReadyTimeoutMs` | 25000 | OCR sandbox handshake timeout |
+| `ocrInitTimeoutMs` | 60000 | Worker startup, language-model download included |
+| `ocrRequestTimeoutMs` | 90000 | Single recognition timeout |
+| `ocrRetryBaseDelayMs` | 2000 | First delay before retrying a failed startup; doubles each time |
+| `ocrRetryMaxDelayMs` | 60000 | Cap on that delay, and the cadence of recovery probes |
 
 ---
 
@@ -340,11 +503,11 @@ All timing constants live in `CONFIG` too — sandbox timeouts, poll cadences an
 | Issue | Severity | Status |
 |-------|----------|--------|
 | AV1 codec string emitted by `parseAv1C` was malformed — `VideoDecoder.isConfigSupported` rejected every AV1 stream | ~~High~~ | **Fixed, then removed as a failure mode.** The codec string now comes from the SourceBuffer MIME type, which already carries a valid WebCodecs string; `parseAvcC`/`parseVpcC`/`parseAv1C` are gone and only the raw configuration-box bytes are still read from the container. |
-| `AheadScanner` re-attempted `configure` every 1.2 s indefinitely when the platform genuinely lacked a decoder, flooding the console | Medium | **Fixed.** `ensureDecoderConfigured` tracks failures per init segment; after 3 failures on the same init it pins `configureFailedInit`, switches `useFallback = true`, and starts the main-video OCR poller. Counters reset on every new init segment. |
+| `AheadScanner` re-attempted `configure` every 1.2 s indefinitely when the platform genuinely lacked a decoder, flooding the console | Medium | **Fixed.** The configure path (since split out as `DecoderSandbox`) tracks failures per init segment; after 3 failures on the same init it pins that init segment as failed, signals the scanner, which switches to the visible-player OCR fallback. Counters reset on every new init segment. |
 | WebM coded size returns (0, 0) from EBML parser | ~~High~~ | **Fixed.** Root cause was `iterateEbml` breaking on the streaming `Segment` element (size = -1). Replaced with `findEbml`, a flat-scan helper that descends past unknown-size containers. The `videoWidth/videoHeight` fallback remains as a safety net. |
 | Buffer copy in `mseInterceptor` happened after `origAppendBuffer` | High | **Fixed.** Copy is now performed before the original call, so the MSE implementation cannot detach a transferable buffer out from under us. |
-| Configure race: stale init bytes if quality switch happens during configure round-trip | Medium | **Fixed.** `ensureDecoderConfigured` snapshots `initSegment` and re-checks identity after the await; if a fresher init arrived, `decoderConfigured` stays false and the next scan tick reconfigures. |
-| Tesseract worker fetches `fra.traineddata` from `tessdata.projectnaptha.com` | Medium | Open. Architecture claims "no remote code", but the language data is loaded from a CDN. On builds where `TextDetector` is available (most Linux/Windows Chromium ≥ 88) the Tesseract path is never hit; otherwise a network failure leaves OCR unavailable until the next session. Fix: bundle `fra.traineddata.gz` under `libs/tesseract/lang-data/` and point `langPath` at `chrome.runtime.getURL(...)`. |
+| Configure race: stale init bytes if quality switch happens during configure round-trip | Medium | **Fixed.** The configure path snapshots the init segment and re-checks identity after the await; if a fresher init arrived, `decoderConfigured` stays false and the next scan tick reconfigures. |
+| Tesseract worker fetches `fra.traineddata` from `tessdata.projectnaptha.com` | Medium | Open, and now the **only** detection path — the DOM fallback was removed (§2.1). Architecture claims "no remote code", but the language data is loaded from a CDN. On builds where `TextDetector` is available (most Linux/Windows Chromium ≥ 88) the Tesseract path is never hit; otherwise a network failure leaves OCR unavailable until the next session. Fix: bundle `fra.traineddata.gz` under `libs/tesseract/lang-data/` and point `langPath` at `chrome.runtime.getURL(...)`. |
 | Sandbox iframe disconnecting unexpectedly | ~~Medium~~ | **Fixed.** `SandboxBridge.ensureReady()` checks `iframe.isConnected` and rebuilds the sandbox instead of returning a cached promise. |
 | Scan loop still ticking in `useFallback = true` mode | ~~Low~~ | **Fixed.** `startFallbackPolling()` stops the loop; a new init segment restarts it via `startScanLoop()`. |
 | Transferring media segment neuters `segmentEntry.data` | Design | If `scan-segment` fails, the data is unrecoverable — no retry possible |
@@ -355,6 +518,23 @@ All timing constants live in `CONFIG` too — sandbox timeouts, poll cadences an
 | AV1 (`av01`) on WebM is not handled | Medium | Only fMP4 AV1 is implicitly handled; AV1-in-WebM would need a new EBML codec path |
 
 ---
+
+**Resolved since the code review (2026-09):**
+
+| Issue | Status |
+|-------|--------|
+| Two concurrent sessions could be mounted on SPA navigation — `currentVideoId` was only set *after* an await of up to 20s, so a second navigation built its own scanner while the first kept running | **Fixed.** A session token is taken on entry and re-validated after every await; components are built in locals and published only once the token still matches. |
+| The probe silently restarted its bisection from the oldest buffered segment when its lower bound had been evicted (`Math.max(0, -1)`) | **Fixed.** It abandons explicitly and hands `resumeTime` back to the scanner. |
+| `addSegment` returned `true` for a segment absorbed without changing anything, making the probe log "ad end extended" falsely | **Fixed.** It compares a signature of the store before and after merging. |
+| Tesseract startup failures were never counted, so `tesseractDisabled` stayed `false` while nothing worked; a sandbox that never answered latched the engine off permanently; a failing init was retried on *every frame* | **Fixed.** See §4.2.5 — one counter for all causes, no latched state, exponential backoff, retry from a fresh iframe, and no permanent surrender. |
+| DOM overlay detection produced no segment across fifteen archived runs | **Removed** (§2.1). OCR is now the only detection path. |
+
+**Measurement caveat.** Across eleven September harness runs the outcome is
+bimodal: nine "clean" runs skip the ad in 3–4 jumps and leave 4.8s of it visible,
+three "fragmented" runs take 5+ jumps and leave 8.8s. The run-to-run spread
+(4.1–10.1s) is wider than any difference measured *between* versions, so
+three-run comparisons are below the noise floor and should not be read as
+evidence. The August-to-September gain (12.5s → 5.0s) is well above it.
 
 ### 11bis. Diagnostics & Logging
 
@@ -415,16 +595,18 @@ YouTube player calls SourceBuffer.appendBuffer(mediaSegment)
                           [ImageBitmaps transferred back to ISOLATED world]
            │
            └─ for each bitmap:
-                frameClassifier.detectFromBitmap(bitmap, timestamp)
-                  ├─ ctx.drawImage(bitmap, 0, 0, 420, 236)
-                  ├─ roiCtx.drawImage(canvas, 0,0,420,59, 0,0,420,59)
-                  └─ TextDetector.detect(roiCanvas)
-                       or Tesseract postMessage("recognize", roiCanvas)
+                frameClassifier.detect(bitmap, timestamp)
+                  ├─ RoiComposer.compose(bitmap)
+                  │    4 corner crops at native resolution → 2×2 composite,
+                  │    each cell keeping the crop's aspect ratio, then binarized
+                  └─ TextDetector.detect(roi.canvas)
+                       or TesseractOcr.recognize(roi.canvas)
                        → { hasCommercialKeyword, matchedKeywords }
-                consumeDetection(detection)
-                  → [eventually] segmentStore.addSegment({ start, end })
+                → probing ? AdEndProbe.consumeResult(...)
+                          : consumeDetection(detection)
+                              → segmentStore.addSegment({ start, end })
 
-(at playback time, every 220ms)
+(at playback time, every skipPollMs)
 SkipController.tick()
   └─ segmentStore.findSegmentForTime(video.currentTime)
        → if match: video.currentTime = segment.end + 0.4

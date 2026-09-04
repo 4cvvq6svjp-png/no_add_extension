@@ -48,8 +48,10 @@ On modifie cette fonction au démarrage de la page : à chaque appel, on fait un
 
 Les morceaux qu'on a copiés sont des données compressées dans un **container** (boîte qui emballe le flux vidéo). Selon le système d'exploitation :
 
-- Sous Windows et Mac, YouTube envoie du **MP4 fragmenté** (extension `.mp4`).
-- Sous Linux, YouTube envoie du **WebM** (un autre format de container).
+- Le plus souvent, YouTube envoie du **MP4 fragmenté** — y compris sous Linux
+  depuis 2026, avec un codec récent appelé AV1.
+- Plus rarement, du **WebM** (un autre format de container), qui était la norme
+  sous Linux jusque-là.
 
 On a un petit programme (`mp4demux.js`) qui sait ouvrir les deux. Le tout premier morceau, appelé **init segment**, contient la "fiche d'identité" de la vidéo : sa résolution (ex. 1920×1080), son codec (la méthode de compression : VP9, H.264…), sa cadence d'images. Les morceaux suivants, appelés **media segments**, contiennent les images proprement dites.
 
@@ -61,7 +63,9 @@ On ne décode pas TOUTES les images — ce serait inutile et coûteux. On ne pre
 
 ### Étape 4 — On cherche le texte dans l'image
 
-Une fois qu'on a une vraie image, on en prend uniquement la **bande du haut** (le quart supérieur), parce que le texte de divulgation YouTube apparaît toujours en haut. Ça réduit énormément le travail.
+Une fois qu'on a une vraie image, on n'en garde que les **quatre coins**, découpés petits puis fortement agrandis et assemblés côte à côte en une seule image. C'est là que le texte de divulgation se trouve, et il y est minuscule : sur une image entière, l'OCR ne rend que du charabia. On agrandit donc les coins pour que les lettres deviennent assez grosses pour être lues, tout en n'ayant qu'une seule image à analyser au lieu de quatre.
+
+Un détail compte plus qu'il n'y paraît : chaque coin est agrandi **en respectant ses proportions**. Pendant un temps ils étaient étirés en hauteur de 66 %, ce qui déformait les lettres et faisait chuter la reconnaissance.
 
 Sur cette bande, on lance de l'**OCR** (Optical Character Recognition — reconnaissance optique de caractères : transformer une image de texte en texte lisible par ordinateur). Deux moteurs sont disponibles :
 
@@ -91,9 +95,9 @@ Pendant que le spectateur regarde la vidéo normalement, un petit surveillant (`
 | **`appendBuffer`** | La fonction que YouTube appelle pour rajouter un morceau de vidéo au lecteur. C'est l'endroit qu'on intercepte. |
 | **Interceptor** | Notre petit programme qui se substitue à `appendBuffer` pour faire passer le travail normal *et* nous donner une copie au passage. |
 | **Container** | Format de fichier qui emballe le flux vidéo (et l'audio, les sous-titres…). Les deux qu'on rencontre : MP4 et WebM. |
-| **Codec** | Méthode de compression de la vidéo elle-même. YouTube utilise H.264 (`avc1`) ou VP9 (`vp09`) selon les cas. Le container *contient* le codec. |
+| **Codec** | Méthode de compression de la vidéo elle-même. YouTube utilise AV1 (`av01`), H.264 (`avc1`) ou VP9 (`vp09`) selon les cas. Le container *contient* le codec. |
 | **fMP4** | Une variante de MP4 ("fragmented MP4") où le fichier est découpé en petits morceaux indépendants. Adapté au streaming. |
-| **WebM** | Un container alternatif au MP4, basé sur la norme **Matroska/EBML**. Utilisé par YouTube sous Linux. |
+| **WebM** | Un container alternatif au MP4, basé sur la norme **Matroska/EBML**. Longtemps utilisé par YouTube sous Linux, aujourd'hui minoritaire. |
 | **EBML** | Format de stockage en blocs étiquetés utilisé par WebM. Sa particularité : les blocs peuvent avoir une taille "inconnue" (élément qui s'étend jusqu'à la fin du flux), ce qui complique la lecture. |
 | **Init segment** | Le tout premier morceau d'une vidéo, qui décrit ses caractéristiques (résolution, codec…). Sans lui, on ne peut pas décoder les morceaux suivants. |
 | **Media segment** | Les morceaux qui suivent l'init segment et qui contiennent les vraies images compressées. |
@@ -149,31 +153,32 @@ Pendant que le spectateur regarde la vidéo normalement, un petit surveillant (`
 
 ---
 
-## 7. État actuel du projet (au 7 mai 2026)
+## 7. État actuel du projet (au 2 septembre 2026)
 
 ### Ce qui marche
-- L'interception de la vidéo : on capture bien les morceaux que YouTube reçoit.
-- Le décodage MP4 (Windows/Mac) : on extrait correctement les images.
-- L'OCR : la lecture du texte sur les images fonctionne.
-- Le saut automatique : quand une zone est enregistrée, le saut se déclenche bien.
+- **L'interception de la vidéo** : on capture bien les morceaux que YouTube reçoit, y compris quand il en coupe un en plusieurs envois.
+- **Le décodage** : les images sont extraites correctement, sur les deux formats de container.
+- **La lecture du texte** : l'OCR reconnaît la mention sur environ **quatre images sur cinq** où elle est présente.
+- **Le saut automatique** : sur la vidéo de référence, l'extension fait disparaître **environ 92 % du passage sponsorisé**, en trois sauts. Sur les 68 secondes de pub, le spectateur en voit à peu près cinq.
 
-### Ce qui vient d'être réparé
-Quatre bugs ont été corrigés récemment :
+### Ce qui a changé récemment
 
-1. **Décodage WebM (Linux) cassé.** Le programme qui lit les fichiers WebM s'arrêtait trop tôt parce qu'il rencontrait un bloc de "taille inconnue" (`size = -1`) dans la structure du fichier. Sur Linux, YouTube envoie justement ce type de fichier, donc rien ne fonctionnait. → Corrigé en réécrivant la lecture pour qu'elle continue à chercher dans les blocs de taille inconnue au lieu de s'arrêter.
+Le projet a connu une revue de code complète en août-septembre 2026, qui a mené à quatre chantiers.
 
-2. **Copie tardive du morceau vidéo.** L'interceptor faisait sa copie **après** avoir donné la donnée à YouTube. Selon les cas, le navigateur pouvait avoir effacé la donnée entretemps : on copiait du vide. → Corrigé en faisant la copie **avant** de transmettre à YouTube.
+**Du ménage.** Beaucoup de code ne servait plus : des fonctions qu'aucun chemin n'atteignait, des réglages que plus personne ne lisait, un composant d'arrière-plan sans aucun usage. L'extension ne demande d'ailleurs plus **aucune permission** au navigateur.
 
-3. **Course entre deux configurations.** Si YouTube changeait la qualité d'une vidéo en plein milieu (passage de 1080p à 720p, par exemple), notre décodeur pouvait se retrouver configuré pour l'ancienne qualité tout en lisant les nouvelles données → erreur. Corrigé en comparant l'identité de l'init segment avant et après chaque configuration.
+**Deux corrections qui ont amélioré la lecture du texte.** L'image envoyée à l'OCR était d'abord rétrécie avant d'être ré-agrandie, ce qui détruisait du détail sur un texte déjà petit ; et les coins étaient étirés en hauteur, ce qui déformait les lettres. Les deux sont corrigés.
 
-4. **Logs de débogage très bruyants.** Le code de lecture WebM imprimait une trentaine de messages dans la console à chaque vidéo. → Nettoyé.
+**Une réorganisation.** Le fichier principal faisait près de deux mille lignes et mélangeait tout. Il est maintenant découpé en treize fichiers, un par sujet, ce qui rend le code lisible par quelqu'un qui ne l'a pas écrit. Une cinquantaine de tests automatiques ont été ajoutés au passage.
+
+**Un changement de stratégie.** L'extension cherchait la mention à deux endroits : dans l'image, et dans la page HTML de YouTube — cette dernière étant remplie quand un créateur *déclare* officiellement sa promotion. La mesure a tranché : sur quinze essais enregistrés, cette seconde voie n'a **jamais rien trouvé**, parce que les créateurs incrustent le mot dans la vidéo au lieu de le déclarer. Elle a été supprimée, et l'extension se concentre entièrement sur la lecture de l'image.
 
 ### Ce qui reste comme limites connues
-- **Tesseract télécharge ses données depuis un site externe** au premier lancement. Sur les machines où le moteur rapide intégré au navigateur fonctionne, on n'en a pas besoin, mais c'est une dépendance réseau qui pourrait être éliminée en intégrant les données dans l'extension (~1,3 Mo).
-- **Le format AV1 sur WebM** (un autre codec récent) n'est pas encore géré.
-- **YouTube pourrait changer sa façon de marquer les vidéos** ou la position du texte de divulgation, ce qui casserait la détection. C'est une dépendance qu'on ne contrôle pas.
-
----
+- **Tesseract télécharge ses données depuis un site externe** au premier lancement (~1,3 Mo). C'est la seule dépendance réseau, et elle pourrait être supprimée en intégrant ces données à l'extension. Depuis le changement de stratégie ci-dessus, c'est aussi un point unique de défaillance : si l'OCR ne fonctionne pas, plus rien ne détecte. Le code sait maintenant réessayer proprement au lieu d'abandonner, mais la dépendance demeure.
+- **Tout ce qu'on sait vient d'une seule vidéo.** Les mesures citées plus haut portent sur une unique vidéo de référence. Rien ne garantit encore que les réglages tiennent sur d'autres formats, d'autres créateurs, d'autres formulations.
+- **Les résultats varient d'un essai à l'autre.** Environ un essai sur quatre se passe moins bien que les autres, pour une raison identifiée : après un saut, la réserve d'avance est vidée et l'extension doit la reconstituer.
+- **Le format AV1 sur WebM** n'est pas géré.
+- **YouTube pourrait changer** sa façon de livrer les vidéos ou la formulation de ses mentions, ce qui casserait la détection. C'est une dépendance qu'on ne contrôle pas.
 
 ## 8. Résumé en 30 secondes pour expliquer à quelqu'un d'autre
 

@@ -72,8 +72,14 @@
     decoderReadyTimeoutMs: 15000,
     decoderRequestTimeoutMs: 30000,
     ocrReadyTimeoutMs: 25000,
-    ocrInitTimeoutMs: 120000,
-    ocrRequestTimeoutMs: 90000
+    // Premier démarrage : téléchargement du modèle `fra` compris. 120s était
+    // démesuré pour une boucle de scan qui tourne toutes les 2s.
+    ocrInitTimeoutMs: 60000,
+    ocrRequestTimeoutMs: 90000,
+    // Délai avant de retenter un démarrage raté, doublé à chaque échec puis
+    // plafonné. Le plafond reste la cadence des tentatives de reprise.
+    ocrRetryBaseDelayMs: 2000,
+    ocrRetryMaxDelayMs: 60000
   };
 
   /**

@@ -419,6 +419,97 @@ Le gain d'août à septembre (12,5 → 5,0s), lui, reste bien au-dessus.
 Pour départager deux versions il faudrait une dizaine de runs chacune, ou
 supprimer la source de variance en attaquant §4.1.
 
+### 2.11 Robustesse du démarrage OCR + lot F *(2026-09-04)*
+
+**Le démarrage de Tesseract avait trois pannes distinctes, pas une.** Le
+démarrage a lieu *dans* la boucle de scan, qui l'attend : sa robustesse
+conditionne tout le pipeline. L'ancienne implémentation mettait en cache une
+promesse dans `this.ready` et se comportait différemment selon l'endroit où ça
+cassait.
+
+*Mode A — l'iframe ne signale jamais sa disponibilité.* `bridge.ensureReady()`
+renvoie `false` **sans lever d'exception**, donc le `catch` qui remet
+`this.ready` à `null` ne s'exécute pas. La promesse résolue à `false` reste en
+cache et, comme le code commence par `if (this.ready) return this.ready`, **plus
+aucune tentative n'a jamais lieu**. Reproduit contre l'ancien code : après
+réparation de la sandbox et cinq frames de plus, `init` tenté **0 fois**.
+
+*Mode B — l'initialisation du moteur échoue.* Là une exception est levée, le
+`catch` remet `this.ready` à `null`, et la frame suivante relance une
+initialisation complète. Reproduit : 6 frames analysées → **6 initialisations
+complètes**, chacune avec un timeout de 60 s. Si l'init *pend* au lieu
+d'échouer, la boucle de scan gèle deux minutes par tentative, en boucle.
+
+*Mode C — le worker meurt après un démarrage réussi.* Cinq échecs de
+reconnaissance et `disabled` passait à `true`… définitivement. Or la sandbox met
+son worker en cache : même en réessayant, `init` aurait rendu le même worker
+mort.
+
+**Et dans les modes A et B, `errorCount` n'était jamais incrémenté** — ces
+chemins ne passent pas par le `catch` de `recognize`. Donc `tesseractDisabled`,
+le champ du heartbeat qui existe précisément pour révéler ce genre de panne,
+restait à `false` pendant que plus rien ne fonctionnait. Le seul indice était
+`ocrMatches` bloqué à zéro, ce qui ressemble à « cette vidéo n'a pas de pub ».
+
+**La correction tient en trois règles**, chacune répondant à un mode :
+
+1. *Aucun état d'échec latché.* Une tentative ratée ne laisse jamais de promesse
+   en cache : elle programme une nouvelle tentative. L'état est explicite —
+   `started`, `starting`, `failures`, `nextAttemptAt` — au lieu d'être déduit du
+   contenu d'une promesse.
+2. *Un seul compteur pour toutes les causes.* Démarrage et reconnaissance
+   alimentent `failures`, donc `disabled` dit la vérité quelle que soit
+   l'origine de la panne.
+3. *Délai croissant entre tentatives*, de `ocrRetryBaseDelayMs` (2 s) doublé à
+   chaque échec jusqu'à `ocrRetryMaxDelayMs` (60 s).
+
+Deux propriétés s'y ajoutent. Une reprise **repart d'une iframe neuve**, sans
+quoi la sandbox rendrait son worker en cache — c'est ce qui rend le mode C
+récupérable. Et le moteur **ne se rend jamais définitivement** : passé le seuil
+il continue de sonder au rythme du plafond, donc une panne réseau au premier
+usage ne condamne plus la vidéo entière. `ocrInitTimeoutMs` passe de 120 à 60 s,
+démesuré pour une boucle qui tourne toutes les 2 s.
+
+9 tests couvrent les trois modes, avec une horloge pilotée pour mesurer le
+backoff au lieu de l'attendre. **50 tests au total.**
+
+**Lot F — documentation.** ARCHITECTURE décrivait cinq composants sur onze : le
+découpage du lot D en avait créé six que rien ne documentait, dont `AdEndProbe`,
+le mécanisme central. Les six ont leur section, `FrameClassifier` et
+`AheadScanner` sont réécrits sur leur périmètre réel, le diagramme de flux final
+ne cite plus de méthodes disparues, et le tableau des risques enregistre ce que
+E1–E3 ont corrigé plus la mise en garde sur la variance de mesure.
+
+Le tableau des paramètres est désormais **généré depuis `content/config.js`** :
+il en manquait 21 sur 32, et `mergeGapSeconds` y était donné à 2 s alors que le
+code dit 20 — l'écart exact qui rend la fusion agressive, donc pas un détail.
+Un contrôle croisé vérifie aussi qu'aucune doc ne cite plus un symbole absent du
+code.
+
+GUIDE portait trois affirmations fausses — « la bande du haut » au lieu des
+quatre coins, « sous Linux, WebM » au lieu d'AV1 en fMP4, et une section d'état
+datée du 7 mai qui présentait comme récentes des corrections antérieures à tout
+ce travail. Réécrite avec les chiffres mesurés et les limites réelles, dont le
+fait que tout ce qu'on sait vient d'une seule vidéo.
+
+**Mesure.** 3 runs, tous `SKIP`, **aucun incident OCR** — le démarrage se fait
+proprement à chaque run, donc les chemins de reprise ne sont pas exercés par le
+harness. C'est attendu : ils ne se déclenchent que sur une panne réseau ou un
+worker cassé, deux conditions que le harness ne provoque pas. Ce sont les tests
+unitaires, avec leur double de pont et leur horloge pilotée, qui les couvrent.
+
+| | n | pub vue (médiane) | sauts | cadence | OCR |
+|---|---|---|---|---|---|
+| après A/B/C | 4 | 5,0s [4,7–8,8] | 4 | 2,1s | 84 % |
+| après D | 2 | 4,4s [4,1–4,6] | 3 | 2,0s | 78 % |
+| après E1-E3 | 3 | 5,3s [4,8–7,6] | 3 | 2,1s | 81 % |
+| sans overlay + E4/E6 | 3 | 5,5s [4,8–10,1] | 3 | 2,1s | 79 % |
+| **robustesse OCR + F** | 3 | 4,8s [4,1–4,9] | 3 | 2,1s | 81 % |
+
+Les trois runs tombent tous dans le mode « net » décrit en §2.10, d'où une
+fourchette resserrée. Rappel de la mise en garde : à 3 runs par version, ces
+écarts restent sous le plancher de bruit.
+
 ---
 
 ## 3. Résultats validés (vidéo de réf `vRAPfDSmBGM`, pub 3:49–4:57)

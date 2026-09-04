@@ -112,8 +112,25 @@
    * Tesseract tourne dans une iframe `chrome-extension://` : la CSP de YouTube
    * bloque son worker WASM, celle de l'extension l'autorise.
    *
-   * Se désactive après `maxTesseractFailures` échecs consécutifs — au-delà,
-   * insister ne ferait que bloquer la boucle de scan sur des appels perdus.
+   * Le démarrage a lieu DANS la boucle de scan, qui l'attend : sa robustesse
+   * conditionne donc tout le pipeline. Trois règles gouvernent cette classe.
+   *
+   * 1. **Aucun état d'échec latché.** Une tentative ratée ne laisse jamais
+   *    derrière elle une promesse mise en cache : elle programme une nouvelle
+   *    tentative. L'ancienne version conservait une promesse résolue à `false`
+   *    quand l'iframe ne répondait pas, et ne réessayait donc plus jamais.
+   * 2. **Un seul compteur pour toutes les causes.** Démarrage et reconnaissance
+   *    alimentent le même compteur, donc `disabled` — que le heartbeat expose —
+   *    dit la vérité quelle que soit l'origine de la panne. Auparavant un échec
+   *    de démarrage n'était jamais compté et `tesseractDisabled` restait à
+   *    `false` alors que plus rien ne fonctionnait.
+   * 3. **Un délai croissant entre les tentatives.** Sans lui, un démarrage qui
+   *    échoue est retenté à chaque frame ; s'il *pend* au lieu d'échouer, il
+   *    gèle la boucle de scan pendant toute la durée du timeout, en boucle.
+   *
+   * Le moteur ne se rend jamais définitivement : passé le seuil, il continue de
+   * tenter une reprise à l'intervalle maximal. Une panne réseau au premier
+   * usage ne condamne donc pas la vidéo entière.
    */
   class TesseractOcr {
     constructor() {
@@ -124,25 +141,28 @@
         requestTimeoutMs: CONFIG.ocrRequestTimeoutMs
       });
 
-      this.ready = null;
-      this.errorCount = 0;
+      /** Worker prêt à reconnaître. */
+      this.started = false;
+      /** Démarrage en vol, pour n'en avoir jamais deux. Jamais conservé après coup. */
+      this.starting = null;
+      /** Échecs consécutifs, démarrage et reconnaissance confondus. */
+      this.failures = 0;
+      /** Vrai une fois le seuil atteint : exposé au heartbeat. */
       this.disabled = false;
+      /** Date avant laquelle aucune nouvelle tentative de démarrage n'a lieu. */
+      this.nextAttemptAt = 0;
       this.lastError = null;
     }
 
     /**
      * @param {HTMLCanvasElement} canvas
      * @returns {Promise<{ text: string } | { error: string }>} `error` porte le
-     *   tag de diagnostic ("tesseract-disabled", "tesseract-error"…).
+     *   tag de diagnostic, repris tel quel dans les logs d'analyse de frame.
      */
     async recognize(canvas) {
-      if (this.disabled) {
-        return { error: "tesseract-disabled" };
-      }
-
-      const ready = await this.ensureReady();
-      if (!ready) {
-        return { error: "tesseract-unavailable" };
+      const started = await this.ensureStarted();
+      if (!started) {
+        return { error: this.disabled ? "tesseract-disabled" : "tesseract-unavailable" };
       }
 
       let bitmap = null;
@@ -156,63 +176,127 @@
         );
         bitmap = null;
 
-        this.errorCount = 0;
+        this.noteSuccess();
         return { text: result.text ?? "" };
       } catch (error) {
         if (bitmap) {
           try { bitmap.close(); } catch { /* ignore */ }
         }
-        this.noteFailure(error);
+        this.noteRecognizeFailure(error);
         return { error: "tesseract-error" };
       }
     }
 
-    noteFailure(error) {
-      this.errorCount += 1;
-      const detail = formatError(error);
+    /* ---------------------------------------------------------------- */
+    /*  Démarrage                                                        */
+    /* ---------------------------------------------------------------- */
 
-      // Les 3 premières erreurs sont loguées telles quelles pour ne jamais
-      // manquer le vrai mode de défaillance ; ensuite on déduplique.
-      if (this.errorCount <= 3 || this.lastError !== detail) {
+    async ensureStarted() {
+      if (this.started) {
+        return true;
+      }
+      if (this.starting) {
+        return this.starting;
+      }
+      if (Date.now() < this.nextAttemptAt) {
+        // On attend la fin du délai plutôt que de relancer un démarrage —
+        // potentiellement long — à chaque frame analysée.
+        return false;
+      }
+
+      this.starting = this.start().finally(() => {
+        this.starting = null;
+      });
+
+      return this.starting;
+    }
+
+    async start() {
+      // Une reprise repart d'une iframe neuve : la sandbox met son worker en
+      // cache, donc lui renvoyer `init` rendrait le même worker mort.
+      if (this.failures > 0) {
+        this.bridge.destroy();
+      }
+
+      try {
+        const connected = await this.bridge.ensureReady();
+        if (!connected) {
+          throw new Error("sandbox OCR indisponible");
+        }
+
+        await this.bridge.request("init", {}, { timeoutMs: CONFIG.ocrInitTimeoutMs });
+
+        const recovering = this.failures > 0;
+        this.started = true;
+        this.noteSuccess();
+        logInfo(recovering
+          ? "Tesseract prêt (reprise après échecs)."
+          : "Tesseract prêt (sandbox iframe chrome-extension://).");
+        return true;
+      } catch (error) {
+        this.bridge.destroy();
+        this.noteStartFailure(error);
+        return false;
+      }
+    }
+
+    /* ---------------------------------------------------------------- */
+    /*  Comptage des échecs et reprise                                   */
+    /* ---------------------------------------------------------------- */
+
+    noteSuccess() {
+      this.failures = 0;
+      this.disabled = false;
+      this.nextAttemptAt = 0;
+      this.lastError = null;
+    }
+
+    /** Le moteur n'a jamais été prêt : la prochaine tentative repartira de zéro. */
+    noteStartFailure(error) {
+      this.started = false;
+      this.recordFailure(error, "démarrage");
+    }
+
+    /** Le worker était prêt et a lâché sur une frame. */
+    noteRecognizeFailure(error) {
+      this.recordFailure(error, "reconnaissance");
+
+      if (this.failures >= CONFIG.maxTesseractFailures) {
+        // Assez d'échecs d'affilée pour conclure que le worker est mort : on
+        // repartira d'une sandbox neuve une fois le délai écoulé.
+        this.started = false;
+      }
+    }
+
+    recordFailure(error, phase) {
+      this.failures += 1;
+
+      const delay = Math.min(
+        CONFIG.ocrRetryBaseDelayMs * 2 ** (this.failures - 1),
+        CONFIG.ocrRetryMaxDelayMs
+      );
+      this.nextAttemptAt = Date.now() + delay;
+
+      const detail = formatError(error);
+      // Les 3 premiers échecs sont logués tels quels pour ne jamais manquer le
+      // vrai mode de défaillance ; ensuite on déduplique.
+      if (this.failures <= 3 || this.lastError !== detail) {
         this.lastError = detail;
-        logWarn("Impossible d'analyser une frame pour OCR (Tesseract)", {
-          attempt: this.errorCount,
+        logWarn(`OCR Tesseract : échec (${phase})`, {
+          tentative: this.failures,
+          prochainEssaiDans: `${Math.round(delay / 1000)}s`,
           error: detail
         });
       }
 
-      if (this.errorCount >= CONFIG.maxTesseractFailures && !this.disabled) {
+      if (this.failures >= CONFIG.maxTesseractFailures && !this.disabled) {
         this.disabled = true;
         logWarn(
           `Tesseract désactivé après ${CONFIG.maxTesseractFailures} échecs consécutifs — ` +
-          "plus aucune détection n'est possible sur cette vidéo."
+          "plus aucune détection n'est possible. Une reprise reste tentée " +
+          `toutes les ${Math.round(CONFIG.ocrRetryMaxDelayMs / 1000)}s.`
         );
       }
-    }
-
-    async ensureReady() {
-      if (this.ready) {
-        return this.ready;
-      }
-
-      this.ready = (async () => {
-        const connected = await this.bridge.ensureReady();
-        if (!connected) {
-          return false;
-        }
-        await this.bridge.request("init", {}, { timeoutMs: CONFIG.ocrInitTimeoutMs });
-        logInfo("Tesseract prêt (sandbox iframe chrome-extension://).");
-        return true;
-      })().catch((error) => {
-        logWarn("Échec d’initialisation Tesseract (iframe)", {
-          error: formatError(error)
-        });
-        this.ready = null;
-        this.bridge.destroy();
-        return false;
-      });
-
-      return this.ready;
     }
 
     async terminate() {
@@ -225,7 +309,11 @@
       }
 
       this.bridge.destroy();
-      this.ready = null;
+      this.started = false;
+      this.starting = null;
+      this.failures = 0;
+      this.disabled = false;
+      this.nextAttemptAt = 0;
     }
   }
 
@@ -277,7 +365,7 @@
 
     // Exposés pour le heartbeat de diagnostic.
     get tesseractErrorCount() {
-      return this.tesseract?.errorCount ?? 0;
+      return this.tesseract?.failures ?? 0;
     }
 
     get tesseractDisabled() {
