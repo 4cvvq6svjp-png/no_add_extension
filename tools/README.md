@@ -94,6 +94,7 @@ donc c'est à faire une seule fois.
 | `--grace`     | 2      | Marge (s) après la fin d'une pub avant de déclarer MISS. |
 | `--out`       | `logs/run-<ts>.jsonl` | Fichier de sortie. |
 | `--headless`  | off    | Mode headless. |
+| `--fault <mode>` | —   | Injecte une panne OCR et vérifie le comportement de reprise (voir ci-dessous). |
 
 ## Comment ça juge une pub (HIT/MISS)
 
@@ -115,3 +116,35 @@ nombre de skips, erreurs, et la raison de l'arrêt. Le JSONL contient le détail
 complet (`grep`-able par `source` et par tag `[NoAdd-MSE]` / `[NoAdd-Decoder]`).
 
 Code retour `1` si un MISS ou une erreur (utile en script/CI), `0` si tout HIT.
+
+## Injection de panne (`--fault`)
+
+Les runs normaux ne jouent que le chemin heureux : le démarrage OCR réussit à
+chaque fois, donc le code de reprise n'est exercé que par les tests unitaires,
+avec un pont simulé. `--fault` comble ce trou en conditions réelles.
+
+Le harness **copie l'extension dans un dossier temporaire**, y casse
+`pages/ocr-sandbox.js`, et charge cette copie. Rien n'est modifié dans les
+sources, et aucun point d'injection ne vit dans le code livré.
+
+| Mode | Ce qu'il simule |
+|------|-----------------|
+| `sandbox-dead` | L'iframe OCR ne signale jamais sa disponibilité. C'est le cas qui condamnait le moteur pour toujours avant correction. |
+| `init-error`   | Le moteur refuse de démarrer (modèle illisible, WASM cassé). C'est le cas qui relançait une initialisation complète à chaque frame. |
+
+```bash
+node capture-logs.mjs --fault sandbox-dead --seconds 90
+```
+
+Le run n'essaie pas de sauter une pub : il observe et vérifie cinq propriétés,
+avec un code retour `0` seulement si toutes sont observées.
+
+- la panne est détectée et loguée ;
+- les tentatives sont **espacées** (backoff), pas une par frame ;
+- le heartbeat finit par signaler `tesseractDisabled` ;
+- **aucun segment n'est consommé** sans OCR disponible ;
+- les segments **restent analysables** pour plus tard.
+
+La reprise après retour à la normale n'est pas couverte ici — la copie est
+statique, la panne ne se lève pas en cours de run. C'est le rôle des tests
+unitaires, qui pilotent une horloge pour ça.

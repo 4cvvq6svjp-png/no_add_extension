@@ -507,7 +507,7 @@ All timing constants live in `CONFIG` too — sandbox timeouts, poll cadences an
 | WebM coded size returns (0, 0) from EBML parser | ~~High~~ | **Fixed.** Root cause was `iterateEbml` breaking on the streaming `Segment` element (size = -1). Replaced with `findEbml`, a flat-scan helper that descends past unknown-size containers. The `videoWidth/videoHeight` fallback remains as a safety net. |
 | Buffer copy in `mseInterceptor` happened after `origAppendBuffer` | High | **Fixed.** Copy is now performed before the original call, so the MSE implementation cannot detach a transferable buffer out from under us. |
 | Configure race: stale init bytes if quality switch happens during configure round-trip | Medium | **Fixed.** The configure path snapshots the init segment and re-checks identity after the await; if a fresher init arrived, `decoderConfigured` stays false and the next scan tick reconfigures. |
-| Tesseract worker fetches `fra.traineddata` from `tessdata.projectnaptha.com` | Medium | Open, and now the **only** detection path — the DOM fallback was removed (§2.1). Architecture claims "no remote code", but the language data is loaded from a CDN. On builds where `TextDetector` is available (most Linux/Windows Chromium ≥ 88) the Tesseract path is never hit; otherwise a network failure leaves OCR unavailable until the next session. Fix: bundle `fra.traineddata.gz` under `libs/tesseract/lang-data/` and point `langPath` at `chrome.runtime.getURL(...)`. |
+| Tesseract worker fetched `fra.traineddata` from `tessdata.projectnaptha.com` | ~~Medium~~ | **Fixed.** The model ships in `libs/tesseract/lang-data/` and `langPath` points at `chrome.runtime.getURL`. This mattered more once OCR became the only detection path (§2.1): a failed download made the extension silently blind. |
 | Sandbox iframe disconnecting unexpectedly | ~~Medium~~ | **Fixed.** `SandboxBridge.ensureReady()` checks `iframe.isConnected` and rebuilds the sandbox instead of returning a cached promise. |
 | Scan loop still ticking in `useFallback = true` mode | ~~Low~~ | **Fixed.** `startFallbackPolling()` stops the loop; a new init segment restarts it via `startScanLoop()`. |
 | Transferring media segment neuters `segmentEntry.data` | Design | If `scan-segment` fails, the data is unrecoverable — no retry possible |
@@ -561,7 +561,7 @@ To make end-to-end pipeline failures debuggable from the DevTools console alone,
 - **Permissions:** none. The extension declares no `permissions` at all; the service worker that used `storage` had no consumer and was removed.
 - **Host permissions:** `https://www.youtube.com/*` only.
 - **CSP for extension pages:** `script-src 'self' 'wasm-unsafe-eval'; object-src 'self'` — minimal, allows WASM for Tesseract.
-- **No remote code:** All resources are bundled in the extension package. Tesseract WASM is loaded from `libs/tesseract/*` (web-accessible resources).
+- **No remote code, and now no remote data:** everything ships in the package — Tesseract's WASM under `libs/tesseract/`, its French model under `libs/tesseract/lang-data/`. The extension makes no network request of its own.
 - **ArrayBuffer handling:** All buffer copies are made before sending via postMessage to avoid use-after-free bugs. The interceptor copies before posting; the decoder-sandbox receives transfers (zero-copy but neuters source).
 - **No eval, no innerHTML:** The extension uses only DOM APIs and postMessage. No user-controlled content is ever injected into the page as HTML.
 

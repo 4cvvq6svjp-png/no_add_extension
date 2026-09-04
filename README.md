@@ -184,9 +184,9 @@ AheadScanner heartbeat { currentTime, bufferedAhead, decoderConfigured,
 
 ## Limites connues
 
-- **Tesseract télécharge son modèle de langue** (`fra`) depuis
-  `tessdata.projectnaptha.com` au premier usage. À embarquer sous
-  `libs/tesseract/` pour supprimer cette dépendance réseau.
+- **Le modèle de langue est embarqué** sous `libs/tesseract/lang-data/`. C'était
+  la seule dépendance réseau de l'extension, et depuis que l'OCR est le seul
+  mécanisme de détection, son échec la rendait muette. Elle n'existe plus.
 - **`TextDetector`** (OCR natif, rapide) n'existe pas sur tous les Chromium ;
   sur Linux c'est Tesseract qui travaille, nettement plus lent.
 - **L'OCR rate environ une image sur onze** sur la vidéo de référence. C'est ce
@@ -213,11 +213,15 @@ de l'extension. Le content script lui envoie des `ImageBitmap` par
 Security Policy` signale que ce contournement n'a pas été emprunté.
 
 **L'OCR ne détecte plus rien.** L'OCR étant le seul mécanisme, sa panne rend
-l'extension muette — et elle continue pourtant d'afficher qu'elle est active.
-Le heartbeat est ce qui le révèle : `ocrBackend` dit quel moteur a été choisi,
-`tesseractDisabled` passe à `true` après cinq échecs consécutifs, et
-`ocrMatches` reste à zéro. La cause la plus fréquente est le téléchargement du
-modèle `fra`, qui a besoin du réseau au premier usage.
+l'extension muette. Le heartbeat est ce qui le révèle : `ocrBackend` dit quel
+moteur a été choisi, `tesseractDisabled` passe à `true` après cinq échecs
+consécutifs, et `ocrMatches` reste à zéro. Le moteur réessaie tout seul, avec
+un délai croissant, et ne se rend jamais définitivement — mais tant qu'il n'est
+pas prêt, la boucle de scan attend au lieu de consommer des segments qu'elle ne
+pourrait pas analyser.
+
+Pour reproduire une panne et vérifier ce comportement :
+`node tools/capture-logs.mjs --fault sandbox-dead --seconds 90`.
 
 **`googlevideo … 403 (Forbidden)` en boucle.** La pile d'appels mentionne
 souvent `kevlar_base_module` : c'est du code YouTube, pas l'extension. Dans le

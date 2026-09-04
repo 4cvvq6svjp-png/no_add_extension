@@ -22,7 +22,8 @@
 import { chromium } from "playwright";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
-import { mkdirSync, createWriteStream } from "node:fs";
+import { mkdirSync, createWriteStream, cpSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
@@ -66,6 +67,30 @@ function requireTimecode(flag, raw) {
   return value;
 }
 
+/** Pannes injectables dans une copie de l'extension (voir buildFaultyExtension). */
+const FAULTS = {
+  "sandbox-dead": {
+    label: "la sandbox OCR ne signale jamais sa disponibilité",
+    patch: (source) => source.replace(
+      'window.parent.postMessage({ channel: CHANNEL, type: "sandbox-ready" }, "*");',
+      '/* panne injectée : sandbox-ready jamais émis */')
+  },
+  "init-error": {
+    label: "l'initialisation du moteur échoue",
+    patch: (source) => source.replace(
+      "    async init() {\n      await getWorker();",
+      '    async init() {\n      throw new Error("panne injectée : modèle indisponible");\n      await getWorker();')
+  }
+};
+
+function requireFault(flag, raw) {
+  if (!FAULTS[raw]) {
+    console.error(`Panne inconnue pour ${flag} : "${raw}" (attendu : ${Object.keys(FAULTS).join(", ")}).`);
+    process.exit(2);
+  }
+  return raw;
+}
+
 function requireValue(flag, raw) {
   if (raw === undefined || String(raw).startsWith("--")) {
     console.error(`Argument manquant pour ${flag}.`);
@@ -88,6 +113,7 @@ function parseArgs(argv) {
     noSeek: false,
     fullWindow: false,
     screenshot: null,
+    fault: null,
     out: null
   };
   for (let i = 2; i < argv.length; i++) {
@@ -105,6 +131,7 @@ function parseArgs(argv) {
       case "--login": opts.login = true; break;
       case "--no-seek": opts.noSeek = true; break;
       case "--full-window": opts.fullWindow = true; break;
+      case "--fault": opts.fault = requireFault(a, next()); break;
       case "--screenshot": opts.screenshot = requireTimecode(a, next()); break;
       case "--ad": {
         const [s, e] = String(next()).split("-");
@@ -267,6 +294,8 @@ function createRecorder(outPath) {
   return {
     outPath,
     detections: [],   // { atWall, kind, detail }
+    ocrFailures: [],  // texte des échecs de démarrage/reconnaissance OCR
+    ocrDisabled: false,
     lastHeartbeat: null,
     heartbeatCount: 0,
     totalEntries: 0,
@@ -319,6 +348,9 @@ function attachLogging(page, recorder) {
     const detection = classifyDetection(text, argsValues);
     if (detection) recorder.detections.push({ atWall: emittedAt, ...detection });
 
+    if (/OCR Tesseract : échec/.test(text)) recorder.ocrFailures.push({ atWall: emittedAt, text });
+    if (/Tesseract désactivé/.test(text)) recorder.ocrDisabled = true;
+
     const heartbeat = extractHeartbeat(text, argsValues);
     if (heartbeat) {
       recorder.lastHeartbeat = heartbeat;
@@ -344,10 +376,42 @@ function attachLogging(page, recorder) {
 /*  Lancement du navigateur                                               */
 /* --------------------------------------------------------------------- */
 
+/**
+ * Copie l'extension dans un dossier temporaire et y injecte une panne.
+ *
+ * Le harness n'exerçait que le chemin heureux : le démarrage OCR réussit à
+ * chaque run, donc tout le code de reprise n'était couvert que par des tests
+ * unitaires à pont simulé. Casser une copie plutôt que la source évite d'avoir
+ * à placer des points d'injection dans le code livré.
+ *
+ * @returns {string} racine de l'extension modifiée
+ */
+function buildFaultyExtension(fault) {
+  const root = join(tmpdir(), `no-add-fault-${fault}-${Date.now()}`);
+  cpSync(REPO_ROOT, root, {
+    recursive: true,
+    filter: (src) => !/(\.git|node_modules|\.profile|logs)(\/|$)/.test(src.slice(REPO_ROOT.length))
+  });
+
+  const target = join(root, "pages/ocr-sandbox.js");
+  const original = readFileSync(target, "utf8");
+  const patched = FAULTS[fault].patch(original);
+  if (patched === original) {
+    console.error(`Injection "${fault}" sans effet : pages/ocr-sandbox.js a changé, le motif ne correspond plus.`);
+    process.exit(2);
+  }
+  writeFileSync(target, patched);
+
+  console.log(`💥 Panne injectée « ${fault} » : ${FAULTS[fault].label}`);
+  console.log(`   copie de l'extension : ${root}`);
+  return root;
+}
+
 async function launchBrowser(opts) {
+  const extensionRoot = opts.fault ? buildFaultyExtension(opts.fault) : REPO_ROOT;
   const extensionArgs = opts.noExtension ? [] : [
-    `--disable-extensions-except=${REPO_ROOT}`,
-    `--load-extension=${REPO_ROOT}`
+    `--disable-extensions-except=${extensionRoot}`,
+    `--load-extension=${extensionRoot}`
   ];
   if (opts.noExtension) console.log("⚠ Mode --no-extension : extension NON chargée (diagnostic).");
 
@@ -550,6 +614,70 @@ async function judgeAllAdWindows(page, opts, recorder, globalDeadline) {
 /*  Résumé stdout                                                         */
 /* --------------------------------------------------------------------- */
 
+/**
+ * Sous `--fault`, le run ne cherche pas à sauter une pub : il vérifie que
+ * l'extension se comporte correctement quand l'OCR ne démarre pas.
+ *
+ * @returns {boolean} true si toutes les propriétés attendues sont observées.
+ */
+function printFaultReport(recorder) {
+  console.log("\n" + "═".repeat(64));
+  console.log("PANNE INJECTÉE — comportement attendu de l'extension");
+  console.log("═".repeat(64));
+
+  const heartbeat = recorder.lastHeartbeat ?? {};
+  const gaps = recorder.ocrFailures
+    .slice(1)
+    .map((failure, i) => failure.atWall - recorder.ocrFailures[i].atWall);
+
+  const checks = [
+    ["la panne est détectée et loguée",
+     recorder.ocrFailures.length > 0,
+     `${recorder.ocrFailures.length} échec(s) OCR`],
+
+    ["les tentatives sont espacées, pas une par frame",
+     gaps.length === 0 || Math.max(...gaps) >= 2000,
+     gaps.length ? `écarts : ${gaps.map((g) => `${(g / 1000).toFixed(1)}s`).join(", ")}` : "une seule tentative"],
+
+    // Le seuil de désactivation est à 5 échecs consécutifs. Un run court n'a
+    // pas le temps de l'atteindre : ce qu'on vérifie, c'est que le compteur
+    // reflète la réalité, et que `disabled` suit dès que le seuil est franchi.
+    // Le compteur est au moins égal aux échecs LOGUÉS : au-delà du troisième,
+    // un message identique est délibérément dédupliqué.
+    ["le compteur d'échecs progresse",
+     heartbeat.tesseractErrors >= recorder.ocrFailures.length && heartbeat.tesseractErrors > 0,
+     `tesseractErrors=${heartbeat.tesseractErrors}, dont ${recorder.ocrFailures.length} logué(s)`],
+
+    ["le moteur se désactive une fois le seuil atteint",
+     heartbeat.tesseractErrors >= 5
+       ? (recorder.ocrDisabled || heartbeat.tesseractDisabled === true)
+       : true,
+     heartbeat.tesseractErrors >= 5
+       ? `tesseractDisabled=${heartbeat.tesseractDisabled}`
+       : `seuil pas encore atteint (${heartbeat.tesseractErrors}/5) — allonge --seconds pour l'observer`],
+
+    ["aucun segment n'est consommé sans OCR",
+     heartbeat.scansRun === 0 && heartbeat.framesDecoded === 0,
+     `scansRun=${heartbeat.scansRun}, framesDecoded=${heartbeat.framesDecoded}`],
+
+    ["les segments restent disponibles pour plus tard",
+     typeof heartbeat.capturedSegments === "string" &&
+       /^(\d+) \(\1 non scannés\)$/.test(heartbeat.capturedSegments),
+     `capturedSegments=${heartbeat.capturedSegments}`]
+  ];
+
+  let allPassed = true;
+  for (const [label, passed, detail] of checks) {
+    if (!passed) allPassed = false;
+    console.log(`  ${passed ? "✅" : "❌"} ${label}\n       ${detail}`);
+  }
+
+  console.log(allPassed
+    ? "\n  Le code de reprise se comporte comme prévu en conditions réelles."
+    : "\n  ⚠ Au moins une propriété attendue n'est pas observée.");
+  return allPassed;
+}
+
 function printSummary(recorder, verdicts, stopReason) {
   console.log("\n" + "═".repeat(64));
   console.log("RÉSUMÉ");
@@ -647,7 +775,11 @@ async function main() {
 
     const globalDeadline = Date.now() + opts.seconds * 1000;
 
-    if (opts.ads.length === 0) {
+    if (opts.fault) {
+      console.log(`Panne injectée : observation passive pendant ${opts.seconds}s.`);
+      while (Date.now() < globalDeadline) await sleep(1000);
+      stopReason = "observation de la panne terminée";
+    } else if (opts.ads.length === 0) {
       console.log("Aucune fenêtre --ad : capture passive jusqu'au timeout.");
       while (Date.now() < globalDeadline) await sleep(1000);
       stopReason = "timeout";
@@ -666,6 +798,10 @@ async function main() {
   }
 
   printSummary(recorder, verdicts, stopReason);
+
+  if (opts.fault) {
+    process.exit(printFaultReport(recorder) ? 0 : 1);
+  }
 
   // Code retour : non-zéro si erreur ou verdict non concluant (ni HIT ni SKIP).
   const failed = recorder.errors.length > 0 ||
