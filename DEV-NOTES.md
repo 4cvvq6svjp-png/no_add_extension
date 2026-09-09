@@ -336,6 +336,275 @@ décrit en §4.1, quand un seek vide le buffer MSE et rapproche la frontière
 atteignable. Les deux autres runs donnent 4,8s et 5,3s avec 3 sauts, alignés
 sur post-D.
 
+### 2.10 Suppression de la détection par overlay DOM, + E4 et E6 *(2026-09-02)*
+
+**Décision produit : l'OCR devient le seul mécanisme de détection.** Le
+détecteur DOM lisait `.ytp-paid-content-overlay`, l'élément que YouTube injecte
+quand un créateur *déclare* une promotion payante. En pratique les créateurs
+incrustent le mot dans l'image plutôt que de le déclarer. La mesure tranche :
+sur **quinze runs archivés, ce chemin n'a jamais produit un seul segment**. Il
+s'est déclenché une fois, en août, et c'était le faux positif sur une pub
+pré-roll que §2.7 a corrigé ; depuis, plus rien sur neuf runs. Les 36 sauts de
+septembre viennent tous de `ahead-ocr`.
+
+`content/overlay.js` est supprimé, avec son entrée de manifeste, les deux clés
+`CONFIG` qui le servaient, et les deux motifs de détection correspondants dans
+le harness. Bilan : −199 lignes pour +82.
+
+**La contrepartie est explicite** : quand l'OCR tombe, plus rien ne détecte. Ce
+cas était mal servi par le code, et la question « pourquoi l'OCR serait-il
+indisponible ? » a révélé que le garde `isAvailable()` protège une situation
+qui n'arrive jamais tout en ratant celles qui arrivent :
+
+- `isAvailable()` n'est faux que si aucun backend n'a été choisi, ce qui exige
+  l'absence simultanée de `TextDetector` **et** de `chrome.runtime.getURL` —
+  impossible dans un content script.
+- Les vrais cas sont ailleurs et laissent `isAvailable()` à `true` : le modèle
+  `fra` qui ne se télécharge pas (dépendance réseau au premier usage), et le
+  worker Tesseract qui plante cinq fois d'affilée et se désactive. Dans les deux
+  cas l'extension affiche « actif sur cette vidéo » et ne détecte plus rien ;
+  seul le heartbeat (`tesseractDisabled`, `ocrMatches`) le révèle.
+
+Le message de désactivation, qui affirmait « seule la détection DOM reste
+active », est corrigé — il était devenu faux.
+
+**Défaut repéré au passage, non corrigé.** Quand l'initialisation de Tesseract
+échoue, `ensureReady()` remet `this.ready` à `null` dans son `catch` : la frame
+suivante relance une initialisation complète, indéfiniment. Avec
+`ocrInitTimeoutMs` à 120 s, une initialisation qui *pend* bloque la boucle de
+scan deux minutes par tentative. Et ce chemin n'incrémente jamais `errorCount`,
+donc il ne se désactive jamais. À traiter.
+
+**E4 — horodatage du harness.** L'horodatage était pris après le déballage des
+arguments du message console, qui coûte un aller-retour vers le navigateur ; il
+est maintenant pris à l'entrée du handler. Mesure préalable : le heartbeat étant
+émis par un `setInterval` de 5 000 ms, l'écart entre deux heartbeats
+*enregistrés* mesure la variation du délai. Sur 54 intervalles : médiane 5 000
+ms, écart-type 7 ms, extrêmes 4 980 et 5 026. **Le décalage réel était de ±26
+ms**, donc sans effet sur des fenêtres de plusieurs dizaines de secondes. Le
+correctif est une garantie, pas une amélioration : le délai n'est pas borné et
+grandirait sur un run beaucoup plus bavard.
+
+**E6 — validation des arguments.** `--seconds`, `--seek-lead`, `--grace`,
+`--screenshot`, `--url` et `--out` sont validés comme `--ad` l'était déjà :
+message explicite et code retour 2. Avant, `--seconds abc` rendait la date
+limite `NaN`, la boucle d'observation ne s'exécutait jamais et le harness
+rendait un `TIMEOUT` en une fraction de seconde sans expliquer pourquoi.
+
+### Ce que 11 runs disent de la méthode de mesure
+
+| | n | verdicts | pub vue (médiane) | sauts | dépass. | cadence | OCR |
+|---|---|---|---|---|---|---|---|
+| après A/B/C | 4 | SKIP | 5,0s [4,7–8,8] | 4 | +0,4s | 2,1s | 84 % |
+| après D | 2 | SKIP | 4,4s [4,1–4,6] | 3 | +0,4s | 2,0s | 78 % |
+| après E1-E3 | 3 | SKIP | 5,3s [4,8–7,6] | 3 | +0,4s | 2,1s | 81 % |
+| sans overlay + E4/E6 | 3 | SKIP | 5,5s [4,8–10,1] | 3 | +0,4s | 2,1s | 79 % |
+
+Regroupés autrement, les 11 runs de septembre sont **bimodaux** :
+
+| | runs | pub vue |
+|---|---|---|
+| net (≤ 4 sauts) | 9 | 4,8s [4,1–5,5] |
+| fragmenté (≥ 5 sauts) | 3 | 8,8s [7,6–10,1] |
+
+Un run sur quatre environ tombe dans le mode fragmenté : le playhead chasse la
+sonde extension par extension, exactement le motif de §4.1 quand un seek vide le
+buffer MSE et rapproche la frontière atteignable.
+
+**Conséquence méthodologique : la variance run-à-run (4,1 à 10,1s) dépasse tout
+écart mesuré entre les versions de septembre (médianes 4,4 à 5,5s).** Aucune des
+comparaisons D contre E contre « sans overlay » n'est concluante, et il ne faut
+pas les lire comme telles — 3 runs par version sont sous le plancher de bruit.
+Le gain d'août à septembre (12,5 → 5,0s), lui, reste bien au-dessus.
+Pour départager deux versions il faudrait une dizaine de runs chacune, ou
+supprimer la source de variance en attaquant §4.1.
+
+### 2.11 Robustesse du démarrage OCR + lot F *(2026-09-04)*
+
+**Le démarrage de Tesseract avait trois pannes distinctes, pas une.** Le
+démarrage a lieu *dans* la boucle de scan, qui l'attend : sa robustesse
+conditionne tout le pipeline. L'ancienne implémentation mettait en cache une
+promesse dans `this.ready` et se comportait différemment selon l'endroit où ça
+cassait.
+
+*Mode A — l'iframe ne signale jamais sa disponibilité.* `bridge.ensureReady()`
+renvoie `false` **sans lever d'exception**, donc le `catch` qui remet
+`this.ready` à `null` ne s'exécute pas. La promesse résolue à `false` reste en
+cache et, comme le code commence par `if (this.ready) return this.ready`, **plus
+aucune tentative n'a jamais lieu**. Reproduit contre l'ancien code : après
+réparation de la sandbox et cinq frames de plus, `init` tenté **0 fois**.
+
+*Mode B — l'initialisation du moteur échoue.* Là une exception est levée, le
+`catch` remet `this.ready` à `null`, et la frame suivante relance une
+initialisation complète. Reproduit : 6 frames analysées → **6 initialisations
+complètes**, chacune avec un timeout de 60 s. Si l'init *pend* au lieu
+d'échouer, la boucle de scan gèle deux minutes par tentative, en boucle.
+
+*Mode C — le worker meurt après un démarrage réussi.* Cinq échecs de
+reconnaissance et `disabled` passait à `true`… définitivement. Or la sandbox met
+son worker en cache : même en réessayant, `init` aurait rendu le même worker
+mort.
+
+**Et dans les modes A et B, `errorCount` n'était jamais incrémenté** — ces
+chemins ne passent pas par le `catch` de `recognize`. Donc `tesseractDisabled`,
+le champ du heartbeat qui existe précisément pour révéler ce genre de panne,
+restait à `false` pendant que plus rien ne fonctionnait. Le seul indice était
+`ocrMatches` bloqué à zéro, ce qui ressemble à « cette vidéo n'a pas de pub ».
+
+**La correction tient en trois règles**, chacune répondant à un mode :
+
+1. *Aucun état d'échec latché.* Une tentative ratée ne laisse jamais de promesse
+   en cache : elle programme une nouvelle tentative. L'état est explicite —
+   `started`, `starting`, `failures`, `nextAttemptAt` — au lieu d'être déduit du
+   contenu d'une promesse.
+2. *Un seul compteur pour toutes les causes.* Démarrage et reconnaissance
+   alimentent `failures`, donc `disabled` dit la vérité quelle que soit
+   l'origine de la panne.
+3. *Délai croissant entre tentatives*, de `ocrRetryBaseDelayMs` (2 s) doublé à
+   chaque échec jusqu'à `ocrRetryMaxDelayMs` (60 s).
+
+Deux propriétés s'y ajoutent. Une reprise **repart d'une iframe neuve**, sans
+quoi la sandbox rendrait son worker en cache — c'est ce qui rend le mode C
+récupérable. Et le moteur **ne se rend jamais définitivement** : passé le seuil
+il continue de sonder au rythme du plafond, donc une panne réseau au premier
+usage ne condamne plus la vidéo entière. `ocrInitTimeoutMs` passe de 120 à 60 s,
+démesuré pour une boucle qui tourne toutes les 2 s.
+
+9 tests couvrent les trois modes, avec une horloge pilotée pour mesurer le
+backoff au lieu de l'attendre.
+
+**Un quatrième défaut, d'intégration cette fois.** Le moteur corrigé était
+propre, mais la boucle de scan ne lui demandait jamais s'il pouvait travailler.
+`scanNext` marquait le segment `scanned` — donc consommé pour de bon — puis le
+faisait démuxer et décoder, et ce n'est qu'ensuite que l'OCR répondait
+« indisponible ». Pendant un délai d'attente de 60 s à ~2 s par itération, cela
+brûlait une trentaine de segments, soit deux à trois minutes de contenu
+**définitivement non analysées**, en payant le décodage au passage. `scanNext`
+et `fallbackTick` demandent maintenant `frameClassifier.ensureReady()` avant de
+consommer quoi que ce soit : sans OCR, la boucle attend au lieu de gaspiller.
+`isAvailable()` ne dit que le backend choisi à la construction, `ensureReady()`
+dit l'état réel.
+
+**51 tests au total.**
+
+**Lot F — documentation.** ARCHITECTURE décrivait cinq composants sur onze : le
+découpage du lot D en avait créé six que rien ne documentait, dont `AdEndProbe`,
+le mécanisme central. Les six ont leur section, `FrameClassifier` et
+`AheadScanner` sont réécrits sur leur périmètre réel, le diagramme de flux final
+ne cite plus de méthodes disparues, et le tableau des risques enregistre ce que
+E1–E3 ont corrigé plus la mise en garde sur la variance de mesure.
+
+Le tableau des paramètres est désormais **généré depuis `content/config.js`** :
+il en manquait 21 sur 32, et `mergeGapSeconds` y était donné à 2 s alors que le
+code dit 20 — l'écart exact qui rend la fusion agressive, donc pas un détail.
+Un contrôle croisé vérifie aussi qu'aucune doc ne cite plus un symbole absent du
+code.
+
+GUIDE portait trois affirmations fausses — « la bande du haut » au lieu des
+quatre coins, « sous Linux, WebM » au lieu d'AV1 en fMP4, et une section d'état
+datée du 7 mai qui présentait comme récentes des corrections antérieures à tout
+ce travail. Réécrite avec les chiffres mesurés et les limites réelles, dont le
+fait que tout ce qu'on sait vient d'une seule vidéo.
+
+**Mesure.** 3 runs, tous `SKIP`, **aucun incident OCR** — le démarrage se fait
+proprement à chaque run, donc les chemins de reprise ne sont pas exercés par le
+harness. C'est attendu : ils ne se déclenchent que sur une panne réseau ou un
+worker cassé, deux conditions que le harness ne provoque pas. Ce sont les tests
+unitaires, avec leur double de pont et leur horloge pilotée, qui les couvrent.
+
+| | n | pub vue (médiane) | sauts | cadence | OCR |
+|---|---|---|---|---|---|
+| après A/B/C | 4 | 5,0s [4,7–8,8] | 4 | 2,1s | 84 % |
+| après D | 2 | 4,4s [4,1–4,6] | 3 | 2,0s | 78 % |
+| après E1-E3 | 3 | 5,3s [4,8–7,6] | 3 | 2,1s | 81 % |
+| sans overlay + E4/E6 | 3 | 5,5s [4,8–10,1] | 3 | 2,1s | 79 % |
+| **robustesse OCR + F** | 3 | 4,8s [4,1–4,9] | 3 | 2,1s | 81 % |
+
+Les trois runs tombent tous dans le mode « net » décrit en §2.10, d'où une
+fourchette resserrée. Rappel de la mise en garde : à 3 runs par version, ces
+écarts restent sous le plancher de bruit.
+
+### 2.12 Modèle OCR embarqué + injection de panne dans le harness *(2026-09-04)*
+
+**Le modèle de langue est livré avec l'extension.** `libs/tesseract/lang-data/`,
+`langPath` pointe sur `chrome.runtime.getURL`. C'était la seule dépendance
+réseau, et depuis §2.10 son échec rendait l'extension muette. Effet secondaire
+non anticipé : Tesseract démarre en **0,5 s** au lieu d'attendre un
+téléchargement — la mise en garde « la première analyse peut être longue »
+n'a plus lieu d'être.
+
+**Le chiffre de 1,3 Mo annoncé par GUIDE était faux : le fichier fait 6,0 Mo.**
+Je l'avais repris sans le vérifier. Cela ouvrait un choix entre trois variantes
+— `4.0.0` (6,0 Mo, celle utilisée jusqu'ici via le CDN), `4.0.0_best` (3,2 Mo)
+et `4.0.0_fast` (0,6 Mo).
+
+**Mesure du modèle léger : équivalent sur le papier, moins bon en réalité.**
+
+| fenêtre | modèle | n | pub vue méd. | fragmentés | avance max méd. | OCR |
+|---|---|---|---|---|---|---|
+| 02h49 | standard | 3 | 4,8s | 0/3 | 39,8s | 81 % |
+| 03h17 | **fast** | 6 | **8,9s** | **4/6** | **33,0s** | 82 % |
+| 03h24 | standard | 3 | 4,8s | 1/3 | 38,8s | 79 % |
+
+Le taux de lecture est identique (82 % contre 81 %) et **les ratés sont les
+mêmes textes** (`Publhocité`, `A Le /`) : les deux modèles lisent la même
+chose. La cadence est même meilleure avec `fast` (1,9 s contre 2,1 s par frame).
+Sur les deux métriques qui devraient départager un modèle OCR, `fast` gagne.
+
+Et pourtant il double la pub vue. Le premier réflexe — attribuer l'écart aux
+conditions réseau — était faux, et **c'est le contrôle qui l'a montré** : le
+standard rejoué immédiatement après, dans la même fenêtre, retrouve ses 4,8 s
+et son avance de 38,8 s. Le standard encadre le fast dans le temps et reste bon
+des deux côtés.
+
+**Le mécanisme est contre-intuitif.** La corrélation est parfaite au run près :
+`avance max ≥ 38,8 s` donne 3 sauts, `≤ 33,4 s` donne 4 à 7 sauts. Standard
+atteint ~39 s sur 5 runs sur 6, fast plafonne à ~33 s sur 5 sur 6. Or c'est le
+modèle *rapide* qui plafonne : la sonde atteint la frontière du buffer **plus
+tôt**, quand YouTube a moins téléchargé d'avance. Elle échantillonne une
+frontière plus proche, saute moins loin, et doit recommencer.
+
+**Le look-ahead est limité par le buffer, pas par le CPU.** Accélérer l'OCR ne
+rapporte rien et peut coûter. C'est une entrée importante pour §4.5, qui listait
+la parallélisation des scans comme piste de débit : elle ne servira à rien tant
+que la frontière restera le facteur limitant. Et c'est aussi §4.1 vu sous un
+autre angle.
+
+C'est donc `4.0.0` qui est livré : l'embarquement ne change alors strictement
+rien au comportement, seule la provenance du fichier change. L'extension passe
+de 4,8 à 11 Mo. `4.0.0_best` (3,2 Mo) reste un intermédiaire non testé.
+
+**Injection de panne dans le harness (`--fault`).** Les runs normaux ne jouaient
+que le chemin heureux : le démarrage OCR réussit à chaque fois, donc tout le
+code de reprise de §2.11 n'était couvert que par des tests unitaires à pont
+simulé. `--fault` copie l'extension dans un dossier temporaire, y casse
+`pages/ocr-sandbox.js` et charge cette copie — aucun point d'injection ne vit
+dans le code livré. Deux modes : `sandbox-dead` (l'iframe ne signale jamais sa
+disponibilité, le cas qui condamnait le moteur pour toujours) et `init-error`
+(le moteur refuse de démarrer, le cas qui relançait une init par frame).
+
+Cinq propriétés vérifiées, code retour 0 seulement si toutes passent. Résultat
+en vrai navigateur :
+
+| | `init-error` | `sandbox-dead` |
+|---|---|---|
+| écarts entre tentatives | 2,5s → 4,9s | 27,4s → 29,8s |
+| compteur d'échecs | 6 (3 logués) | 4 (3 logués) |
+| désactivation au seuil | oui | seuil non atteint en 120s |
+| segments consommés | **0** | **0** |
+| segments préservés | 4 (4 non scannés) | 30 (30 non scannés) |
+
+Le backoff double bien, et surtout `scansRun=0` confirme en conditions réelles
+le correctif d'intégration : plus aucun segment n'est brûlé pendant une panne.
+
+**À noter pour la suite** : sur les cinq contrôles du rapport de panne, **deux
+ont d'abord échoué parce que l'assertion était fausse, pas le code** — l'une
+comparait le compteur au nombre d'échecs *logués* alors que les messages
+identiques sont dédupliqués après le troisième, l'autre exigeait la
+désactivation avant que le seuil de cinq échecs ne soit atteignable dans la
+durée du run. Un test qui échoue sur du code fraîchement écrit n'est pas
+forcément un test qui a raison.
+
 ---
 
 ## 3. Résultats validés (vidéo de réf `vRAPfDSmBGM`, pub 3:49–4:57)
@@ -400,9 +669,11 @@ de run montre par ailleurs `28 capturés (8 non scannés)` — le scanner reste 
 goulot, mais frame par frame.
 
 Deux pistes qui s'attaquent au bon terme :
-- **Paralléliser les scans** : plusieurs `scan-segment` en vol (le pont supporte
-  déjà des `reqId` concurrents), ou une seconde sandbox OCR. Le décodage est
-  rapide ; c'est l'appel Tesseract qui domine.
+- ~~**Paralléliser les scans**~~ : hypothèse **invalidée** par l'A/B des modèles
+  OCR (§2.12). Un modèle plus rapide fait atteindre la frontière du buffer plus
+  tôt, donc plus près, et dégrade le résultat — 8,9s de pub vue contre 4,8s. Le
+  look-ahead est limité par le **buffer**, pas par le CPU : accélérer l'OCR ne
+  rapportera rien tant que §4.1 n'est pas traité.
 - **Réduire le coût d'un appel Tesseract** : le composite est passé de
   1600×900 à 1600×538 (§2.7), mais rien ne dit que 1600 de large soit
   nécessaire. À balayer.

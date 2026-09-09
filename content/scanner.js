@@ -72,7 +72,9 @@
 
     async start() {
       if (!this.frameClassifier.isAvailable()) {
-        logWarn("Aucun moteur OCR disponible, AheadScanner désactivé.");
+        // Depuis la suppression de la détection par overlay DOM, l'OCR est le
+        // seul mécanisme de détection : sans lui, l'extension ne fait rien.
+        logWarn("Aucun moteur OCR disponible — l'extension est inactive sur cette plateforme.");
         return;
       }
 
@@ -204,6 +206,13 @@
       if (!this.buffer.initSegment || this.buffer.segments.length === 0) return false;
 
       try {
+        // Un segment consommé est marqué scanné, donc perdu pour de bon. Tant
+        // que l'OCR ne peut pas l'analyser — démarrage en cours, ou délai
+        // d'attente après un échec — on n'en prend aucun : on décoderait pour
+        // jeter, et le contenu ne serait jamais rattrapé.
+        const ocrReady = await this.frameClassifier.ensureReady();
+        if (!ocrReady) return false;
+
         const configured = await this.decoder.ensureConfigured();
         if (!configured) return false;
 
@@ -340,6 +349,10 @@
 
       const sampleTime = Number(video.currentTime ?? 0);
       if (sampleTime - this.lastScannedTime < CONFIG.frameSampleSeconds) return;
+
+      // Même raison qu'en mode MSE : sans OCR prêt, avancer lastScannedTime
+      // ferait sauter cette fenêtre de temps sans l'avoir analysée.
+      if (!await this.frameClassifier.ensureReady()) return;
 
       this.fallbackBusy = true;
       try {

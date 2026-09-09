@@ -143,6 +143,6 @@ test("une absorption qui ajoute une source compte comme un changement", () => {
   const store = new SegmentStore({ mergeGapSeconds: 20, minSegmentSeconds: 3 });
   store.addSegment({ start: 100, end: 120, source: "ahead-ocr" });
 
-  assert.equal(store.addSegment({ start: 105, end: 115, source: "dom-overlay" }), true);
-  assert.equal(store.getAll()[0].source, "ahead-ocr+dom-overlay");
+  assert.equal(store.addSegment({ start: 105, end: 115, source: "main-video-ocr" }), true);
+  assert.equal(store.getAll()[0].source, "ahead-ocr+main-video-ocr");
 });

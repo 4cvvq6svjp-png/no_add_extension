@@ -35,7 +35,6 @@
         "content/segments.js",
         "content/ui.js",
         "content/sandbox.js",
-        "content/overlay.js",
         "content/ocr.js",
         "content/mse-buffer.js",
         "content/decoder.js",

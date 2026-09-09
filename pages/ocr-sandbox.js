@@ -29,7 +29,9 @@
       workerPromise = self.Tesseract.createWorker("fra", 1, {
         workerPath: `${base}worker.min.js`,
         corePath: `${base}tesseract-core-simd.wasm.js`,
-        langPath: "https://tessdata.projectnaptha.com/4.0.0",
+        // Modèle embarqué : c'était la seule dépendance réseau, et depuis
+        // la suppression de la détection DOM, son échec rend l'extension muette.
+        langPath: chrome.runtime.getURL("libs/tesseract/lang-data"),
         gzip: true,
         workerBlobURL: false,
         logger: () => {}
