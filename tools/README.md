@@ -121,6 +121,39 @@ complet (`grep`-able par `source` et par tag `[NoAdd-MSE]` / `[NoAdd-Decoder]`).
 
 Code retour `1` si un MISS ou une erreur (utile en script/CI), `0` si tout HIT.
 
+## Banc d'essai multi-vidéos (`run-corpus.mjs`)
+
+`tools/corpus.json` est la **source de vérité** : identifiants YouTube, fenêtres
+de pub relevées à la main, plafond `--seconds` par vidéo. Cinq tests en gardent
+le format (`npm test`), parce qu'une entrée mal formée ne se verrait qu'après
+des dizaines de minutes de runs.
+
+```bash
+node tools/run-corpus.mjs                 # détection, en série
+node tools/run-corpus.mjs --jobs 3        # détection, 3 vidéos à la fois
+node tools/run-corpus.mjs --full-window   # couverture, série imposée
+node tools/run-corpus.mjs --only Np_Fc7tWXus --seek-lead 45
+```
+
+### Deux passes, deux questions
+
+| Passe | Question | Parallélisable ? |
+|---|---|---|
+| **détection** (défaut) | Le mot-clé est-il lu dans la fenêtre ? | **oui** — le verdict est binaire, robuste à la contention |
+| **couverture** (`--full-window`) | Quelle part de la pub est réellement sautée ? | **non**, et le runner le refuse |
+
+La couverture dépend de la profondeur du buffer et de la cadence de scan
+(DEV-NOTES §4.1). Or plusieurs navigateurs simultanés se disputent la bande
+passante et le CPU, c'est-à-dire exactement ces deux variables : une mesure de
+couverture faite en parallèle serait ininterprétable. Le runner sort en code 2
+plutôt que de produire un chiffre trompeur.
+
+### Profils
+
+Chromium verrouille son dossier de profil, donc chaque worker a besoin du sien.
+Au-delà d'un worker, le runner clone `.profile` dans `.profile-workers/wN` pour
+conserver la session YouTube. Compter ~111 Mo par worker.
+
 ## Injection de panne (`--fault`)
 
 Les runs normaux ne jouent que le chemin heureux : le démarrage OCR réussit à

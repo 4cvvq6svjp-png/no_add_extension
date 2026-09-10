@@ -27,7 +27,7 @@ import { tmpdir } from "node:os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
-const PROFILE_DIR = join(__dirname, ".profile");
+const DEFAULT_PROFILE_DIR = join(__dirname, ".profile");
 const LOGS_DIR = join(REPO_ROOT, "logs");
 
 /* Vidéo de référence : contient une pub « collaboration commerciale » 3:49→4:57. */
@@ -114,6 +114,7 @@ function parseArgs(argv) {
     fullWindow: false,
     screenshot: null,
     fault: null,
+    profile: DEFAULT_PROFILE_DIR,
     out: null
   };
   for (let i = 2; i < argv.length; i++) {
@@ -125,6 +126,9 @@ function parseArgs(argv) {
       case "--seek-lead": opts.seekLead = requireNumber(a, next()); break;
       case "--grace": opts.grace = requireNumber(a, next()); break;
       case "--out": opts.out = requireValue(a, next()); break;
+      // Un profil dédié rend le parallélisme possible : Chromium verrouille le
+      // dossier de profil, deux instances ne peuvent pas le partager.
+      case "--profile": opts.profile = resolve(requireValue(a, next())); break;
       case "--headless": opts.headless = true; break;
       case "--no-extension": opts.noExtension = true; break;
       case "--passive": opts.passive = true; break;
@@ -415,7 +419,7 @@ async function launchBrowser(opts) {
   ];
   if (opts.noExtension) console.log("⚠ Mode --no-extension : extension NON chargée (diagnostic).");
 
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+  const context = await chromium.launchPersistentContext(opts.profile, {
     headless: opts.headless,
     // Chromium fourni par `npx playwright install chromium` (pas le Brave snap,
     // dont le confinement casserait --load-extension + profil custom).
@@ -737,7 +741,7 @@ async function main() {
   const recorder = createRecorder(opts.out ? resolve(opts.out) : join(LOGS_DIR, `run-${stamp}.jsonl`));
 
   console.log(`▶ Extension : ${REPO_ROOT}`);
-  console.log(`▶ Profil    : ${PROFILE_DIR}`);
+  console.log(`▶ Profil    : ${opts.profile}`);
   console.log(`▶ Sortie    : ${recorder.outPath}`);
   console.log(`▶ URL       : ${opts.url}`);
   if (opts.ads.length) {
