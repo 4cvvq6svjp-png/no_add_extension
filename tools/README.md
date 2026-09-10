@@ -79,6 +79,10 @@ node capture-logs.mjs \
   --ad 2:05-2:35 --ad 8:10-8:40
 ```
 
+> **Corpus de vidéos annotées** : `corpus.md` liste des vidéos réelles avec
+> leur fenêtre de pub relevée à la main et la commande prête à rejouer. C'est
+> le banc d'essai de la généralisation multi-vidéos.
+
 Au **premier lancement**, une fenêtre Chrome s'ouvre : connecte-toi à YouTube /
 accepte le consentement si demandé. Le profil (`tools/.profile/`) est persistant,
 donc c'est à faire une seule fois.

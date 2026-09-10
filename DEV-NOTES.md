@@ -684,6 +684,12 @@ Le coin exact et l'intitulé varient selon les créateurs (« Publicité »,
 la liste `COMMERCIAL_KEYWORDS` couvrent déjà pas mal ; à éprouver sur d'autres
 vidéos et ajuster crops/mots-clefs.
 
+Banc d'essai : **`tools/corpus.md`** — 9 vidéos supplémentaires annotées
+(fenêtres relevées à la main, commandes prêtes à rejouer), dont une
+volontairement difficile à lire (`lbLj5Yb6SAE`), une pub de 13 s seulement
+(`Np_Fc7tWXus`) et deux pubs démarrant avant 1:30, où le look-ahead manque de
+buffer (§4.1).
+
 ### 4.4 Bornes & faux positifs
 - Réduire le léger dépassement en début/fin de segment (paddings).
 - Exiger 2 confirmations avant un skip si des faux positifs apparaissent.
