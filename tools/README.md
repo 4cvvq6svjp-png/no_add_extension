@@ -129,30 +129,48 @@ le format (`npm test`), parce qu'une entrée mal formée ne se verrait qu'après
 des dizaines de minutes de runs.
 
 ```bash
-node tools/run-corpus.mjs                 # détection, en série
-node tools/run-corpus.mjs --jobs 3        # détection, 3 vidéos à la fois
-node tools/run-corpus.mjs --full-window   # couverture, série imposée
+node tools/run-corpus.mjs                 # passe de détection
+node tools/run-corpus.mjs --full-window   # passe de couverture
 node tools/run-corpus.mjs --only Np_Fc7tWXus --seek-lead 45
 ```
 
 ### Deux passes, deux questions
 
-| Passe | Question | Parallélisable ? |
-|---|---|---|
-| **détection** (défaut) | Le mot-clé est-il lu dans la fenêtre ? | **oui** — le verdict est binaire, robuste à la contention |
-| **couverture** (`--full-window`) | Quelle part de la pub est réellement sautée ? | **non**, et le runner le refuse |
+| Passe | Question |
+|---|---|
+| **détection** (défaut) | Le mot-clé est-il lu dans la fenêtre ? |
+| **couverture** (`--full-window`) | Quelle part de la pub est réellement sautée ? |
 
-La couverture dépend de la profondeur du buffer et de la cadence de scan
-(DEV-NOTES §4.1). Or plusieurs navigateurs simultanés se disputent la bande
-passante et le CPU, c'est-à-dire exactement ces deux variables : une mesure de
-couverture faite en parallèle serait ininterprétable. Le runner sort en code 2
-plutôt que de produire un chiffre trompeur.
+Les runs restent **en série**. Le parallélisme a été envisagé puis écarté : la
+couverture dépend de la profondeur du buffer et de la cadence de scan
+(DEV-NOTES §4.1), or plusieurs navigateurs simultanés se disputent la bande
+passante et le CPU — précisément ces deux variables. On mesurerait la
+contention plutôt que le produit.
 
-### Profils
+## Voir ce que l'OCR voit (`--dump-roi`)
 
-Chromium verrouille son dossier de profil, donc chaque worker a besoin du sien.
-Au-delà d'un worker, le runner clone `.profile` dans `.profile-workers/wN` pour
-conserver la session YouTube. Compter ~111 Mo par worker.
+Le composite 2×2 que `RoiComposer` construit — quatre coins cropés, agrandis,
+binarisés — n'existe qu'en mémoire. `--dump-roi` l'exporte pour chaque frame
+analysée, **avant et après binarisation** :
+
+```bash
+node tools/capture-logs.mjs --url "…?v=ID" --ad 3:49-4:53 --full-window --dump-roi
+# → logs/roi/<ID>/00229.4s-1-brut.png
+#   logs/roi/<ID>/00229.4s-2-binarise.png
+```
+
+La paire tranche entre les trois causes possibles d'un échec de lecture :
+
+| Ce qu'on observe | Cause |
+|---|---|
+| le texte est absent de l'image brute | le crop des coins l'a manqué |
+| lisible en brut, effacé après binarisation | `ocrBinarizeThreshold` inadapté |
+| illisible dans les deux | taille ou contraste insuffisants à la source |
+
+Comme `--fault`, le mode travaille sur une **copie** de l'extension dans un
+dossier temporaire : aucun point d'export ne vit dans le code livré. Les images
+vont sur disque et non dans le JSONL, qu'une paire de PNG base64 par frame
+rendrait illisible. Compter ~650 Ko par frame.
 
 ## Injection de panne (`--fault`)
 

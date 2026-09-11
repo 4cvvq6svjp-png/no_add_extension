@@ -27,7 +27,7 @@ import { tmpdir } from "node:os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
-const DEFAULT_PROFILE_DIR = join(__dirname, ".profile");
+const PROFILE_DIR = join(__dirname, ".profile");
 const LOGS_DIR = join(REPO_ROOT, "logs");
 
 /* Vidéo de référence : contient une pub « collaboration commerciale » 3:49→4:57. */
@@ -71,17 +71,39 @@ function requireTimecode(flag, raw) {
 const FAULTS = {
   "sandbox-dead": {
     label: "la sandbox OCR ne signale jamais sa disponibilité",
-    patch: (source) => source.replace(
-      'window.parent.postMessage({ channel: CHANNEL, type: "sandbox-ready" }, "*");',
-      '/* panne injectée : sandbox-ready jamais émis */')
+    needle: 'window.parent.postMessage({ channel: CHANNEL, type: "sandbox-ready" }, "*");',
+    replacement: '/* panne injectée : sandbox-ready jamais émis */'
   },
   "init-error": {
     label: "l'initialisation du moteur échoue",
-    patch: (source) => source.replace(
-      "    async init() {\n      await getWorker();",
-      '    async init() {\n      throw new Error("panne injectée : modèle indisponible");\n      await getWorker();')
+    needle: "    async init() {\n      await getWorker();",
+    replacement: '    async init() {\n      throw new Error("panne injectée : modèle indisponible");\n      await getWorker();'
   }
 };
+
+/**
+ * Exporte l'image que l'OCR analyse réellement, avant ET après binarisation.
+ *
+ * Le composite construit par RoiComposer n'existe qu'en mémoire : personne ne
+ * l'a jamais regardé. La paire avant/après tranche entre trois causes
+ * possibles d'un échec de lecture — le texte est hors du crop, il est écrasé
+ * par la binarisation, ou il est simplement illisible.
+ */
+const ROI_DUMP_PATCH = [
+  [
+    "      this.binarize();\n      return true;",
+    "      this.rawDataUrl = this.canvas.toDataURL(\"image/png\");\n" +
+    "      this.binarize();\n      return true;"
+  ],
+  [
+    "      if (this.ocrBackend === \"text-detector\") {\n" +
+    "        return this.detectWithTextDetector(sampleTime);",
+    "      console.info(\"[NoAdd-ROI]\", sampleTime.toFixed(1), this.roi.rawDataUrl,\n" +
+    "        this.roi.canvas.toDataURL(\"image/png\"));\n\n" +
+    "      if (this.ocrBackend === \"text-detector\") {\n" +
+    "        return this.detectWithTextDetector(sampleTime);"
+  ]
+];
 
 function requireFault(flag, raw) {
   if (!FAULTS[raw]) {
@@ -114,7 +136,7 @@ function parseArgs(argv) {
     fullWindow: false,
     screenshot: null,
     fault: null,
-    profile: DEFAULT_PROFILE_DIR,
+    dumpRoi: false,
     out: null
   };
   for (let i = 2; i < argv.length; i++) {
@@ -126,9 +148,6 @@ function parseArgs(argv) {
       case "--seek-lead": opts.seekLead = requireNumber(a, next()); break;
       case "--grace": opts.grace = requireNumber(a, next()); break;
       case "--out": opts.out = requireValue(a, next()); break;
-      // Un profil dédié rend le parallélisme possible : Chromium verrouille le
-      // dossier de profil, deux instances ne peuvent pas le partager.
-      case "--profile": opts.profile = resolve(requireValue(a, next())); break;
       case "--headless": opts.headless = true; break;
       case "--no-extension": opts.noExtension = true; break;
       case "--passive": opts.passive = true; break;
@@ -136,6 +155,7 @@ function parseArgs(argv) {
       case "--no-seek": opts.noSeek = true; break;
       case "--full-window": opts.fullWindow = true; break;
       case "--fault": opts.fault = requireFault(a, next()); break;
+      case "--dump-roi": opts.dumpRoi = true; break;
       case "--screenshot": opts.screenshot = requireTimecode(a, next()); break;
       case "--ad": {
         const [s, e] = String(next()).split("-");
@@ -305,6 +325,8 @@ function createRecorder(outPath) {
     totalEntries: 0,
     bySource: Object.create(null),
     errors: [],
+    roiDir: null,
+    roiCount: 0,
 
     /**
      * `entry.ts` l'emporte quand l'appelant connaît la date d'émission : le
@@ -313,6 +335,16 @@ function createRecorder(outPath) {
      */
     write(entry) {
       stream.write(JSON.stringify({ ts: Date.now(), ...entry }) + "\n");
+    },
+
+    /** Écrit la paire avant/après binarisation d'une frame analysée. */
+    saveRoi(time, rawDataUrl, binarizedDataUrl) {
+      if (!this.roiDir || !rawDataUrl) return;
+      const decode = (url) => Buffer.from(String(url).split(",")[1] ?? "", "base64");
+      const stamp = String(time).padStart(7, "0");
+      writeFileSync(join(this.roiDir, `${stamp}s-1-brut.png`), decode(rawDataUrl));
+      writeFileSync(join(this.roiDir, `${stamp}s-2-binarise.png`), decode(binarizedDataUrl));
+      this.roiCount += 1;
     },
 
     noteError(message, source = "harness") {
@@ -352,6 +384,13 @@ function attachLogging(page, recorder) {
     const detection = classifyDetection(text, argsValues);
     if (detection) recorder.detections.push({ atWall: emittedAt, ...detection });
 
+    // Les images ROI vont sur disque, pas dans le JSONL : une paire de PNG en
+    // base64 par frame le rendrait illisible.
+    if (text.startsWith("[NoAdd-ROI]")) {
+      recorder.saveRoi(argsValues[1], argsValues[2], argsValues[3]);
+      return;
+    }
+
     if (/OCR Tesseract : échec/.test(text)) recorder.ocrFailures.push({ atWall: emittedAt, text });
     if (/Tesseract désactivé/.test(text)) recorder.ocrDisabled = true;
 
@@ -390,36 +429,50 @@ function attachLogging(page, recorder) {
  *
  * @returns {string} racine de l'extension modifiée
  */
-function buildFaultyExtension(fault) {
-  const root = join(tmpdir(), `no-add-fault-${fault}-${Date.now()}`);
+function buildPatchedExtension(label, patches, file = "pages/ocr-sandbox.js") {
+  const root = join(tmpdir(), `no-add-${label}-${Date.now()}`);
   cpSync(REPO_ROOT, root, {
     recursive: true,
     filter: (src) => !/(\.git|node_modules|\.profile|logs)(\/|$)/.test(src.slice(REPO_ROOT.length))
   });
 
-  const target = join(root, "pages/ocr-sandbox.js");
-  const original = readFileSync(target, "utf8");
-  const patched = FAULTS[fault].patch(original);
-  if (patched === original) {
-    console.error(`Injection "${fault}" sans effet : pages/ocr-sandbox.js a changé, le motif ne correspond plus.`);
-    process.exit(2);
-  }
-  writeFileSync(target, patched);
+  const target = join(root, file);
+  let source = readFileSync(target, "utf8");
 
-  console.log(`💥 Panne injectée « ${fault} » : ${FAULTS[fault].label}`);
-  console.log(`   copie de l'extension : ${root}`);
+  for (const [needle, replacement] of patches) {
+    if (!source.includes(needle)) {
+      console.error(`Patch "${label}" sans effet : ${file} a changé, le motif ne correspond plus.`);
+      console.error(`Motif attendu :\n${needle}`);
+      process.exit(2);
+    }
+    source = source.replace(needle, replacement);
+  }
+  writeFileSync(target, source);
+
+  console.log(`🔧 Extension modifiée « ${label} » : ${root}`);
   return root;
 }
 
+function resolveExtensionRoot(opts) {
+  if (opts.fault) {
+    console.log(`💥 Panne « ${opts.fault} » : ${FAULTS[opts.fault].label}`);
+    return buildPatchedExtension(`fault-${opts.fault}`, [[FAULTS[opts.fault].needle, FAULTS[opts.fault].replacement]]);
+  }
+  if (opts.dumpRoi) {
+    return buildPatchedExtension("dump-roi", ROI_DUMP_PATCH, "content/ocr.js");
+  }
+  return REPO_ROOT;
+}
+
 async function launchBrowser(opts) {
-  const extensionRoot = opts.fault ? buildFaultyExtension(opts.fault) : REPO_ROOT;
+  const extensionRoot = resolveExtensionRoot(opts);
   const extensionArgs = opts.noExtension ? [] : [
     `--disable-extensions-except=${extensionRoot}`,
     `--load-extension=${extensionRoot}`
   ];
   if (opts.noExtension) console.log("⚠ Mode --no-extension : extension NON chargée (diagnostic).");
 
-  const context = await chromium.launchPersistentContext(opts.profile, {
+  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: opts.headless,
     // Chromium fourni par `npx playwright install chromium` (pas le Brave snap,
     // dont le confinement casserait --load-extension + profil custom).
@@ -721,6 +774,9 @@ function printSummary(recorder, verdicts, stopReason) {
     recorder.errors.slice(0, 5).forEach((e) => console.log(`  - ${e}`));
   }
 
+  if (recorder.roiCount > 0) {
+    console.log(`\nImages ROI : ${recorder.roiCount / 2} frames dans ${recorder.roiDir}`);
+  }
   console.log(`\nLog complet : ${recorder.outPath}`);
 }
 
@@ -740,8 +796,15 @@ async function main() {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const recorder = createRecorder(opts.out ? resolve(opts.out) : join(LOGS_DIR, `run-${stamp}.jsonl`));
 
+  if (opts.dumpRoi) {
+    const videoId = opts.url.match(/v=([\w-]+)/)?.[1] ?? "video";
+    recorder.roiDir = join(LOGS_DIR, "roi", videoId);
+    mkdirSync(recorder.roiDir, { recursive: true });
+    console.log(`▶ ROI       : ${recorder.roiDir}`);
+  }
+
   console.log(`▶ Extension : ${REPO_ROOT}`);
-  console.log(`▶ Profil    : ${opts.profile}`);
+  console.log(`▶ Profil    : ${PROFILE_DIR}`);
   console.log(`▶ Sortie    : ${recorder.outPath}`);
   console.log(`▶ URL       : ${opts.url}`);
   if (opts.ads.length) {
