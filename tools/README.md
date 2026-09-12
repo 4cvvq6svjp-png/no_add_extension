@@ -168,7 +168,11 @@ La paire tranche entre les trois causes possibles d'un échec de lecture :
 | illisible dans les deux | taille ou contraste insuffisants à la source |
 
 Comme `--fault`, le mode travaille sur une **copie** de l'extension dans un
-dossier temporaire : aucun point d'export ne vit dans le code livré. Les images
+dossier temporaire : aucun point d'export ne vit dans le code livré. En
+contrepartie, les motifs de patch sont couplés au code source — le harness
+**refuse de démarrer** quand un motif ne correspond plus, plutôt que de lancer
+un run silencieusement sans effet. Si ça arrive, c'est `ROI_DUMP_PATCH` (ou
+`FAULTS`) qu'il faut remettre à jour dans `capture-logs.mjs`. Les images
 vont sur disque et non dans le JSONL, qu'une paire de PNG base64 par frame
 rendrait illisible. Compter ~650 Ko par frame.
 

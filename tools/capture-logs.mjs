@@ -91,15 +91,15 @@ const FAULTS = {
  */
 const ROI_DUMP_PATCH = [
   [
-    "      this.binarize();\n      return true;",
+    "      if (adaptive) {\n        this.binarizeAdaptive(cellWidth, cellHeight);",
     "      this.rawDataUrl = this.canvas.toDataURL(\"image/png\");\n" +
-    "      this.binarize();\n      return true;"
+    "      if (adaptive) {\n        this.binarizeAdaptive(cellWidth, cellHeight);"
   ],
   [
     "      if (this.ocrBackend === \"text-detector\") {\n" +
     "        return this.detectWithTextDetector(sampleTime);",
-    "      console.info(\"[NoAdd-ROI]\", sampleTime.toFixed(1), this.roi.rawDataUrl,\n" +
-    "        this.roi.canvas.toDataURL(\"image/png\"));\n\n" +
+    "      console.info(\"[NoAdd-ROI]\", `${sampleTime.toFixed(1)}${adaptive ? \"-adaptatif\" : \"\"}`,\n" +
+    "        this.roi.rawDataUrl, this.roi.canvas.toDataURL(\"image/png\"));\n\n" +
     "      if (this.ocrBackend === \"text-detector\") {\n" +
     "        return this.detectWithTextDetector(sampleTime);"
   ]
