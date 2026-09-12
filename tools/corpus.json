@@ -4,7 +4,7 @@
   "warning": "Les paramètres &t=… des liens YouTube d'origine ne correspondent à rien : seules les fenêtres ci-dessous font foi.",
   "conventions": {
     "ad": "Fenêtre d'intégration commerciale, en secondes depuis le début de la vidéo.",
-    "seconds": "Plafond de sécurité du run en temps RÉEL, pas une position vidéo : couvre démarrage + seek-lead + durée de la fenêtre.",
+    "seconds": "Plafond de sécurité du run en temps RÉEL, pas une position vidéo. Doit couvrir démarrage + seek de mise en place + durée de la fenêtre, avec de la marge : un seek profond qui doit réessayer mange le budget, et deux vidéos sortaient en TIMEOUT avec 240 s alors que la détection fonctionnait.",
     "note": "Précaution de lecture. Aucun réglage n'est pré-appliqué : la ligne de base se mesure avec les valeurs par défaut."
   },
   "videos": [
@@ -14,7 +14,7 @@
         "start": 229,
         "end": 297
       },
-      "seconds": 300,
+      "seconds": 360,
       "reference": true,
       "note": "Vidéo de référence : toute la ligne de base historique porte sur elle."
     },
@@ -24,7 +24,7 @@
         "start": 645,
         "end": 747
       },
-      "seconds": 300
+      "seconds": 360
     },
     {
       "id": "AiytemqB_F0",
@@ -32,7 +32,7 @@
         "start": 74,
         "end": 124
       },
-      "seconds": 240,
+      "seconds": 360,
       "note": "Pub très tôt : le seek de mise en place tombe près du début, le look-ahead manque de buffer (§4.1). Un MISS peut être un manque d'avance plutôt qu'un défaut de lecture — comparer avec --seek-lead 45."
     },
     {
@@ -41,7 +41,7 @@
         "start": 229,
         "end": 293
       },
-      "seconds": 240,
+      "seconds": 360,
       "note": "fenêtre quasi identique à la vidéo de réf."
     },
     {
@@ -50,7 +50,7 @@
         "start": 209,
         "end": 222
       },
-      "seconds": 180,
+      "seconds": 360,
       "note": "la plus courte : marge d'erreur minimale, teste la latence de détection"
     },
     {
@@ -59,7 +59,7 @@
         "start": 68,
         "end": 129
       },
-      "seconds": 240,
+      "seconds": 360,
       "note": "pub très tôt : peu de buffer d'avance disponible Pub très tôt : le seek de mise en place tombe près du début, le look-ahead manque de buffer (§4.1). Un MISS peut être un manque d'avance plutôt qu'un défaut de lecture — comparer avec --seek-lead 45."
     },
     {
@@ -68,7 +68,7 @@
         "start": 87,
         "end": 173
       },
-      "seconds": 300,
+      "seconds": 360,
       "note": "pub très tôt (idem) Pub très tôt : le seek de mise en place tombe près du début, le look-ahead manque de buffer (§4.1). Un MISS peut être un manque d'avance plutôt qu'un défaut de lecture — comparer avec --seek-lead 45."
     },
     {
@@ -77,7 +77,7 @@
         "start": 1036,
         "end": 1125
       },
-      "seconds": 300,
+      "seconds": 360,
       "note": "cas difficile : bandeau peu lisible même pour un humain. Perfs attendues plus faibles ; c'est le test final, pas un critère de blocage"
     },
     {
@@ -86,7 +86,7 @@
         "start": 215,
         "end": 302
       },
-      "seconds": 300
+      "seconds": 360
     },
     {
       "id": "IL6YjqAlBa4",
@@ -94,7 +94,7 @@
         "start": 968,
         "end": 1004
       },
-      "seconds": 240,
+      "seconds": 360,
       "note": "courte, tardive"
     }
   ]

@@ -39,6 +39,13 @@
     // Binarisation : le texte de disclosure est quasi-blanc. On ne garde que
     // les pixels très clairs (texte) → noir sur blanc, lisible par Tesseract.
     ocrBinarizeThreshold: 190,
+    // Certains créateurs affichent un texte SOMBRE sur une boîte claire :
+    // le seuil fixe efface alors tout. Quand la première passe ne trouve rien,
+    // on recompose avec un seuil calculé par cellule (Otsu) et on réessaie.
+    // Une seconde passe seulement sur les frames qui échouaient déjà : aucune
+    // régression possible sur celles qui fonctionnent, et aucun coût ajouté
+    // quand la détection réussit du premier coup.
+    ocrAdaptiveFallback: true,
     // Commit proactif d'un segment autour de chaque détection (look-ahead) :
     // marge avant + fenêtre en avant, fusionnées au fil des détections.
     segmentStartPadSeconds: 8,
@@ -62,6 +69,15 @@
     urlWatchPollMs: 900,
     notifierTimeoutMs: 2500,
 
+    /* --- Correspondance des mots-clés --------------------------------- */
+    // Budget d'erreurs toléré par mot-clé : longueur / diviseur, plafonné.
+    // L'OCR insère et substitue des caractères (« publhocité » pour
+    // « publicité ») et le crop peut amputer un mot (« commercia »). Un budget
+    // proportionnel laisse les mots courts stricts — « sponsor » n'a droit
+    // qu'à une erreur — tout en tolérant deux fautes sur « publicite ».
+    keywordEditDivisor: 4,
+    keywordMaxEdits: 2,
+
     /* --- Plafonds et seuils d'abandon --------------------------------- */
     maxCapturedSegments: 30,
     maxMp4AccumBytes: 8_000_000,
@@ -84,15 +100,23 @@
 
   /**
    * Formulations de disclosure recherchées, écrites sans accent : la
-   * comparaison se fait sur du texte normalisé (voir util.js).
+   * comparaison se fait sur du texte normalisé et TOLÉRANT (voir util.js).
    *
-   * La recherche est par SOUS-CHAÎNE, donc « sponsor » couvre déjà « contenu
-   * sponsorisé », « vidéo sponsorisée » et « sponsorisé par » — les lister
-   * séparément n'ajoutait aucune détection.
+   * Deux principes, tous deux issus de la mesure sur le corpus :
+   *
+   * - **Des mots isolés, pas des locutions.** « collaboration commerciale »
+   *   s'affiche souvent avec le premier mot en graisse fine, que la
+   *   binarisation détruit ; l'OCR ne rend alors que « COMMERCIALE ». Exiger
+   *   la locution complète faisait échouer 5 vidéos sur 10 alors que le texte
+   *   était parfaitement lu. Chercher les deux mots séparément a porté la
+   *   détection de 4 à 9 vidéos sur 10.
+   * - **Des radicaux courts.** « commercial » couvre « commerciale »,
+   *   « commerciaux » et « communication commerciale ». Lister les locutions
+   *   en plus n'ajoutait aucune détection : elles sont subsumées.
    */
   const COMMERCIAL_KEYWORDS = [
-    "collaboration commerciale",
-    "communication commerciale",
+    "collaboration",
+    "commercial",
     "partenariat remunere",
     "publicite",
     "sponsor"

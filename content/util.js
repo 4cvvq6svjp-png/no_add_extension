@@ -8,7 +8,7 @@
   "use strict";
 
   const NoAdd = (window.__NoAdd ??= {});
-  const { EXTENSION_TAG, COMMERCIAL_KEYWORDS } = NoAdd;
+  const { EXTENSION_TAG, CONFIG, COMMERCIAL_KEYWORDS } = NoAdd;
 
   function logInfo(message, extra) {
     console.info(EXTENSION_TAG, message, ...(extra === undefined ? [] : [extra]));
@@ -29,8 +29,46 @@
       .toLowerCase();
   }
 
-  /** Liste normalisée une fois au chargement, pas à chaque frame analysée. */
-  const NORMALIZED_KEYWORDS = COMMERCIAL_KEYWORDS.map(normalizeText);
+  /**
+   * Distance d'édition minimale entre `needle` et une sous-chaîne quelconque de
+   * `haystack` : préfixe et suffixe libres.
+   *
+   * C'est de la recherche approchée de sous-chaîne, pas une comparaison de
+   * chaînes entières — l'OCR rend le mot-clé noyé dans du bruit, et on veut
+   * savoir s'il s'y trouve à quelques fautes près. La première ligne de la
+   * matrice reste à zéro (on peut commencer n'importe où) et on lit le minimum
+   * de la dernière (on peut finir n'importe où).
+   */
+  function approximateDistance(haystack, needle) {
+    if (!needle) return 0;
+
+    let previous = new Array(haystack.length + 1).fill(0);
+
+    for (let i = 1; i <= needle.length; i++) {
+      const current = new Array(haystack.length + 1);
+      current[0] = i;
+
+      for (let j = 1; j <= haystack.length; j++) {
+        const substitution = previous[j - 1] + (needle[i - 1] === haystack[j - 1] ? 0 : 1);
+        current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, substitution);
+      }
+
+      previous = current;
+    }
+
+    return Math.min(...previous);
+  }
+
+  /** Nombre de fautes toléré sur un mot-clé, proportionnel à sa longueur. */
+  function keywordEditBudget(keyword) {
+    return Math.min(CONFIG.keywordMaxEdits, Math.floor(keyword.length / CONFIG.keywordEditDivisor));
+  }
+
+  /** Mots-clés normalisés et leur budget, calculés une fois au chargement. */
+  const NORMALIZED_KEYWORDS = COMMERCIAL_KEYWORDS.map((keyword) => {
+    const text = normalizeText(keyword);
+    return { text, budget: keywordEditBudget(text) };
+  });
 
   function extractCommercialKeywords(rawText) {
     const normalized = normalizeText(rawText);
@@ -39,7 +77,13 @@
       return [];
     }
 
-    return NORMALIZED_KEYWORDS.filter((keyword) => normalized.includes(keyword));
+    return NORMALIZED_KEYWORDS
+      .filter(({ text, budget }) =>
+        // Le cas exact est de loin le plus fréquent : on l'écarte avant de
+        // payer la matrice de distance.
+        normalized.includes(text) ||
+        (budget > 0 && approximateDistance(normalized, text) <= budget))
+      .map(({ text }) => text);
   }
 
   function combineSources(previousSource, nextSource) {
@@ -124,6 +168,7 @@
   NoAdd.logInfo = logInfo;
   NoAdd.logWarn = logWarn;
   NoAdd.normalizeText = normalizeText;
+  NoAdd.approximateDistance = approximateDistance;
   NoAdd.extractCommercialKeywords = extractCommercialKeywords;
   NoAdd.combineSources = combineSources;
   NoAdd.sleep = sleep;

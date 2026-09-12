@@ -109,13 +109,13 @@ test("une source sans dimensions est refusée au lieu d'être analysée", () => 
 /*  Mots-clés                                                             */
 /* --------------------------------------------------------------------- */
 
-test("la liste réduite couvre toujours toutes les formulations", () => {
+test("les formulations réelles sont détectées", () => {
   const cases = [
     ["Contenu sponsorisé", ["sponsor"]],
-    ["Vidéo sponsorisée", ["sponsor"]],
     ["sponsorisé par ACME", ["sponsor"]],
-    ["Collaboration commerciale", ["collaboration commerciale"]],
-    ["COMMUNICATION COMMERCIALE", ["communication commerciale"]],
+    ["Collaboration commerciale", ["collaboration", "commercial"]],
+    ["COLLABORATION COMMERCIALE", ["collaboration", "commercial"]],
+    ["COMMUNICATION COMMERCIALE", ["commercial"]],
     ["Partenariat rémunéré", ["partenariat remunere"]],
     ["Publicité", ["publicite"]],
     ["une vidéo tout à fait normale", []],
@@ -123,8 +123,49 @@ test("la liste réduite couvre toujours toutes les formulations", () => {
   ];
 
   for (const [text, expected] of cases) {
-    assert.deepEqual(extractCommercialKeywords(text), expected, text);
+    assert.deepEqual(extractCommercialKeywords(text).sort(), expected.sort(), text);
   }
+});
+
+test("un mot-clé isolé suffit : le premier mot est souvent illisible", () => {
+  // Le bandeau écrit « COLLABORATION » en graisse fine et « COMMERCIALE » en
+  // gras ; la binarisation ne laisse que le second. Exiger la locution
+  // complète faisait échouer 5 vidéos du corpus sur 10.
+  assert.deepEqual(extractCommercialKeywords("COMMERCIALE"), ["commercial"]);
+  assert.deepEqual(extractCommercialKeywords("LABORATION COMMERCIALE"), ["commercial"]);
+});
+
+test("les quasi-mots produits par l'OCR sont rattrapés", () => {
+  // Tous relevés dans les logs du corpus.
+  for (const lu of ["publhocité", "publicito", "publicte"]) {
+    assert.deepEqual(extractCommercialKeywords(lu), ["publicite"], lu);
+  }
+  // Mot amputé par le crop, observé sur FOrRFw9PPvw.
+  assert.deepEqual(extractCommercialKeywords("Collaboration commercia").sort(),
+                   ["collaboration", "commercial"]);
+});
+
+test("le budget d'erreurs reste proportionnel : les mots courts sont stricts", () => {
+  // « sponsor » (7 lettres) n'a droit qu'à une faute.
+  assert.deepEqual(extractCommercialKeywords("sponsar"), ["sponsor"]);
+  assert.deepEqual(extractCommercialKeywords("spinsar"), [], "deux fautes : refusé");
+});
+
+test("le bruit OCR ne déclenche rien", () => {
+  // Textes réellement lus hors fenêtres de pub dans le corpus.
+  for (const bruit of ["nf", "l -", "Yrrif.", "A8 fee fear TS 4 JA", "(4/2)",
+                       "amazon music", "— me »", "Pine 9 * + | Ju 4;"]) {
+    assert.deepEqual(extractCommercialKeywords(bruit), [], bruit);
+  }
+});
+
+test("approximateDistance cherche une sous-chaîne, pas la chaîne entière", () => {
+  const { approximateDistance } = globalThis.__NoAdd;
+
+  assert.equal(approximateDistance("xx publicite yy", "publicite"), 0, "présent tel quel");
+  assert.equal(approximateDistance("xx publhocite yy", "publicite"), 2, "une insertion, une substitution");
+  assert.equal(approximateDistance("", "publicite"), 9, "texte vide : tout le mot manque");
+  assert.equal(approximateDistance("pu", "publicite"), 7, "texte trop court pour matcher");
 });
 
 /* --------------------------------------------------------------------- */
@@ -170,4 +211,22 @@ test("findSegmentForTime borne à droite et rejette les temps non finis", () => 
 test("combineSources dédoublonne les étiquettes", () => {
   assert.equal(combineSources("a+b", "b+c"), "a+b+c");
   assert.equal(combineSources("ahead-ocr", "ahead-ocr"), "ahead-ocr");
+});
+
+/* --------------------------------------------------------------------- */
+/*  Binarisation adaptative                                              */
+/* --------------------------------------------------------------------- */
+
+test("compose accepte un mode adaptatif sans changer la géométrie", () => {
+  const composer = new RoiComposer();
+  const source = { width: 1920, height: 1080 };
+
+  assert.equal(composer.compose(source), true);
+  const fixe = [composer.canvas.width, composer.canvas.height];
+  const drawsFixe = composer.ctx.draws.length;
+
+  assert.equal(composer.compose(source, { adaptive: true }), true);
+  assert.deepEqual([composer.canvas.width, composer.canvas.height], fixe,
+    "le mode adaptatif ne touche qu'au seuil, pas au découpage");
+  assert.equal(composer.ctx.draws.length, drawsFixe * 2, "toujours 4 coins dessinés");
 });
