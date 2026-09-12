@@ -605,6 +605,81 @@ désactivation avant que le seuil de cinq échecs ne soit atteignable dans la
 durée du run. Un test qui échoue sur du code fraîchement écrit n'est pas
 forcément un test qui a raison.
 
+### 2.13 Généralisation multi-vidéos : ce que dix vidéos ont appris *(2026-09-12)*
+
+Le corpus annoté (`tools/corpus.json`, 10 vidéos, 9 créateurs) a servi de banc
+d'essai. Ligne de base initiale : **4 vidéos détectées sur 10**.
+
+**Le pipeline généralise ; la lecture aussi.** Sur les six échecs, 32 à 53
+frames décodées et OCRisées par vidéo. Mieux : l'OCR *lisait* le bandeau —
+`COMMERCIALE` sur 18 frames sur 18 pour `sJZBUk0nO5E`, `Collaboration
+commercia` sur 10 sur 10 pour `FOrRFw9PPvw`, `collaboration commerciale` sur 6
+sur 9 pour `IL6YjqAlBa4`. Toutes en MISS. **Le défaut n'était ni l'interception,
+ni le décodage, ni l'OCR : c'était la règle de correspondance.**
+
+Le mode `--dump-roi` (voir `tools/README.md`) a été écrit pour ça : exporter le
+composite que l'OCR analyse, avant et après binarisation. Sans ces images, le
+diagnostic était impossible — j'avais formulé puis dû abandonner l'hypothèse
+d'un mauvais emplacement du crop, réfutée par capture d'écran.
+
+**Quatre mécanismes distincts**, tous invisibles depuis les compteurs :
+
+1. *Érosion du mot en graisse fine.* Le bandeau écrit « COLLABORATION » en fin
+   et « COMMERCIALE » en gras ; la binarisation détruit les traits fins.
+2. *Troncature par le crop.* Un bandeau plus large que 30 % du cadre sort de la
+   cellule : l'OCR lit `Collaboration commercia`, amputé.
+3. *Polarité inversée.* Texte sombre sur boîte claire — le seuil fixe efface
+   tout.
+4. *Plafond de mesure trop court.* Deux vidéos sortaient en TIMEOUT alors que la
+   détection fonctionnait : un défaut du harness, pas du produit.
+
+Les correctifs (§2.12 des commits : mots-clés isolés, correspondance approchée,
+binarisation adaptative en repli) traitent les trois premiers ; les plafonds du
+corpus ont été relevés à 360 s.
+
+### Les pubs YouTube polluaient la mesure
+
+Deux anomalies ont résisté longtemps : la même vidéo, même codec, même
+résolution, donnait deux runs aux contenus lus **différents aux mêmes
+horodatages** — `COLLABORATION COMMERCIALE` sur 14 frames d'un côté, `(4/2)` et
+une pièce aux néons de l'autre. Et la vidéo de référence, jamais tombée en
+trente runs, a rendu 40 frames de `SHOW` et `Lu) nusna` sans un seul match.
+
+J'ai d'abord soupçonné `timestampOffset` (défaut réel, voir plus bas), puis une
+régression de la passe adaptative. Les deux étaient faux : deux runs de contrôle
+de la référence donnent SKIP avec 9 matches chacun.
+
+L'explication est ailleurs, et une frame la donne : à 96 s, l'OCR lit
+`THE ® Tree CONSTRUCTION OREIT SHOW`. Ce n'est pas la vidéo de référence —
+**c'est une publicité YouTube**. Pendant une pub, MSE transporte SES segments :
+l'extension analyse ses images, avec sa propre timeline. Un run dont la fenêtre
+tombe pendant une pub YouTube n'observe pas la vidéo annotée du tout.
+
+Et le harness **absorbait ces pubs silencieusement** — `handleAds` n'écrivait
+rien. D'où des heures passées à chercher un défaut produit là où il n'y avait
+qu'un artefact de mesure. Il trace désormais chaque pub absorbée, sa durée, et
+avertit dans le résumé qu'un MISS ou un TIMEOUT peut n'être que ça.
+
+**Leçon de méthode** : un harness qui corrige silencieusement une condition
+anormale ment sur ce qu'il a mesuré. Toute compensation automatique doit laisser
+une trace.
+
+### `timestampOffset` capté mais jamais appliqué
+
+Relevé au passage et confirmé par lecture du code. L'interceptor patche le
+setter de `SourceBuffer.timestampOffset` et `MseSegmentBuffer` conserve la
+valeur par segment, mais elle ne sert qu'à détecter une discontinuité de
+réassemblage : `DecoderSandbox.scanSegment` ne la transmet pas, et
+`parseMediaSegment` calcule ses horodatages depuis le conteneur seul.
+
+YouTube s'en sert pour recoller deux périodes — insertion publicitaire,
+changement de rendition, reprise après seek. Un offset non nul décalerait donc
+silencieusement tous les segments stockés par rapport à `video.currentTime`, et
+aucun compteur ne le montrerait.
+
+Mesuré sur plusieurs runs : **tous les offsets valent zéro**. Le défaut est réel
+mais latent. Le heartbeat rapporte désormais `tsOffsets`.
+
 ---
 
 ## 3. Résultats validés (vidéo de réf `vRAPfDSmBGM`, pub 3:49–4:57)

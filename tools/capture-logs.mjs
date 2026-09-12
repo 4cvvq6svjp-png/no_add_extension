@@ -263,12 +263,29 @@ async function isAdShowing(page) {
   }).catch(() => false);
 }
 
-/** Attend/skippe les pubs servies par YouTube (celles qui resettent le seek). */
-async function handleAds(page, maxWaitMs = 60000) {
+/**
+ * Attend/skippe les pubs servies par YouTube.
+ *
+ * Ces pubs ne font pas que retarder la lecture : pendant leur diffusion, MSE
+ * transporte LEURS segments, donc l'extension analyse leurs images avec leur
+ * propre timeline. Un run dont la fenêtre tombe pendant une pub YouTube
+ * n'observe pas la vidéo annotée — d'où la trace, sans laquelle on prend ça
+ * pour un défaut de détection.
+ */
+async function handleAds(page, maxWaitMs = 60000, recorder = null) {
   const deadline = Date.now() + maxWaitMs;
+  const startedAt = Date.now();
   let sawAd = false;
   while (Date.now() < deadline) {
-    if (!(await isAdShowing(page))) return sawAd;
+    if (!(await isAdShowing(page))) {
+      if (sawAd) {
+        const seconds = ((Date.now() - startedAt) / 1000).toFixed(0);
+        console.log(`  ⏭ pub YouTube absorbée (${seconds}s) — l'extension a analysé SES images pendant ce temps`);
+        recorder?.write({ source: "harness", level: "ad-break", text: `pub YouTube ${seconds}s` });
+        recorder?.noteAdBreak();
+      }
+      return sawAd;
+    }
     sawAd = true;
     await page.evaluate(() => {
       const b = document.querySelector(
@@ -282,9 +299,9 @@ async function handleAds(page, maxWaitMs = 60000) {
 }
 
 /** Seek + confirmation que le playhead a bien atterri (retries si pub/reset). */
-async function seekAndConfirm(page, target) {
+async function seekAndConfirm(page, target, recorder = null) {
   for (let attempt = 0; attempt < 6; attempt++) {
-    await handleAds(page);
+    await handleAds(page, 60000, recorder);
     await seekTo(page, target);
     await ensurePlaying(page);
     for (let i = 0; i < 16; i++) {
@@ -325,6 +342,7 @@ function createRecorder(outPath) {
     totalEntries: 0,
     bySource: Object.create(null),
     errors: [],
+    adBreaks: 0,
     roiDir: null,
     roiCount: 0,
 
@@ -345,6 +363,10 @@ function createRecorder(outPath) {
       writeFileSync(join(this.roiDir, `${stamp}s-1-brut.png`), decode(rawDataUrl));
       writeFileSync(join(this.roiDir, `${stamp}s-2-binarise.png`), decode(binarizedDataUrl));
       this.roiCount += 1;
+    },
+
+    noteAdBreak() {
+      this.adBreaks += 1;
     },
 
     noteError(message, source = "harness") {
@@ -538,8 +560,8 @@ async function runLoginMode(page) {
 }
 
 /** Seek au timestamp voulu, laisse s'afficher, capture la frame. */
-async function runScreenshotMode(page, opts, stamp) {
-  await seekAndConfirm(page, opts.screenshot);
+async function runScreenshotMode(page, opts, stamp, recorder) {
+  await seekAndConfirm(page, opts.screenshot, recorder);
   await sleep(2500);
 
   const shotPath = join(LOGS_DIR, `frame-${Math.round(opts.screenshot)}s-${stamp}.png`);
@@ -586,11 +608,11 @@ async function judgeAdWindow(page, ad, opts, recorder, globalDeadline) {
   if (opts.noSeek) {
     console.log(`\n▶ Pub [${start}-${end}s] — lecture continue (--no-seek), on attend que le playhead y arrive…`);
     // Absorbe la/les pub(s) YouTube pré-roll avant de compter le temps.
-    if (await handleAds(page, 90000)) console.log("  ⏭ pub YouTube pré-roll passée.");
+    await handleAds(page, 90000, recorder);
     await ensurePlaying(page);
   } else {
     console.log(`\n⏩ Pub [${start}-${end}s] — seek à ${seekTarget}s…`);
-    const landed = await seekAndConfirm(page, seekTarget);
+    const landed = await seekAndConfirm(page, seekTarget, recorder);
     if (!landed) console.log("  ⚠ seek non confirmé (pub persistante ?) — observation quand même.");
   }
 
@@ -615,7 +637,7 @@ async function judgeAdWindow(page, ad, opts, recorder, globalDeadline) {
     // Pub YouTube en cours : on la passe. Le playhead du contenu ne bouge pas
     // pendant une pub → ne pas compter ça comme un blocage.
     if (await isAdShowing(page)) {
-      await handleAds(page);
+      await handleAds(page, 60000, recorder);
       await ensurePlaying(page);
       lastProgressWall = Date.now();
       lastCt = await getCurrentTime(page);
@@ -625,7 +647,7 @@ async function judgeAdWindow(page, ad, opts, recorder, globalDeadline) {
     // Mode seek uniquement : lecture réinitialisée sous la fenêtre → re-seek.
     if (!opts.noSeek && ct !== null && ct < seekTarget - 10) {
       console.log(`  ↻ reset détecté (t=${ct}s) — re-seek à ${seekTarget}s…`);
-      await seekAndConfirm(page, seekTarget);
+      await seekAndConfirm(page, seekTarget, recorder);
       lastProgressWall = Date.now();
       lastCt = await getCurrentTime(page);
       continue;
@@ -765,6 +787,12 @@ function printSummary(recorder, verdicts, stopReason) {
     console.log("⚠ Aucun heartbeat capturé — l'AheadScanner n'a peut-être pas démarré.");
   }
 
+  if (recorder.adBreaks > 0) {
+    console.log(`\n⚠ ${recorder.adBreaks} pub(s) YouTube absorbée(s) pendant ce run.`);
+    console.log("  Pendant une pub, l'extension analyse les images de la PUB, pas de la vidéo :");
+    console.log("  un MISS ou un TIMEOUT peut n'être qu'un artefact de mesure.");
+  }
+
   const skips = recorder.detections.filter((d) => d.kind === "skip").length;
   const ocrHits = recorder.detections.filter((d) => d.kind === "ocr-keyword").length;
   console.log(`\nSignaux détectés : ${recorder.detections.length} (skips=${skips}, ocr-keyword=${ocrHits})`);
@@ -834,7 +862,7 @@ async function main() {
     await ensurePlaying(page);
 
     if (opts.screenshot !== null) {
-      await runScreenshotMode(page, opts, stamp);
+      await runScreenshotMode(page, opts, stamp, recorder);
       await context.close().catch(() => {});
       recorder.close();
       process.exit(0);
