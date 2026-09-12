@@ -708,6 +708,52 @@ Elle prédisait l'état antérieur au dixième près (68/2,13 − 9,4 = 22,6s po
 mesurées). **Le nombre de sauts n'est donc pas la cause** — seuls comptent les
 deux termes : la vitesse de scan (§2.5) et l'avance accumulée (§2.6).
 
+
+### Généralisation : 10 vidéos sur 10 *(run du 2026-09-12, passe détection)*
+
+`node tools/run-corpus.mjs` sur les 10 vidéos du corpus, après les correctifs
+de §2.13 (mots-clés isolés, correspondance approchée, binarisation adaptative
+en repli, plafonds à 360 s) :
+
+| | 2026-09-10 | 2026-09-12 (6/10) | 2026-09-12 (après §2.13) |
+|---|---|---|---|
+| Vidéos détectées | 4 / 10 | 6 / 10 | **10 / 10** |
+| Durée totale | 24,3 min | 27,5 min | **5,1 min** |
+| TIMEOUT | 2 | 4 | **0** |
+
+Vérification faite avant de signer le chiffre — **les dix détections tombent
+dans leur fenêtre annotée**, sur une frame comprise entre le début de la fenêtre
+et 7 s avant :
+
+| fenêtre | frame détectée | segment OCR posé |
+|---|---|---|
+| 229–297 | 230 | 222–235 |
+| 645–747 | 648 | 640–653 |
+| 74–124 | 76 | 68–81 |
+| 229–293 | 234 | 226–239 |
+| 209–222 | 210 | 202–215 |
+| 68–129 | 72 | 64–77 |
+| 87–173 | 91 | 83–96 |
+| 1036–1125 | 1044 | 1036–1049 |
+| 215–302 | 215 | 207–220 |
+| 968–1004 | 973 | 965–978 |
+
+Aucun faux positif : une seule frame `keyword=true` par vidéo, la passe
+détection s'arrêtant au premier match.
+
+**Ce que ce run ne prouve pas.** Aucune pub YouTube n'a été servie — la nouvelle
+trace de §2.13 est restée muette sur les dix vidéos. L'hypothèse « les pubs
+polluaient la mesure » est donc *compatible* avec ce résultat, pas démontrée par
+lui : il faudra un run contaminé, cette fois tracé, pour la confirmer. Le run du
+6/10 est par ailleurs suspect en lui-même — ses quatre TIMEOUT sont les quatre
+premières vidéos dans l'ordre chronologique, les six suivantes passant toutes,
+ce qui ressemble à une condition transitoire de début de session plutôt qu'à un
+défaut par vidéo.
+
+Enfin la passe détection ne mesure que la lecture du mot-clé dans la fenêtre.
+Le saut réel reste couvert par §3 sur la vidéo de référence et par
+`--full-window`.
+
 ---
 
 ## 4. Pistes d'amélioration (à reprendre)
