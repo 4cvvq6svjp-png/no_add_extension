@@ -754,6 +754,69 @@ Enfin la passe détection ne mesure que la lecture du mot-clé dans la fenêtre.
 Le saut réel reste couvert par §3 sur la vidéo de référence et par
 `--full-window`.
 
+
+### Ce qu'une pub coûte vraiment, et le réglage qui le réduit *(2026-09-14)*
+
+Mesuré avec `tools/ad-seen.mjs`, qui décompose la pub vue en trois postes —
+ils ne se corrigent pas avec les mêmes leviers.
+
+Ligne de base à `segmentForwardSeconds: 5`, 18 runs, 1263s de pub :
+
+| poste | total | part |
+|---|---|---|
+| tête — avant le 1er saut | 1,2s | 0 % |
+| milieu — entre deux sauts | 179,3s | 65 % |
+| queue — après le dernier saut | 94,0s | 34 % |
+
+**La détection ne coûte rien** : le look-ahead reconnaît la pub quasi
+instantanément. Tout le coût est en aval. Le milieu se calcule presque
+exactement — ~1,9s par saut, le prix d'une reconfirmation OCR. La queue, elle,
+disait quelque chose d'inattendu : le dernier saut s'arrête **avant** la fin de
+la pub dans 13 runs sur 18 (médiane −1,5s, pire −29,2s). Le réglage prudent
+l'était du mauvais côté — on sous-estimait la fin de pub, on ne la dépassait
+pas. Le débord maximum observé était de +5,6s.
+
+### La première campagne A/B était ininterprétable
+
+Un lot complet à 5 puis un lot complet à 10. Le second a rendu 8 TIMEOUT contre
+2, avec des effondrements de rendition jusqu'en 240p, et 12 pubs mesurables
+contre 18 : les deux lots ne portaient plus sur les mêmes vidéos. L'écart
+agrégé mélangeait l'effet du réglage et un changement de distribution, et pris
+au premier degré il disait « 10 est pire ».
+
+`tools/ab-forward.mjs` alterne donc les valeurs **sur la même vidéo, dos à
+dos**. Les trois réglages voient la même bande passante et la même rendition ;
+seules les fenêtres mesurées sous les trois valeurs sont comparées.
+
+Résultat apparié, 8 fenêtres, 503s de pub par réglage :
+
+| | pub vue | sautée | queue | sauts | coût/saut | contenu légitime perdu |
+|---|---|---|---|---|---|---|
+| 5 | 123,5s | 75,5 % | 26,3s | 53 | 1,83s | 0,0s (0/8) |
+| **10** | **112,3s** | **77,7 %** | **17,2s** | 46 | 2,07s | **3,7s (2/8), pire +3,4s** |
+| 12 | 107,2s | 78,7 % | 10,7s | 38 | 2,54s | 7,7s (4/8), pire +3,5s |
+
+**Le gain vient de la queue, pas du nombre de sauts.** Celui-ci baisse bien
+(53 → 46 → 38) mais le coût par saut monte d'autant (1,83 → 2,07 → 2,54s), si
+bien que le poste « milieu » ne bouge quasiment pas (97,2 → 95,2 → 96,5s). La
+prédiction « moins de sauts donc moins de coût » était fausse.
+
+Retenu : **10**. En marginal, 5 → 10 économise 11,2s de pub pour 3,7s de
+contenu mangé (3 pour 1) ; 10 → 12 n'économise plus que 5,1s pour 4,0s de plus
+(1,3 pour 1). Au-delà de 10 on paie presque une seconde de vraie vidéo par
+seconde de pub évitée.
+
+Réserve : 8 paires, et la variance par vidéo reste forte (`[87-173]` gagne
+14,2s en passant à 12, `[968-1004]` en perd 11,2s). C'est la monotonie sur
+trois réglages qui porte la conclusion, pas l'écart sur une vidéo.
+
+### Ce que `lbLj5Yb6SAE` ne doit pas à ce réglage
+
+Sa queue valait 29,2s et 24,2s : la sonde concluait que la pub finissait à
+~1096s alors qu'elle finit à 1125s. Allonger la projection la ramène à 19,2s
+mais ne la règle pas — c'est une perte de lecture du bandeau sur la fin du
+segment, pas une projection trop courte. Sujet distinct.
+
 ---
 
 ## 4. Pistes d'amélioration (à reprendre)

@@ -49,10 +49,31 @@
     // Commit proactif d'un segment autour de chaque détection (look-ahead) :
     // marge avant + fenêtre en avant, fusionnées au fil des détections.
     segmentStartPadSeconds: 8,
-    // Projection AVEUGLE en avant sur une détection. Volontairement courte (~1
-    // GOP) : c'est la sonde qui établit la vraie fin de pub. Une valeur large
-    // faisait dépasser la fin réelle d'autant sur la dernière frame positive.
-    segmentForwardSeconds: 5,
+    // Projection AVEUGLE en avant sur une détection ; c'est la sonde qui
+    // établit ensuite la vraie fin de pub.
+    //
+    // Longtemps réglée à 5 (~1 GOP) par crainte de dépasser la fin réelle. La
+    // mesure a montré l'inverse : à 5, le dernier saut s'arrêtait AVANT la fin
+    // de la pub dans 13 runs sur 18, et cette queue coûtait 34 % de toute la
+    // pub vue. On sous-estimait, on ne débordait pas.
+    //
+    // A/B apparié sur 8 fenêtres (tools/ab-forward.mjs, les trois valeurs dos à
+    // dos sur chaque vidéo pour neutraliser la dérive du réseau) :
+    //
+    //        pub vue   queue   contenu légitime perdu
+    //   5     123,5s   26,3s   0,0s
+    //  10     112,3s   17,2s   3,7s  (pire cas +3,4s)
+    //  12     107,2s   10,7s   7,7s  (pire cas +3,5s)
+    //
+    // 10 prend l'essentiel du gain : passer de 5 à 10 économise 11,2s de pub
+    // pour 3,7s de contenu mangé (3 pour 1), alors que 10 → 12 n'économise plus
+    // que 5,1s pour 4,0s de plus (1,3 pour 1) — on y paie presque une seconde
+    // de vraie vidéo par seconde de pub évitée.
+    //
+    // Le gain vient de la QUEUE, pas du nombre de sauts : celui-ci baisse bien
+    // (53 → 46 → 38) mais le coût par saut monte d'autant (1,83 → 2,07 →
+    // 2,54s), si bien que le poste « milieu » ne bouge pas.
+    segmentForwardSeconds: 10,
     // Garde-fou anti sur-saut : au-delà de ce saut, la sonde exige 2 lectures
     // OCR positives distinctes avant d'étendre le segment. Pendant une vraie
     // pub le texte est permanent (confirmation immédiate) ; un faux positif

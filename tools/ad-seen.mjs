@@ -120,7 +120,7 @@ for (const file of recentRuns(opts.last)) {
   const run = readRun(file);
   if (!run.window || run.verdict !== "SKIP") continue;
   const m = measure(run);
-  if (m) measured.push({ window: run.window, ...m });
+  if (m) measured.push({ window: run.window, forward: run.forward, ...m });
 }
 
 if (!measured.length) {
