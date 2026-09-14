@@ -134,6 +134,7 @@ function parseArgs(argv) {
     login: false,
     noSeek: false,
     fullWindow: false,
+    forward: null,
     screenshot: null,
     fault: null,
     dumpRoi: false,
@@ -156,6 +157,7 @@ function parseArgs(argv) {
       case "--full-window": opts.fullWindow = true; break;
       case "--fault": opts.fault = requireFault(a, next()); break;
       case "--dump-roi": opts.dumpRoi = true; break;
+      case "--forward": opts.forward = requireNumber(a, next(), { min: 1 }); break;
       case "--screenshot": opts.screenshot = requireTimecode(a, next()); break;
       case "--ad": {
         const [s, e] = String(next()).split("-");
@@ -482,6 +484,17 @@ function resolveExtensionRoot(opts) {
   }
   if (opts.dumpRoi) {
     return buildPatchedExtension("dump-roi", ROI_DUMP_PATCH, "content/ocr.js");
+  }
+  if (opts.forward !== null) {
+    // Comparer deux réglages exige de les exposer aux MÊMES conditions réseau :
+    // une campagne A/B alterne les valeurs run après run plutôt que de modifier
+    // config.js entre deux lots (cf. tools/ab-forward.mjs).
+    console.log(`🎚 segmentForwardSeconds = ${opts.forward}`);
+    return buildPatchedExtension(
+      `forward-${opts.forward}`,
+      [["segmentForwardSeconds: 5,", `segmentForwardSeconds: ${opts.forward},`]],
+      "content/config.js"
+    );
   }
   return REPO_ROOT;
 }
@@ -823,6 +836,15 @@ async function main() {
   mkdirSync(LOGS_DIR, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const recorder = createRecorder(opts.out ? resolve(opts.out) : join(LOGS_DIR, `run-${stamp}.jsonl`));
+
+  // Trace le réglage dans le JSONL : sans elle, une campagne A/B alternée
+  // produit des runs que rien ne distingue après coup.
+  recorder.write({
+    source: "harness",
+    level: "config",
+    text: `segmentForwardSeconds=${opts.forward ?? "défaut"}`,
+    forward: opts.forward
+  });
 
   if (opts.dumpRoi) {
     const videoId = opts.url.match(/v=([\w-]+)/)?.[1] ?? "video";
