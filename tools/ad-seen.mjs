@@ -25,14 +25,14 @@ import { fileURLToPath } from "node:url";
 const LOGS = join(dirname(fileURLToPath(import.meta.url)), "..", "logs");
 
 function parseArgs(argv) {
-  const opts = { last: 10, label: null, byForward: false };
+  const opts = { last: 10, label: null, byConfig: false };
   for (let i = 2; i < argv.length; i++) {
     switch (argv[i]) {
       case "--last": opts.last = Number(argv[++i]); break;
       case "--label": opts.label = String(argv[++i]); break;
-      case "--by-forward": opts.byForward = true; break;
+      case "--by-config": opts.byConfig = true; break;
       case "--help": case "-h":
-        console.log("Usage: node tools/ad-seen.mjs [--last N] [--label texte] [--by-forward]");
+        console.log("Usage: node tools/ad-seen.mjs [--last N] [--label texte] [--by-config]");
         process.exit(0);
         break;
       default:
@@ -56,7 +56,9 @@ function recentRuns(count) {
 function readRun(file) {
   let window = null;
   let verdict = null;
-  let forward = null;
+  // Signature du réglage sous lequel ce run a tourné, écrite par capture-logs :
+  // « frameSampleSeconds=12 », « défaut »… C'est elle qui sépare les groupes A/B.
+  let config = "défaut";
   const skips = [];
 
   for (const line of readFileSync(file, "utf8").split("\n")) {
@@ -64,7 +66,7 @@ function readRun(file) {
     let entry;
     try { entry = JSON.parse(line); } catch { continue; }
 
-    if (entry.level === "config") forward = entry.forward;
+    if (entry.level === "config") config = entry.text || "défaut";
     if (entry.ad) {
       window = [entry.ad.start, entry.ad.end];
       verdict = entry.verdict;
@@ -73,7 +75,13 @@ function readRun(file) {
     if (skip) skips.push([Number(skip[1]), Number(skip[2])]);
   }
 
-  return { window, verdict, forward, skips };
+  return { window, verdict, config, skips };
+}
+
+/** « frameSampleSeconds=12 » → « =12 », pour tenir dans une colonne. */
+function shortLabel(config) {
+  const at = config.indexOf("=");
+  return at < 0 ? config : config.slice(at);
 }
 
 /** Intervalles sautés à l'intérieur de la fenêtre, fusionnés et ordonnés. */
@@ -120,7 +128,7 @@ for (const file of recentRuns(opts.last)) {
   const run = readRun(file);
   if (!run.window || run.verdict !== "SKIP") continue;
   const m = measure(run);
-  if (m) measured.push({ window: run.window, forward: run.forward, ...m });
+  if (m) measured.push({ window: run.window, config: run.config, ...m });
 }
 
 if (!measured.length) {
@@ -158,7 +166,7 @@ function printGroup(title, rows) {
   console.log(`  CONTENU LÉGITIME PERDU : ${s.lostCount}/${s.count} runs · ${s.lostTotal.toFixed(1)}s au total · pire +${Math.max(0, s.maxOvershoot).toFixed(1)}s`);
 }
 
-if (!opts.byForward) {
+if (!opts.byConfig) {
   if (opts.label) console.log(`\n▶ ${opts.label}`);
   console.log(`\n${"fenêtre".padStart(13)} ${"tête".padStart(7)} ${"milieu".padStart(8)} ${"queue".padStart(7)} ${"vue".padStart(7)} ${"sauts".padStart(6)} ${"débord".padStart(8)}`);
   console.log("-".repeat(62));
@@ -176,7 +184,11 @@ if (!opts.byForward) {
   console.log("-".repeat(62));
   printGroup(opts.label ?? "ensemble", measured);
 } else {
-  const values = [...new Set(measured.map((m) => m.forward))].sort((a, b) => a - b);
+  // Tri NUMÉRIQUE sur la valeur du réglage : un tri alphabétique placerait 10
+  // avant 5 et la colonne « verdict », qui compare la dernière valeur à la
+  // première, en inverserait le sens.
+  const values = [...new Set(measured.map((m) => m.config))]
+    .sort((a, b) => (Number(shortLabel(a).slice(1)) || 0) - (Number(shortLabel(b).slice(1)) || 0));
 
   // Comparaison APPARIÉE : seules les fenêtres mesurées sous TOUTES les valeurs
   // comptent. Comparer des ensembles de vidéos différents ferait passer un
@@ -185,13 +197,13 @@ if (!opts.byForward) {
   for (const m of measured) {
     const key = `${m.window[0]}-${m.window[1]}`;
     if (!byWindow.has(key)) byWindow.set(key, new Map());
-    byWindow.get(key).set(m.forward, m);
+    byWindow.get(key).set(m.config, m);
   }
   const paired = [...byWindow.entries()].filter(([, byValue]) => values.every((v) => byValue.has(v)));
 
   console.log(`\nCOMPARAISON APPARIÉE — ${paired.length} fenêtres mesurées sous les ${values.length} réglages`);
   console.log(`(${byWindow.size - paired.length} fenêtres écartées : incomplètes)`);
-  console.log(`\n${"fenêtre".padStart(13)} ${values.map((v) => `fwd=${v}`.padStart(9)).join(" ")}   verdict`);
+  console.log(`\n${"fenêtre".padStart(13)} ${values.map((v) => shortLabel(v).padStart(9)).join(" ")}   verdict`);
   console.log("-".repeat(20 + values.length * 10));
   for (const [key, byValue] of paired) {
     const seens = values.map((v) => byValue.get(v).head + byValue.get(v).middle + byValue.get(v).tail);
@@ -201,6 +213,6 @@ if (!opts.byForward) {
   }
 
   for (const v of values) {
-    printGroup(`segmentForwardSeconds = ${v} (apparié)`, paired.map(([, byValue]) => byValue.get(v)));
+    printGroup(`${v} (apparié)`, paired.map(([, byValue]) => byValue.get(v)));
   }
 }

@@ -17,6 +17,7 @@
  *   node tools/capture-logs.mjs --url <video> [--ad 2:05-2:35 --ad 8:10-8:40]
  *                               [--seconds 180] [--out logs/run-<ts>.jsonl]
  *                               [--seek-lead 30] [--grace 2] [--headless]
+ *                               [--config frameSampleSeconds=12] [--forward 10]
  */
 
 import { chromium } from "playwright";
@@ -134,7 +135,7 @@ function parseArgs(argv) {
     login: false,
     noSeek: false,
     fullWindow: false,
-    forward: null,
+    configOverrides: {},
     screenshot: null,
     fault: null,
     dumpRoi: false,
@@ -157,7 +158,17 @@ function parseArgs(argv) {
       case "--full-window": opts.fullWindow = true; break;
       case "--fault": opts.fault = requireFault(a, next()); break;
       case "--dump-roi": opts.dumpRoi = true; break;
-      case "--forward": opts.forward = requireNumber(a, next(), { min: 1 }); break;
+      case "--forward": opts.configOverrides.segmentForwardSeconds = requireNumber(a, next(), { min: 1 }); break;
+      case "--config": {
+        const pair = requireValue(a, next());
+        const at = pair.indexOf("=");
+        if (at < 1) {
+          console.error(`--config attend clé=valeur, reçu « ${pair} ».`);
+          process.exit(2);
+        }
+        opts.configOverrides[pair.slice(0, at)] = Number(pair.slice(at + 1));
+        break;
+      }
       case "--screenshot": opts.screenshot = requireTimecode(a, next()); break;
       case "--ad": {
         const [s, e] = String(next()).split("-");
@@ -171,7 +182,14 @@ function parseArgs(argv) {
         break;
       }
       case "--help": case "-h":
-        console.log("Usage: node tools/capture-logs.mjs --url <video> [--ad start-end ...] [--seconds N] [--out file] [--seek-lead 30] [--grace 2] [--headless]");
+        console.log("Usage: node tools/capture-logs.mjs --url <video> [--ad start-end ...] [--seconds N] [--out file]");
+        console.log("                                    [--seek-lead 30] [--grace 2] [--headless] [--full-window]");
+        console.log("                                    [--config cle=valeur ...] [--forward N] [--dump-roi] [--fault nom]");
+        console.log("");
+        console.log("  --config  surcharge un réglage de content/config.js le temps du run (répétable),");
+        console.log("            sur une COPIE de l'extension : la source n'est jamais touchée.");
+        console.log("            ex. --config frameSampleSeconds=12 --config segmentForwardSeconds=10");
+        console.log("  --forward raccourci pour --config segmentForwardSeconds=N");
         process.exit(0);
         break;
       default:
@@ -477,6 +495,30 @@ function buildPatchedExtension(label, patches, file = "pages/ocr-sandbox.js") {
   return root;
 }
 
+/** `{ a: 1, b: 2 }` → `a=1 b=2`, pour les logs et le JSONL. */
+function describeOverrides(overrides) {
+  return Object.entries(overrides).map(([key, value]) => `${key}=${value}`).join(" ");
+}
+
+/**
+ * Construit les motifs de remplacement à partir du texte ACTUEL de config.js.
+ * Coder la valeur attendue en dur (« segmentForwardSeconds: 5, ») condamnait le
+ * drapeau dès que la valeur livrée changeait : le patch tombait en panne à la
+ * première campagne suivant un réglage validé.
+ */
+function configPatches(overrides) {
+  const source = readFileSync(join(REPO_ROOT, "content/config.js"), "utf8");
+
+  return Object.entries(overrides).map(([key, value]) => {
+    const current = new RegExp(`^\\s*${key}: [^,\\n]+,$`, "m").exec(source);
+    if (!current) {
+      console.error(`Réglage inconnu « ${key} » : aucune ligne « ${key}: …, » dans content/config.js.`);
+      process.exit(2);
+    }
+    return [current[0], current[0].replace(/: [^,\n]+,$/, `: ${value},`)];
+  });
+}
+
 function resolveExtensionRoot(opts) {
   if (opts.fault) {
     console.log(`💥 Panne « ${opts.fault} » : ${FAULTS[opts.fault].label}`);
@@ -485,14 +527,15 @@ function resolveExtensionRoot(opts) {
   if (opts.dumpRoi) {
     return buildPatchedExtension("dump-roi", ROI_DUMP_PATCH, "content/ocr.js");
   }
-  if (opts.forward !== null) {
+  const overridden = Object.keys(opts.configOverrides);
+  if (overridden.length) {
     // Comparer deux réglages exige de les exposer aux MÊMES conditions réseau :
     // une campagne A/B alterne les valeurs run après run plutôt que de modifier
-    // config.js entre deux lots (cf. tools/ab-forward.mjs).
-    console.log(`🎚 segmentForwardSeconds = ${opts.forward}`);
+    // config.js entre deux lots (cf. tools/ab-config.mjs).
+    console.log(`🎚 ${describeOverrides(opts.configOverrides)}`);
     return buildPatchedExtension(
-      `forward-${opts.forward}`,
-      [["segmentForwardSeconds: 5,", `segmentForwardSeconds: ${opts.forward},`]],
+      `config-${overridden.map((k) => `${k}${opts.configOverrides[k]}`).join("-")}`,
+      configPatches(opts.configOverrides),
       "content/config.js"
     );
   }
@@ -842,8 +885,8 @@ async function main() {
   recorder.write({
     source: "harness",
     level: "config",
-    text: `segmentForwardSeconds=${opts.forward ?? "défaut"}`,
-    forward: opts.forward
+    text: describeOverrides(opts.configOverrides) || "défaut",
+    overrides: opts.configOverrides
   });
 
   if (opts.dumpRoi) {
