@@ -680,6 +680,71 @@ aucun compteur ne le montrerait.
 Mesuré sur plusieurs runs : **tous les offsets valent zéro**. Le défaut est réel
 mais latent. Le heartbeat rapporte désormais `tsOffsets`.
 
+### 2.14 Le coût d'une pub : le bon modèle, et une piste réfutée *(2026-09-15)*
+
+**Le modèle de §3 ne généralise pas.** La loi `pub_vue ≈ durée / vitesse_scan −
+avance_initiale` avait été établie sur quelques runs d'une seule vidéo. Testée
+sur 33 runs SKIP du corpus, avec vitesse et avance *mesurées* et non ajustées,
+elle donne **R² = −0,60** — pire que de prédire la moyenne.
+
+Le modèle qui tient est plus simple :
+
+```
+pub vue ≈ (nombre de sauts − 1) × latence d'analyse + queue     R² = +0,75
+```
+
+Le coût mesuré par intervalle entre deux sauts est de 2,70s ; la latence d'une
+analyse, mesurée indépendamment, de 2,44s. Ce sont les mêmes secondes.
+
+**Pourquoi.** `skip.js` vise `segment.end + skipMarginSeconds`, c'est-à-dire la
+frontière de ce que l'OCR a confirmé. Chaque saut téléporte donc le playhead
+*sur* la frontière du scanner, qui se retrouve sans avance : il doit produire
+une nouvelle analyse avant de pouvoir étendre le segment, et pendant ces 2,44s
+la vidéo joue. Le cycle est « 2,44s regardées, ~15s sautées » — soit **16 % de
+la pub regardée, structurellement**, indépendamment du réseau et de la
+rendition.
+
+Il n'y a donc que deux leviers : **baisser la latence d'analyse**, ou
+**augmenter l'avance gagnée par analyse**.
+
+Sur le premier, une expérience naturelle donne la décomposition : les frames qui
+déclenchent le repli adaptatif font deux passes OCR au lieu d'une. Une passe
+2,35s, deux passes 5,06s → **Tesseract est ~100 % du cycle**, décodage et
+composite disparaissent dans le bruit.
+
+### `frameSampleSeconds` ne fait pas ce qu'il annonce — et l'augmenter ne marche pas
+
+Le réglage vaut 4 et prétend espacer les images analysées. Il ne le fait pas :
+un segment média YouTube ne transporte **qu'une seule keyframe**, espacée d'environ
+5s de la suivante, si bien que le filtre `lastScannedTime + 4` est toujours
+satisfait. Le pas réel n'est pas 4s mais la durée d'un segment — mesurée à 5,2s.
+L'extension analyse donc une image tous les 5s pour engager un segment qui en
+couvre 18 : environ trois analyses là où une suffirait.
+
+Porté à 8 puis 12, le réglage mord réellement, et **le milieu baisse exactement
+comme le modèle le prédit** — 60,9s → 39,2s → 34,8s, et 31 sauts → 22 → 20.
+
+Mais la pub vue, elle, **augmente** : 84,3s → 103,7s → 92,4s (campagne appariée,
+5 fenêtres vues sous les trois réglages, alternées dos à dos sur la même vidéo).
+
+Ce que l'économie du milieu paie ailleurs, c'est la **latence de détection** :
+
+| pas | pas réel | 1re détection après le début de pub | poste « tête » |
+|---|---|---|---|
+| 4 | 5,2s | médiane 3,5s · max 8,5s | 0,6s |
+| 8 | 9,2s | médiane 5,0s · max 39,2s | 32,1s |
+| 12 | 12,0s | médiane 7,4s · max 39,2s | 32,2s |
+
+Et une pub de 13s a été **entièrement manquée** à pas 12 : plus courte que
+l'intervalle d'échantillonnage, elle peut tomber entre deux images.
+
+**Le réglage reste donc à 4.** Mais l'expérience n'est pas perdue : elle établit
+qu'un pas d'échantillonnage *global* ne peut pas servir les deux régimes. Repérer
+le **début** d'une pub exige un pas fin ; confirmer qu'elle **continue** se
+contenterait d'un pas grossier. C'est précisément la séparation qu'offrirait une
+vérification de persistance bon marché — OCR coûteux pour détecter, contrôle
+léger pour confirmer.
+
 ---
 
 ## 3. Résultats validés (vidéo de réf `vRAPfDSmBGM`, pub 3:49–4:57)
@@ -696,7 +761,10 @@ Run `--full-window`, mesures extraites des `Skip appliqué` du JSONL :
 Toute la chaîne fonctionne : décodage → OCR → sonde → segment → **skip**, sans
 skip hors fenêtre de pub, sans erreur, `storeSize=1`.
 
-### La loi qui gouverne le résultat
+### La loi qui gouverne le résultat *(ne généralise pas — voir §2.14)*
+
+> ⚠️ Cette loi a été établie sur la seule vidéo de référence. Testée sur 33 runs
+> du corpus, elle donne R² = −0,60. Le modèle valide est celui de §2.14.
 
 En corrélant l'horodatage wall-clock et le temps de contenu des `frame analysée` :
 
