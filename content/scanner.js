@@ -436,6 +436,7 @@
         useFallback: this.useFallback,
         capturedSegments: `${this.buffer.segments.length} (${this.buffer.unscannedCount} non scannés)`,
         mediaSegmentsReceived: this.buffer.totalReceived,
+        tsOffsets: Array.from(this.buffer.timestampOffsetsSeen).join(","),
         scansRun: this.totalScans,
         framesDecoded: this.totalFramesDecoded,
         ocrMatches: this.totalOcrMatches,

@@ -605,6 +605,146 @@ désactivation avant que le seuil de cinq échecs ne soit atteignable dans la
 durée du run. Un test qui échoue sur du code fraîchement écrit n'est pas
 forcément un test qui a raison.
 
+### 2.13 Généralisation multi-vidéos : ce que dix vidéos ont appris *(2026-09-12)*
+
+Le corpus annoté (`tools/corpus.json`, 10 vidéos, 9 créateurs) a servi de banc
+d'essai. Ligne de base initiale : **4 vidéos détectées sur 10**.
+
+**Le pipeline généralise ; la lecture aussi.** Sur les six échecs, 32 à 53
+frames décodées et OCRisées par vidéo. Mieux : l'OCR *lisait* le bandeau —
+`COMMERCIALE` sur 18 frames sur 18 pour `sJZBUk0nO5E`, `Collaboration
+commercia` sur 10 sur 10 pour `FOrRFw9PPvw`, `collaboration commerciale` sur 6
+sur 9 pour `IL6YjqAlBa4`. Toutes en MISS. **Le défaut n'était ni l'interception,
+ni le décodage, ni l'OCR : c'était la règle de correspondance.**
+
+Le mode `--dump-roi` (voir `tools/README.md`) a été écrit pour ça : exporter le
+composite que l'OCR analyse, avant et après binarisation. Sans ces images, le
+diagnostic était impossible — j'avais formulé puis dû abandonner l'hypothèse
+d'un mauvais emplacement du crop, réfutée par capture d'écran.
+
+**Quatre mécanismes distincts**, tous invisibles depuis les compteurs :
+
+1. *Érosion du mot en graisse fine.* Le bandeau écrit « COLLABORATION » en fin
+   et « COMMERCIALE » en gras ; la binarisation détruit les traits fins.
+2. *Troncature par le crop.* Un bandeau plus large que 30 % du cadre sort de la
+   cellule : l'OCR lit `Collaboration commercia`, amputé.
+3. *Polarité inversée.* Texte sombre sur boîte claire — le seuil fixe efface
+   tout.
+4. *Plafond de mesure trop court.* Deux vidéos sortaient en TIMEOUT alors que la
+   détection fonctionnait : un défaut du harness, pas du produit.
+
+Les correctifs (§2.12 des commits : mots-clés isolés, correspondance approchée,
+binarisation adaptative en repli) traitent les trois premiers ; les plafonds du
+corpus ont été relevés à 360 s.
+
+### Les pubs YouTube polluaient la mesure
+
+Deux anomalies ont résisté longtemps : la même vidéo, même codec, même
+résolution, donnait deux runs aux contenus lus **différents aux mêmes
+horodatages** — `COLLABORATION COMMERCIALE` sur 14 frames d'un côté, `(4/2)` et
+une pièce aux néons de l'autre. Et la vidéo de référence, jamais tombée en
+trente runs, a rendu 40 frames de `SHOW` et `Lu) nusna` sans un seul match.
+
+J'ai d'abord soupçonné `timestampOffset` (défaut réel, voir plus bas), puis une
+régression de la passe adaptative. Les deux étaient faux : deux runs de contrôle
+de la référence donnent SKIP avec 9 matches chacun.
+
+L'explication est ailleurs, et une frame la donne : à 96 s, l'OCR lit
+`THE ® Tree CONSTRUCTION OREIT SHOW`. Ce n'est pas la vidéo de référence —
+**c'est une publicité YouTube**. Pendant une pub, MSE transporte SES segments :
+l'extension analyse ses images, avec sa propre timeline. Un run dont la fenêtre
+tombe pendant une pub YouTube n'observe pas la vidéo annotée du tout.
+
+Et le harness **absorbait ces pubs silencieusement** — `handleAds` n'écrivait
+rien. D'où des heures passées à chercher un défaut produit là où il n'y avait
+qu'un artefact de mesure. Il trace désormais chaque pub absorbée, sa durée, et
+avertit dans le résumé qu'un MISS ou un TIMEOUT peut n'être que ça.
+
+**Leçon de méthode** : un harness qui corrige silencieusement une condition
+anormale ment sur ce qu'il a mesuré. Toute compensation automatique doit laisser
+une trace.
+
+### `timestampOffset` capté mais jamais appliqué
+
+Relevé au passage et confirmé par lecture du code. L'interceptor patche le
+setter de `SourceBuffer.timestampOffset` et `MseSegmentBuffer` conserve la
+valeur par segment, mais elle ne sert qu'à détecter une discontinuité de
+réassemblage : `DecoderSandbox.scanSegment` ne la transmet pas, et
+`parseMediaSegment` calcule ses horodatages depuis le conteneur seul.
+
+YouTube s'en sert pour recoller deux périodes — insertion publicitaire,
+changement de rendition, reprise après seek. Un offset non nul décalerait donc
+silencieusement tous les segments stockés par rapport à `video.currentTime`, et
+aucun compteur ne le montrerait.
+
+Mesuré sur plusieurs runs : **tous les offsets valent zéro**. Le défaut est réel
+mais latent. Le heartbeat rapporte désormais `tsOffsets`.
+
+### 2.14 Le coût d'une pub : le bon modèle, et une piste réfutée *(2026-09-15)*
+
+**Le modèle de §3 ne généralise pas.** La loi `pub_vue ≈ durée / vitesse_scan −
+avance_initiale` avait été établie sur quelques runs d'une seule vidéo. Testée
+sur 33 runs SKIP du corpus, avec vitesse et avance *mesurées* et non ajustées,
+elle donne **R² = −0,60** — pire que de prédire la moyenne.
+
+Le modèle qui tient est plus simple :
+
+```
+pub vue ≈ (nombre de sauts − 1) × latence d'analyse + queue     R² = +0,75
+```
+
+Le coût mesuré par intervalle entre deux sauts est de 2,70s ; la latence d'une
+analyse, mesurée indépendamment, de 2,44s. Ce sont les mêmes secondes.
+
+**Pourquoi.** `skip.js` vise `segment.end + skipMarginSeconds`, c'est-à-dire la
+frontière de ce que l'OCR a confirmé. Chaque saut téléporte donc le playhead
+*sur* la frontière du scanner, qui se retrouve sans avance : il doit produire
+une nouvelle analyse avant de pouvoir étendre le segment, et pendant ces 2,44s
+la vidéo joue. Le cycle est « 2,44s regardées, ~15s sautées » — soit **16 % de
+la pub regardée, structurellement**, indépendamment du réseau et de la
+rendition.
+
+Il n'y a donc que deux leviers : **baisser la latence d'analyse**, ou
+**augmenter l'avance gagnée par analyse**.
+
+Sur le premier, une expérience naturelle donne la décomposition : les frames qui
+déclenchent le repli adaptatif font deux passes OCR au lieu d'une. Une passe
+2,35s, deux passes 5,06s → **Tesseract est ~100 % du cycle**, décodage et
+composite disparaissent dans le bruit.
+
+### `frameSampleSeconds` ne fait pas ce qu'il annonce — et l'augmenter ne marche pas
+
+Le réglage vaut 4 et prétend espacer les images analysées. Il ne le fait pas :
+un segment média YouTube ne transporte **qu'une seule keyframe**, espacée d'environ
+5s de la suivante, si bien que le filtre `lastScannedTime + 4` est toujours
+satisfait. Le pas réel n'est pas 4s mais la durée d'un segment — mesurée à 5,2s.
+L'extension analyse donc une image tous les 5s pour engager un segment qui en
+couvre 18 : environ trois analyses là où une suffirait.
+
+Porté à 8 puis 12, le réglage mord réellement, et **le milieu baisse exactement
+comme le modèle le prédit** — 60,9s → 39,2s → 34,8s, et 31 sauts → 22 → 20.
+
+Mais la pub vue, elle, **augmente** : 84,3s → 103,7s → 92,4s (campagne appariée,
+5 fenêtres vues sous les trois réglages, alternées dos à dos sur la même vidéo).
+
+Ce que l'économie du milieu paie ailleurs, c'est la **latence de détection** :
+
+| pas | pas réel | 1re détection après le début de pub | poste « tête » |
+|---|---|---|---|
+| 4 | 5,2s | médiane 3,5s · max 8,5s | 0,6s |
+| 8 | 9,2s | médiane 5,0s · max 39,2s | 32,1s |
+| 12 | 12,0s | médiane 7,4s · max 39,2s | 32,2s |
+
+Et une pub de 13s a été **entièrement manquée** à pas 12 : plus courte que
+l'intervalle d'échantillonnage, elle peut tomber entre deux images.
+
+**Le réglage reste donc à 4.** Mais l'expérience n'est pas perdue : elle établit
+qu'un pas d'échantillonnage *global* ne peut pas servir les deux régimes. Repérer
+le **début** d'une pub exige un pas fin ; confirmer qu'elle **continue** se
+contenterait d'un pas grossier. C'est précisément la séparation qu'offrirait une
+vérification de persistance bon marché — OCR coûteux pour détecter, contrôle
+léger pour confirmer.
+
 ---
 
 ## 3. Résultats validés (vidéo de réf `vRAPfDSmBGM`, pub 3:49–4:57)
@@ -621,7 +761,10 @@ Run `--full-window`, mesures extraites des `Skip appliqué` du JSONL :
 Toute la chaîne fonctionne : décodage → OCR → sonde → segment → **skip**, sans
 skip hors fenêtre de pub, sans erreur, `storeSize=1`.
 
-### La loi qui gouverne le résultat
+### La loi qui gouverne le résultat *(ne généralise pas — voir §2.14)*
+
+> ⚠️ Cette loi a été établie sur la seule vidéo de référence. Testée sur 33 runs
+> du corpus, elle donne R² = −0,60. Le modèle valide est celui de §2.14.
 
 En corrélant l'horodatage wall-clock et le temps de contenu des `frame analysée` :
 
@@ -632,6 +775,115 @@ pub_vue ≈ durée_pub / vitesse_scan − avance_initiale
 Elle prédisait l'état antérieur au dixième près (68/2,13 − 9,4 = 22,6s pour 22,9s
 mesurées). **Le nombre de sauts n'est donc pas la cause** — seuls comptent les
 deux termes : la vitesse de scan (§2.5) et l'avance accumulée (§2.6).
+
+
+### Généralisation : 10 vidéos sur 10 *(run du 2026-09-12, passe détection)*
+
+`node tools/run-corpus.mjs` sur les 10 vidéos du corpus, après les correctifs
+de §2.13 (mots-clés isolés, correspondance approchée, binarisation adaptative
+en repli, plafonds à 360 s) :
+
+| | 2026-09-10 | 2026-09-12 (6/10) | 2026-09-12 (après §2.13) |
+|---|---|---|---|
+| Vidéos détectées | 4 / 10 | 6 / 10 | **10 / 10** |
+| Durée totale | 24,3 min | 27,5 min | **5,1 min** |
+| TIMEOUT | 2 | 4 | **0** |
+
+Vérification faite avant de signer le chiffre — **les dix détections tombent
+dans leur fenêtre annotée**, sur une frame comprise entre le début de la fenêtre
+et 7 s avant :
+
+| fenêtre | frame détectée | segment OCR posé |
+|---|---|---|
+| 229–297 | 230 | 222–235 |
+| 645–747 | 648 | 640–653 |
+| 74–124 | 76 | 68–81 |
+| 229–293 | 234 | 226–239 |
+| 209–222 | 210 | 202–215 |
+| 68–129 | 72 | 64–77 |
+| 87–173 | 91 | 83–96 |
+| 1036–1125 | 1044 | 1036–1049 |
+| 215–302 | 215 | 207–220 |
+| 968–1004 | 973 | 965–978 |
+
+Aucun faux positif : une seule frame `keyword=true` par vidéo, la passe
+détection s'arrêtant au premier match.
+
+**Ce que ce run ne prouve pas.** Aucune pub YouTube n'a été servie — la nouvelle
+trace de §2.13 est restée muette sur les dix vidéos. L'hypothèse « les pubs
+polluaient la mesure » est donc *compatible* avec ce résultat, pas démontrée par
+lui : il faudra un run contaminé, cette fois tracé, pour la confirmer. Le run du
+6/10 est par ailleurs suspect en lui-même — ses quatre TIMEOUT sont les quatre
+premières vidéos dans l'ordre chronologique, les six suivantes passant toutes,
+ce qui ressemble à une condition transitoire de début de session plutôt qu'à un
+défaut par vidéo.
+
+Enfin la passe détection ne mesure que la lecture du mot-clé dans la fenêtre.
+Le saut réel reste couvert par §3 sur la vidéo de référence et par
+`--full-window`.
+
+
+### Ce qu'une pub coûte vraiment, et le réglage qui le réduit *(2026-09-14)*
+
+Mesuré avec `tools/ad-seen.mjs`, qui décompose la pub vue en trois postes —
+ils ne se corrigent pas avec les mêmes leviers.
+
+Ligne de base à `segmentForwardSeconds: 5`, 18 runs, 1263s de pub :
+
+| poste | total | part |
+|---|---|---|
+| tête — avant le 1er saut | 1,2s | 0 % |
+| milieu — entre deux sauts | 179,3s | 65 % |
+| queue — après le dernier saut | 94,0s | 34 % |
+
+**La détection ne coûte rien** : le look-ahead reconnaît la pub quasi
+instantanément. Tout le coût est en aval. Le milieu se calcule presque
+exactement — ~1,9s par saut, le prix d'une reconfirmation OCR. La queue, elle,
+disait quelque chose d'inattendu : le dernier saut s'arrête **avant** la fin de
+la pub dans 13 runs sur 18 (médiane −1,5s, pire −29,2s). Le réglage prudent
+l'était du mauvais côté — on sous-estimait la fin de pub, on ne la dépassait
+pas. Le débord maximum observé était de +5,6s.
+
+### La première campagne A/B était ininterprétable
+
+Un lot complet à 5 puis un lot complet à 10. Le second a rendu 8 TIMEOUT contre
+2, avec des effondrements de rendition jusqu'en 240p, et 12 pubs mesurables
+contre 18 : les deux lots ne portaient plus sur les mêmes vidéos. L'écart
+agrégé mélangeait l'effet du réglage et un changement de distribution, et pris
+au premier degré il disait « 10 est pire ».
+
+`tools/ab-forward.mjs` alterne donc les valeurs **sur la même vidéo, dos à
+dos**. Les trois réglages voient la même bande passante et la même rendition ;
+seules les fenêtres mesurées sous les trois valeurs sont comparées.
+
+Résultat apparié, 8 fenêtres, 503s de pub par réglage :
+
+| | pub vue | sautée | queue | sauts | coût/saut | contenu légitime perdu |
+|---|---|---|---|---|---|---|
+| 5 | 123,5s | 75,5 % | 26,3s | 53 | 1,83s | 0,0s (0/8) |
+| **10** | **112,3s** | **77,7 %** | **17,2s** | 46 | 2,07s | **3,7s (2/8), pire +3,4s** |
+| 12 | 107,2s | 78,7 % | 10,7s | 38 | 2,54s | 7,7s (4/8), pire +3,5s |
+
+**Le gain vient de la queue, pas du nombre de sauts.** Celui-ci baisse bien
+(53 → 46 → 38) mais le coût par saut monte d'autant (1,83 → 2,07 → 2,54s), si
+bien que le poste « milieu » ne bouge quasiment pas (97,2 → 95,2 → 96,5s). La
+prédiction « moins de sauts donc moins de coût » était fausse.
+
+Retenu : **10**. En marginal, 5 → 10 économise 11,2s de pub pour 3,7s de
+contenu mangé (3 pour 1) ; 10 → 12 n'économise plus que 5,1s pour 4,0s de plus
+(1,3 pour 1). Au-delà de 10 on paie presque une seconde de vraie vidéo par
+seconde de pub évitée.
+
+Réserve : 8 paires, et la variance par vidéo reste forte (`[87-173]` gagne
+14,2s en passant à 12, `[968-1004]` en perd 11,2s). C'est la monotonie sur
+trois réglages qui porte la conclusion, pas l'écart sur une vidéo.
+
+### Ce que `lbLj5Yb6SAE` ne doit pas à ce réglage
+
+Sa queue valait 29,2s et 24,2s : la sonde concluait que la pub finissait à
+~1096s alors qu'elle finit à 1125s. Allonger la projection la ramène à 19,2s
+mais ne la règle pas — c'est une perte de lecture du bandeau sur la fin du
+segment, pas une projection trop courte. Sujet distinct.
 
 ---
 

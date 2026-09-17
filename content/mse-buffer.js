@@ -45,6 +45,11 @@
       this.mp4AccumTsOffset = null;
 
       this.totalReceived = 0;
+      // Offsets de timeline observés. YouTube les utilise pour recoller des
+      // périodes (insertion publicitaire, changement de rendition) ; on les
+      // expose au heartbeat parce qu'un offset non nul décale les timestamps
+      // que le démuxeur calcule (voir DEV-NOTES).
+      this.timestampOffsetsSeen = new Set();
 
       this.boundOnMessage = (event) => this.onMessage(event);
     }
@@ -116,6 +121,7 @@
         case "media-segment":
           if (!this.initSegment) return; // Un média sans init est inexploitable.
           this.totalReceived += 1;
+          this.timestampOffsetsSeen.add(msg.timestampOffset ?? 0);
           this.acceptMediaSegment(msg.data, msg.timestampOffset ?? 0);
           this.evictOldSegments();
           return;

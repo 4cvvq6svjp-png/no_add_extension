@@ -3,5 +3,9 @@ tools/node_modules/
 tools/.profile/
 logs/
 
+# Corpus : la source de vérité est tools/corpus.json (versionné).
+# Le markdown d'origine est gardé en local comme sauvegarde de la saisie.
+tools/corpus.md
+
 # Artefact de packaging
 no_add_extension.zip

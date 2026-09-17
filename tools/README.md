@@ -121,6 +121,61 @@ complet (`grep`-able par `source` et par tag `[NoAdd-MSE]` / `[NoAdd-Decoder]`).
 
 Code retour `1` si un MISS ou une erreur (utile en script/CI), `0` si tout HIT.
 
+## Banc d'essai multi-vidéos (`run-corpus.mjs`)
+
+`tools/corpus.json` est la **source de vérité** : identifiants YouTube, fenêtres
+de pub relevées à la main, plafond `--seconds` par vidéo. Cinq tests en gardent
+le format (`npm test`), parce qu'une entrée mal formée ne se verrait qu'après
+des dizaines de minutes de runs.
+
+```bash
+node tools/run-corpus.mjs                 # passe de détection
+node tools/run-corpus.mjs --full-window   # passe de couverture
+node tools/run-corpus.mjs --only Np_Fc7tWXus --seek-lead 45
+```
+
+### Deux passes, deux questions
+
+| Passe | Question |
+|---|---|
+| **détection** (défaut) | Le mot-clé est-il lu dans la fenêtre ? |
+| **couverture** (`--full-window`) | Quelle part de la pub est réellement sautée ? |
+
+Les runs restent **en série**. Le parallélisme a été envisagé puis écarté : la
+couverture dépend de la profondeur du buffer et de la cadence de scan
+(DEV-NOTES §4.1), or plusieurs navigateurs simultanés se disputent la bande
+passante et le CPU — précisément ces deux variables. On mesurerait la
+contention plutôt que le produit.
+
+## Voir ce que l'OCR voit (`--dump-roi`)
+
+Le composite 2×2 que `RoiComposer` construit — quatre coins cropés, agrandis,
+binarisés — n'existe qu'en mémoire. `--dump-roi` l'exporte pour chaque frame
+analysée, **avant et après binarisation** :
+
+```bash
+node tools/capture-logs.mjs --url "…?v=ID" --ad 3:49-4:53 --full-window --dump-roi
+# → logs/roi/<ID>/00229.4s-1-brut.png
+#   logs/roi/<ID>/00229.4s-2-binarise.png
+```
+
+La paire tranche entre les trois causes possibles d'un échec de lecture :
+
+| Ce qu'on observe | Cause |
+|---|---|
+| le texte est absent de l'image brute | le crop des coins l'a manqué |
+| lisible en brut, effacé après binarisation | `ocrBinarizeThreshold` inadapté |
+| illisible dans les deux | taille ou contraste insuffisants à la source |
+
+Comme `--fault`, le mode travaille sur une **copie** de l'extension dans un
+dossier temporaire : aucun point d'export ne vit dans le code livré. En
+contrepartie, les motifs de patch sont couplés au code source — le harness
+**refuse de démarrer** quand un motif ne correspond plus, plutôt que de lancer
+un run silencieusement sans effet. Si ça arrive, c'est `ROI_DUMP_PATCH` (ou
+`FAULTS`) qu'il faut remettre à jour dans `capture-logs.mjs`. Les images
+vont sur disque et non dans le JSONL, qu'une paire de PNG base64 par frame
+rendrait illisible. Compter ~650 Ko par frame.
+
 ## Injection de panne (`--fault`)
 
 Les runs normaux ne jouent que le chemin heureux : le démarrage OCR réussit à

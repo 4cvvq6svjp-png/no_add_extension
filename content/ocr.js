@@ -47,7 +47,12 @@
      * @param {ImageBitmap|HTMLVideoElement} source
      * @returns {boolean} false si la source n'a pas encore de dimensions.
      */
-    compose(source) {
+    /**
+     * @param {ImageBitmap|HTMLVideoElement} source
+     * @param {{ adaptive?: boolean }} options `adaptive` calcule un seuil par
+     *   cellule au lieu du seuil fixe — voir binarizeAdaptive().
+     */
+    compose(source, { adaptive = false } = {}) {
       const sourceWidth = source.videoWidth || source.width || 0;
       const sourceHeight = source.videoHeight || source.height || 0;
       if (sourceWidth <= 0 || sourceHeight <= 0) {
@@ -79,7 +84,11 @@
       ctx.drawImage(source, 0,        cropTop, cropWidth, cropHeight, 0,         cellHeight, cellWidth, cellHeight);
       ctx.drawImage(source, cropLeft, cropTop, cropWidth, cropHeight, cellWidth, cellHeight, cellWidth, cellHeight);
 
-      this.binarize();
+      if (adaptive) {
+        this.binarizeAdaptive(cellWidth, cellHeight);
+      } else {
+        this.binarize();
+      }
       return true;
     }
 
@@ -102,6 +111,81 @@
 
       this.ctx.putImageData(image, 0, 0);
     }
+
+    /**
+     * Binarisation avec un seuil calculé par cellule (méthode d'Otsu), et
+     * l'encre prise du côté SOMBRE.
+     *
+     * Le seuil fixe suppose un texte quasi-blanc sur un fond plus sombre. Quand
+     * un créateur inscrit un texte sombre dans une boîte claire, il efface tout.
+     * Otsu sépare les deux modes de luminance de chaque coin sans rien
+     * supposer, et chaque coin a son propre éclairage — d'où un seuil par
+     * cellule plutôt qu'un seuil global.
+     */
+    binarizeAdaptive(cellWidth, cellHeight) {
+      for (const cellX of [0, 1]) {
+        for (const cellY of [0, 1]) {
+          const image = this.ctx.getImageData(
+            cellX * cellWidth, cellY * cellHeight, cellWidth, cellHeight
+          );
+          const pixels = image.data;
+          const histogram = new Array(256).fill(0);
+
+          for (let i = 0; i < pixels.length; i += 4) {
+            const luminance =
+              0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+            histogram[Math.min(255, Math.round(luminance))] += 1;
+          }
+
+          const threshold = otsuThreshold(histogram, pixels.length / 4);
+
+          for (let i = 0; i < pixels.length; i += 4) {
+            const luminance =
+              0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+            const value = luminance <= threshold ? 0 : 255;
+            pixels[i] = value;
+            pixels[i + 1] = value;
+            pixels[i + 2] = value;
+          }
+
+          this.ctx.putImageData(image, cellX * cellWidth, cellY * cellHeight);
+        }
+      }
+    }
+  }
+
+  /**
+   * Seuil d'Otsu : la valeur qui maximise la variance inter-classes d'un
+   * histogramme, c'est-à-dire qui sépare le mieux ses deux modes de luminance.
+   */
+  function otsuThreshold(histogram, total) {
+    let sumAll = 0;
+    for (let i = 0; i < 256; i++) sumAll += i * histogram[i];
+
+    let weightBelow = 0;
+    let sumBelow = 0;
+    let bestVariance = -1;
+    let bestThreshold = 0;
+
+    for (let t = 0; t < 256; t++) {
+      weightBelow += histogram[t];
+      if (weightBelow === 0) continue;
+
+      const weightAbove = total - weightBelow;
+      if (weightAbove === 0) break;
+
+      sumBelow += t * histogram[t];
+      const meanBelow = sumBelow / weightBelow;
+      const meanAbove = (sumAll - sumBelow) / weightAbove;
+      const variance = weightBelow * weightAbove * (meanBelow - meanAbove) ** 2;
+
+      if (variance > bestVariance) {
+        bestVariance = variance;
+        bestThreshold = t;
+      }
+    }
+
+    return bestThreshold;
   }
 
   /* ------------------------------------------------------------------ */
@@ -400,8 +484,25 @@
         return noDetection(sampleTime, "ocr-unavailable");
       }
 
+      const first = await this.detectWithBinarization(source, sampleTime, false);
+      if (first.hasCommercialKeyword || !CONFIG.ocrAdaptiveFallback) {
+        return first;
+      }
+
+      // Rien trouvé : le seuil fixe a peut-être effacé un texte sombre sur
+      // boîte claire. On recompose avec un seuil par cellule et on réessaie.
+      // Cette passe ne s'exécute que sur des frames qui échouaient déjà.
+      const second = await this.detectWithBinarization(source, sampleTime, true);
+      if (second.hasCommercialKeyword) {
+        return { ...second, source: `${second.source}-adaptatif` };
+      }
+
+      return first;
+    }
+
+    async detectWithBinarization(source, sampleTime, adaptive) {
       try {
-        if (!this.roi.compose(source)) {
+        if (!this.roi.compose(source, { adaptive })) {
           return noDetection(sampleTime, "source-not-ready");
         }
       } catch (error) {

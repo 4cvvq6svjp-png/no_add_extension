@@ -158,6 +158,18 @@ Two properties decide legibility, and both were bugs at some point:
   an OCR engine trained on undistorted text handles badly. The composite height
   is now derived from the crop, which also cut its area by 40%.
 
+`compose(source, { adaptive })` offers two binarizations. The default fixed
+threshold keeps near-white pixels, which assumes light text over a darker
+background. `binarizeAdaptive` instead computes an **Otsu threshold per cell**
+and takes the dark side as ink — for creators who set dark text inside a light
+box, where the fixed threshold erases everything.
+
+Replacing the fixed threshold outright was tried first and **rejected on
+measurement**: across the extracted composites, global Otsu rescued two corpus
+videos and degraded two others, because text is too small a pixel minority for
+Otsu to find in a busy corner. The adaptive pass is therefore a *fallback*, not
+a replacement — see §4.2.9.
+
 #### 4.2.5 `TesseractOcr`
 
 **Role:** Own the heavy OCR engine's lifecycle.
@@ -275,11 +287,34 @@ was removed.
 `TesseractOcr`'s state, because the heartbeat is the diagnostic contract the
 harness reads.
 
-**Text normalization:** accents are stripped (NFD + removing combining marks)
-and text lowercased before matching, so "Collaboration commerciale" matches the
-stored `collaboration commerciale`. Matching is by substring, which is why
-`sponsor` alone covers "contenu sponsorisé", "vidéo sponsorisée" and
-"sponsorisé par".
+**Two-pass detection.** `detect` binarizes with the fixed threshold and OCRs.
+If nothing matched and `ocrAdaptiveFallback` is on, it recomposes with the
+per-cell adaptive threshold (§4.2.4) and tries once more, tagging the result
+`…-adaptatif`. The second pass runs *only* on frames the first already failed,
+so it cannot regress a working case and costs nothing when detection succeeds.
+
+**Keyword matching is deliberately loose**, and both halves of that were forced
+by measurement on the ten-video corpus:
+
+- **Isolated words, not phrases.** "Collaboration commerciale" is usually set
+  with its first word in a light weight, which binarization erodes away; the OCR
+  then returns `COMMERCIALE` alone. Requiring the full phrase failed on five of
+  ten videos *while the text was being read perfectly*. Searching
+  `collaboration` and `commercial` separately took detection from 4/10 to 9/10
+  videos, and made the full phrases redundant — measured, they add nothing.
+- **Approximate matching.** `approximateDistance` is the edit distance between a
+  keyword and the best-matching *substring* of the OCR output — free prefix and
+  suffix, since the keyword arrives buried in noise. Each keyword gets
+  `length / keywordEditDivisor` edits, capped at `keywordMaxEdits`. That absorbs
+  characters OCR invents (`publhocité` for `publicité`, distance 2) and words
+  the crop truncates (`commercia`, distance 1), while keeping short keywords
+  strict: `sponsor` gets one edit, not two.
+
+Swept over 393 in-window and 806 out-of-window frames: 54% → 82% of in-window
+frames detected, with **zero false positives** at every operating point tried.
+The chosen budget (length/4, cap 2) comes from that sweep.
+
+Text is normalized before matching — NFD, combining marks removed, lowercased.
 
 #### 4.2.10 `AheadScanner`
 
@@ -528,6 +563,8 @@ All timing constants live in `CONFIG` too — sandbox timeouts, poll cadences an
 | `addSegment` returned `true` for a segment absorbed without changing anything, making the probe log "ad end extended" falsely | **Fixed.** It compares a signature of the store before and after merging. |
 | Tesseract startup failures were never counted, so `tesseractDisabled` stayed `false` while nothing worked; a sandbox that never answered latched the engine off permanently; a failing init was retried on *every frame* | **Fixed.** See §4.2.5 — one counter for all causes, no latched state, exponential backoff, retry from a fresh iframe, and no permanent surrender. |
 | DOM overlay detection produced no segment across fifteen archived runs | **Removed** (§2.1). OCR is now the only detection path. |
+
+| `timestampOffset` is captured but never applied | Medium | **Open, latent.** The interceptor patches the `SourceBuffer` setter and `MseSegmentBuffer` keeps the value per segment, but it is used only to detect a reassembly discontinuity — `DecoderSandbox.scanSegment` never forwards it, and `parseMediaSegment` derives timestamps from the container alone. A non-zero offset would silently shift every stored segment relative to `video.currentTime`, and no counter would show it. Measured over two runs: all offsets were `0`, so the defect has no effect today. The heartbeat now reports `tsOffsets`. |
 
 **Measurement caveat.** Across eleven September harness runs the outcome is
 bimodal: nine "clean" runs skip the ad in 3–4 jumps and leave 4.8s of it visible,

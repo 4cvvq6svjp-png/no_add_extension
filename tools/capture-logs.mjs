@@ -17,6 +17,7 @@
  *   node tools/capture-logs.mjs --url <video> [--ad 2:05-2:35 --ad 8:10-8:40]
  *                               [--seconds 180] [--out logs/run-<ts>.jsonl]
  *                               [--seek-lead 30] [--grace 2] [--headless]
+ *                               [--config frameSampleSeconds=12] [--forward 10]
  */
 
 import { chromium } from "playwright";
@@ -71,17 +72,39 @@ function requireTimecode(flag, raw) {
 const FAULTS = {
   "sandbox-dead": {
     label: "la sandbox OCR ne signale jamais sa disponibilité",
-    patch: (source) => source.replace(
-      'window.parent.postMessage({ channel: CHANNEL, type: "sandbox-ready" }, "*");',
-      '/* panne injectée : sandbox-ready jamais émis */')
+    needle: 'window.parent.postMessage({ channel: CHANNEL, type: "sandbox-ready" }, "*");',
+    replacement: '/* panne injectée : sandbox-ready jamais émis */'
   },
   "init-error": {
     label: "l'initialisation du moteur échoue",
-    patch: (source) => source.replace(
-      "    async init() {\n      await getWorker();",
-      '    async init() {\n      throw new Error("panne injectée : modèle indisponible");\n      await getWorker();')
+    needle: "    async init() {\n      await getWorker();",
+    replacement: '    async init() {\n      throw new Error("panne injectée : modèle indisponible");\n      await getWorker();'
   }
 };
+
+/**
+ * Exporte l'image que l'OCR analyse réellement, avant ET après binarisation.
+ *
+ * Le composite construit par RoiComposer n'existe qu'en mémoire : personne ne
+ * l'a jamais regardé. La paire avant/après tranche entre trois causes
+ * possibles d'un échec de lecture — le texte est hors du crop, il est écrasé
+ * par la binarisation, ou il est simplement illisible.
+ */
+const ROI_DUMP_PATCH = [
+  [
+    "      if (adaptive) {\n        this.binarizeAdaptive(cellWidth, cellHeight);",
+    "      this.rawDataUrl = this.canvas.toDataURL(\"image/png\");\n" +
+    "      if (adaptive) {\n        this.binarizeAdaptive(cellWidth, cellHeight);"
+  ],
+  [
+    "      if (this.ocrBackend === \"text-detector\") {\n" +
+    "        return this.detectWithTextDetector(sampleTime);",
+    "      console.info(\"[NoAdd-ROI]\", `${sampleTime.toFixed(1)}${adaptive ? \"-adaptatif\" : \"\"}`,\n" +
+    "        this.roi.rawDataUrl, this.roi.canvas.toDataURL(\"image/png\"));\n\n" +
+    "      if (this.ocrBackend === \"text-detector\") {\n" +
+    "        return this.detectWithTextDetector(sampleTime);"
+  ]
+];
 
 function requireFault(flag, raw) {
   if (!FAULTS[raw]) {
@@ -112,8 +135,10 @@ function parseArgs(argv) {
     login: false,
     noSeek: false,
     fullWindow: false,
+    configOverrides: {},
     screenshot: null,
     fault: null,
+    dumpRoi: false,
     out: null
   };
   for (let i = 2; i < argv.length; i++) {
@@ -132,6 +157,18 @@ function parseArgs(argv) {
       case "--no-seek": opts.noSeek = true; break;
       case "--full-window": opts.fullWindow = true; break;
       case "--fault": opts.fault = requireFault(a, next()); break;
+      case "--dump-roi": opts.dumpRoi = true; break;
+      case "--forward": opts.configOverrides.segmentForwardSeconds = requireNumber(a, next(), { min: 1 }); break;
+      case "--config": {
+        const pair = requireValue(a, next());
+        const at = pair.indexOf("=");
+        if (at < 1) {
+          console.error(`--config attend clé=valeur, reçu « ${pair} ».`);
+          process.exit(2);
+        }
+        opts.configOverrides[pair.slice(0, at)] = Number(pair.slice(at + 1));
+        break;
+      }
       case "--screenshot": opts.screenshot = requireTimecode(a, next()); break;
       case "--ad": {
         const [s, e] = String(next()).split("-");
@@ -145,7 +182,14 @@ function parseArgs(argv) {
         break;
       }
       case "--help": case "-h":
-        console.log("Usage: node tools/capture-logs.mjs --url <video> [--ad start-end ...] [--seconds N] [--out file] [--seek-lead 30] [--grace 2] [--headless]");
+        console.log("Usage: node tools/capture-logs.mjs --url <video> [--ad start-end ...] [--seconds N] [--out file]");
+        console.log("                                    [--seek-lead 30] [--grace 2] [--headless] [--full-window]");
+        console.log("                                    [--config cle=valeur ...] [--forward N] [--dump-roi] [--fault nom]");
+        console.log("");
+        console.log("  --config  surcharge un réglage de content/config.js le temps du run (répétable),");
+        console.log("            sur une COPIE de l'extension : la source n'est jamais touchée.");
+        console.log("            ex. --config frameSampleSeconds=12 --config segmentForwardSeconds=10");
+        console.log("  --forward raccourci pour --config segmentForwardSeconds=N");
         process.exit(0);
         break;
       default:
@@ -239,12 +283,29 @@ async function isAdShowing(page) {
   }).catch(() => false);
 }
 
-/** Attend/skippe les pubs servies par YouTube (celles qui resettent le seek). */
-async function handleAds(page, maxWaitMs = 60000) {
+/**
+ * Attend/skippe les pubs servies par YouTube.
+ *
+ * Ces pubs ne font pas que retarder la lecture : pendant leur diffusion, MSE
+ * transporte LEURS segments, donc l'extension analyse leurs images avec leur
+ * propre timeline. Un run dont la fenêtre tombe pendant une pub YouTube
+ * n'observe pas la vidéo annotée — d'où la trace, sans laquelle on prend ça
+ * pour un défaut de détection.
+ */
+async function handleAds(page, maxWaitMs = 60000, recorder = null) {
   const deadline = Date.now() + maxWaitMs;
+  const startedAt = Date.now();
   let sawAd = false;
   while (Date.now() < deadline) {
-    if (!(await isAdShowing(page))) return sawAd;
+    if (!(await isAdShowing(page))) {
+      if (sawAd) {
+        const seconds = ((Date.now() - startedAt) / 1000).toFixed(0);
+        console.log(`  ⏭ pub YouTube absorbée (${seconds}s) — l'extension a analysé SES images pendant ce temps`);
+        recorder?.write({ source: "harness", level: "ad-break", text: `pub YouTube ${seconds}s` });
+        recorder?.noteAdBreak();
+      }
+      return sawAd;
+    }
     sawAd = true;
     await page.evaluate(() => {
       const b = document.querySelector(
@@ -258,9 +319,9 @@ async function handleAds(page, maxWaitMs = 60000) {
 }
 
 /** Seek + confirmation que le playhead a bien atterri (retries si pub/reset). */
-async function seekAndConfirm(page, target) {
+async function seekAndConfirm(page, target, recorder = null) {
   for (let attempt = 0; attempt < 6; attempt++) {
-    await handleAds(page);
+    await handleAds(page, 60000, recorder);
     await seekTo(page, target);
     await ensurePlaying(page);
     for (let i = 0; i < 16; i++) {
@@ -301,6 +362,9 @@ function createRecorder(outPath) {
     totalEntries: 0,
     bySource: Object.create(null),
     errors: [],
+    adBreaks: 0,
+    roiDir: null,
+    roiCount: 0,
 
     /**
      * `entry.ts` l'emporte quand l'appelant connaît la date d'émission : le
@@ -309,6 +373,20 @@ function createRecorder(outPath) {
      */
     write(entry) {
       stream.write(JSON.stringify({ ts: Date.now(), ...entry }) + "\n");
+    },
+
+    /** Écrit la paire avant/après binarisation d'une frame analysée. */
+    saveRoi(time, rawDataUrl, binarizedDataUrl) {
+      if (!this.roiDir || !rawDataUrl) return;
+      const decode = (url) => Buffer.from(String(url).split(",")[1] ?? "", "base64");
+      const stamp = String(time).padStart(7, "0");
+      writeFileSync(join(this.roiDir, `${stamp}s-1-brut.png`), decode(rawDataUrl));
+      writeFileSync(join(this.roiDir, `${stamp}s-2-binarise.png`), decode(binarizedDataUrl));
+      this.roiCount += 1;
+    },
+
+    noteAdBreak() {
+      this.adBreaks += 1;
     },
 
     noteError(message, source = "harness") {
@@ -348,6 +426,13 @@ function attachLogging(page, recorder) {
     const detection = classifyDetection(text, argsValues);
     if (detection) recorder.detections.push({ atWall: emittedAt, ...detection });
 
+    // Les images ROI vont sur disque, pas dans le JSONL : une paire de PNG en
+    // base64 par frame le rendrait illisible.
+    if (text.startsWith("[NoAdd-ROI]")) {
+      recorder.saveRoi(argsValues[1], argsValues[2], argsValues[3]);
+      return;
+    }
+
     if (/OCR Tesseract : échec/.test(text)) recorder.ocrFailures.push({ atWall: emittedAt, text });
     if (/Tesseract désactivé/.test(text)) recorder.ocrDisabled = true;
 
@@ -386,29 +471,79 @@ function attachLogging(page, recorder) {
  *
  * @returns {string} racine de l'extension modifiée
  */
-function buildFaultyExtension(fault) {
-  const root = join(tmpdir(), `no-add-fault-${fault}-${Date.now()}`);
+function buildPatchedExtension(label, patches, file = "pages/ocr-sandbox.js") {
+  const root = join(tmpdir(), `no-add-${label}-${Date.now()}`);
   cpSync(REPO_ROOT, root, {
     recursive: true,
     filter: (src) => !/(\.git|node_modules|\.profile|logs)(\/|$)/.test(src.slice(REPO_ROOT.length))
   });
 
-  const target = join(root, "pages/ocr-sandbox.js");
-  const original = readFileSync(target, "utf8");
-  const patched = FAULTS[fault].patch(original);
-  if (patched === original) {
-    console.error(`Injection "${fault}" sans effet : pages/ocr-sandbox.js a changé, le motif ne correspond plus.`);
-    process.exit(2);
-  }
-  writeFileSync(target, patched);
+  const target = join(root, file);
+  let source = readFileSync(target, "utf8");
 
-  console.log(`💥 Panne injectée « ${fault} » : ${FAULTS[fault].label}`);
-  console.log(`   copie de l'extension : ${root}`);
+  for (const [needle, replacement] of patches) {
+    if (!source.includes(needle)) {
+      console.error(`Patch "${label}" sans effet : ${file} a changé, le motif ne correspond plus.`);
+      console.error(`Motif attendu :\n${needle}`);
+      process.exit(2);
+    }
+    source = source.replace(needle, replacement);
+  }
+  writeFileSync(target, source);
+
+  console.log(`🔧 Extension modifiée « ${label} » : ${root}`);
   return root;
 }
 
+/** `{ a: 1, b: 2 }` → `a=1 b=2`, pour les logs et le JSONL. */
+function describeOverrides(overrides) {
+  return Object.entries(overrides).map(([key, value]) => `${key}=${value}`).join(" ");
+}
+
+/**
+ * Construit les motifs de remplacement à partir du texte ACTUEL de config.js.
+ * Coder la valeur attendue en dur (« segmentForwardSeconds: 5, ») condamnait le
+ * drapeau dès que la valeur livrée changeait : le patch tombait en panne à la
+ * première campagne suivant un réglage validé.
+ */
+function configPatches(overrides) {
+  const source = readFileSync(join(REPO_ROOT, "content/config.js"), "utf8");
+
+  return Object.entries(overrides).map(([key, value]) => {
+    const current = new RegExp(`^\\s*${key}: [^,\\n]+,$`, "m").exec(source);
+    if (!current) {
+      console.error(`Réglage inconnu « ${key} » : aucune ligne « ${key}: …, » dans content/config.js.`);
+      process.exit(2);
+    }
+    return [current[0], current[0].replace(/: [^,\n]+,$/, `: ${value},`)];
+  });
+}
+
+function resolveExtensionRoot(opts) {
+  if (opts.fault) {
+    console.log(`💥 Panne « ${opts.fault} » : ${FAULTS[opts.fault].label}`);
+    return buildPatchedExtension(`fault-${opts.fault}`, [[FAULTS[opts.fault].needle, FAULTS[opts.fault].replacement]]);
+  }
+  if (opts.dumpRoi) {
+    return buildPatchedExtension("dump-roi", ROI_DUMP_PATCH, "content/ocr.js");
+  }
+  const overridden = Object.keys(opts.configOverrides);
+  if (overridden.length) {
+    // Comparer deux réglages exige de les exposer aux MÊMES conditions réseau :
+    // une campagne A/B alterne les valeurs run après run plutôt que de modifier
+    // config.js entre deux lots (cf. tools/ab-config.mjs).
+    console.log(`🎚 ${describeOverrides(opts.configOverrides)}`);
+    return buildPatchedExtension(
+      `config-${overridden.map((k) => `${k}${opts.configOverrides[k]}`).join("-")}`,
+      configPatches(opts.configOverrides),
+      "content/config.js"
+    );
+  }
+  return REPO_ROOT;
+}
+
 async function launchBrowser(opts) {
-  const extensionRoot = opts.fault ? buildFaultyExtension(opts.fault) : REPO_ROOT;
+  const extensionRoot = resolveExtensionRoot(opts);
   const extensionArgs = opts.noExtension ? [] : [
     `--disable-extensions-except=${extensionRoot}`,
     `--load-extension=${extensionRoot}`
@@ -481,8 +616,8 @@ async function runLoginMode(page) {
 }
 
 /** Seek au timestamp voulu, laisse s'afficher, capture la frame. */
-async function runScreenshotMode(page, opts, stamp) {
-  await seekAndConfirm(page, opts.screenshot);
+async function runScreenshotMode(page, opts, stamp, recorder) {
+  await seekAndConfirm(page, opts.screenshot, recorder);
   await sleep(2500);
 
   const shotPath = join(LOGS_DIR, `frame-${Math.round(opts.screenshot)}s-${stamp}.png`);
@@ -529,11 +664,11 @@ async function judgeAdWindow(page, ad, opts, recorder, globalDeadline) {
   if (opts.noSeek) {
     console.log(`\n▶ Pub [${start}-${end}s] — lecture continue (--no-seek), on attend que le playhead y arrive…`);
     // Absorbe la/les pub(s) YouTube pré-roll avant de compter le temps.
-    if (await handleAds(page, 90000)) console.log("  ⏭ pub YouTube pré-roll passée.");
+    await handleAds(page, 90000, recorder);
     await ensurePlaying(page);
   } else {
     console.log(`\n⏩ Pub [${start}-${end}s] — seek à ${seekTarget}s…`);
-    const landed = await seekAndConfirm(page, seekTarget);
+    const landed = await seekAndConfirm(page, seekTarget, recorder);
     if (!landed) console.log("  ⚠ seek non confirmé (pub persistante ?) — observation quand même.");
   }
 
@@ -558,7 +693,7 @@ async function judgeAdWindow(page, ad, opts, recorder, globalDeadline) {
     // Pub YouTube en cours : on la passe. Le playhead du contenu ne bouge pas
     // pendant une pub → ne pas compter ça comme un blocage.
     if (await isAdShowing(page)) {
-      await handleAds(page);
+      await handleAds(page, 60000, recorder);
       await ensurePlaying(page);
       lastProgressWall = Date.now();
       lastCt = await getCurrentTime(page);
@@ -568,7 +703,7 @@ async function judgeAdWindow(page, ad, opts, recorder, globalDeadline) {
     // Mode seek uniquement : lecture réinitialisée sous la fenêtre → re-seek.
     if (!opts.noSeek && ct !== null && ct < seekTarget - 10) {
       console.log(`  ↻ reset détecté (t=${ct}s) — re-seek à ${seekTarget}s…`);
-      await seekAndConfirm(page, seekTarget);
+      await seekAndConfirm(page, seekTarget, recorder);
       lastProgressWall = Date.now();
       lastCt = await getCurrentTime(page);
       continue;
@@ -708,6 +843,12 @@ function printSummary(recorder, verdicts, stopReason) {
     console.log("⚠ Aucun heartbeat capturé — l'AheadScanner n'a peut-être pas démarré.");
   }
 
+  if (recorder.adBreaks > 0) {
+    console.log(`\n⚠ ${recorder.adBreaks} pub(s) YouTube absorbée(s) pendant ce run.`);
+    console.log("  Pendant une pub, l'extension analyse les images de la PUB, pas de la vidéo :");
+    console.log("  un MISS ou un TIMEOUT peut n'être qu'un artefact de mesure.");
+  }
+
   const skips = recorder.detections.filter((d) => d.kind === "skip").length;
   const ocrHits = recorder.detections.filter((d) => d.kind === "ocr-keyword").length;
   console.log(`\nSignaux détectés : ${recorder.detections.length} (skips=${skips}, ocr-keyword=${ocrHits})`);
@@ -717,6 +858,9 @@ function printSummary(recorder, verdicts, stopReason) {
     recorder.errors.slice(0, 5).forEach((e) => console.log(`  - ${e}`));
   }
 
+  if (recorder.roiCount > 0) {
+    console.log(`\nImages ROI : ${recorder.roiCount / 2} frames dans ${recorder.roiDir}`);
+  }
   console.log(`\nLog complet : ${recorder.outPath}`);
 }
 
@@ -735,6 +879,22 @@ async function main() {
   mkdirSync(LOGS_DIR, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const recorder = createRecorder(opts.out ? resolve(opts.out) : join(LOGS_DIR, `run-${stamp}.jsonl`));
+
+  // Trace le réglage dans le JSONL : sans elle, une campagne A/B alternée
+  // produit des runs que rien ne distingue après coup.
+  recorder.write({
+    source: "harness",
+    level: "config",
+    text: describeOverrides(opts.configOverrides) || "défaut",
+    overrides: opts.configOverrides
+  });
+
+  if (opts.dumpRoi) {
+    const videoId = opts.url.match(/v=([\w-]+)/)?.[1] ?? "video";
+    recorder.roiDir = join(LOGS_DIR, "roi", videoId);
+    mkdirSync(recorder.roiDir, { recursive: true });
+    console.log(`▶ ROI       : ${recorder.roiDir}`);
+  }
 
   console.log(`▶ Extension : ${REPO_ROOT}`);
   console.log(`▶ Profil    : ${PROFILE_DIR}`);
@@ -767,7 +927,7 @@ async function main() {
     await ensurePlaying(page);
 
     if (opts.screenshot !== null) {
-      await runScreenshotMode(page, opts, stamp);
+      await runScreenshotMode(page, opts, stamp, recorder);
       await context.close().catch(() => {});
       recorder.close();
       process.exit(0);
