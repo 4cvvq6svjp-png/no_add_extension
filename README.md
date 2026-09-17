@@ -50,7 +50,7 @@ Pour produire une archive : `npm run pack`.
 ```
 YouTube appelle SourceBuffer.appendBuffer(segment)
         │
-        ├─ mseInterceptor.js   (monde MAIN)      copie les octets au passage
+        ├─ page-mse-interceptor.js   (monde MAIN)      copie les octets au passage
         ▼
    content/*.js                (monde ISOLATED)  orchestration
         │
@@ -87,8 +87,8 @@ Quatre points méritent une explication, détaillée dans
 no_add_extension/
 ├── manifest.json              Manifest V3 : content scripts, CSP, ressources
 ├── package.json               Script `pack`
-├── content/                   Monde ISOLATED, sauf mseInterceptor
-│   ├── mseInterceptor.js      Monde MAIN, document_start. Patche appendBuffer.
+├── content/                   Scripts de contenu. `page-` = exécuté dans la page
+│   ├── page-mse-interceptor.js   Monde MAIN, document_start. Patche appendBuffer.
 │   ├── config.js              CONFIG, mots-clés, noms de canaux
 │   ├── util.js                Logs, normalisation de texte, helpers DOM
 │   ├── segments.js            SegmentStore

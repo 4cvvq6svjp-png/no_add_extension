@@ -1,12 +1,18 @@
 /**
- * MSE Interceptor — MAIN world script
+ * MSE Interceptor — le SEUL fichier de content/ exécuté dans la page.
  *
- * Monkey-patches MediaSource / SourceBuffer so we can observe the raw video
- * segments YouTube feeds into MSE.  Only *video* segments are forwarded to
- * the ISOLATED-world content script via window.postMessage.
+ * D'où le préfixe `page-` : tous ses voisins tournent dans le monde ISOLATED
+ * de l'extension, lui dans le monde MAIN, avec les objets de la page. Les deux
+ * moitiés ne partagent AUCUNE mémoire et ne peuvent pas s'appeler — elles ne
+ * communiquent que par window.postMessage sur CONFIG.MSE_CHANNEL, dont l'autre
+ * extrémité est content/mse-buffer.js. Déplacer une fonction d'un côté à
+ * l'autre la casse silencieusement.
  *
- * This script MUST run at document_start in the MAIN world so that the
- * patches are in place before YouTube's player JS executes.
+ * Il patche MediaSource / SourceBuffer pour observer les segments vidéo bruts
+ * que YouTube pousse dans MSE ; seuls les segments *vidéo* sont transmis.
+ *
+ * Il DOIT s'exécuter à document_start pour que les patches soient en place
+ * avant le JS du lecteur YouTube.
  */
 (() => {
   "use strict";
