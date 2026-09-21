@@ -19,7 +19,7 @@
         "https://www.youtube.com/*"
       ],
       "js": [
-        "content/mseInterceptor.js"
+        "content/page-mse-interceptor.js"
       ],
       "run_at": "document_start",
       "world": "MAIN"

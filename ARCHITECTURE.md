@@ -43,7 +43,7 @@ This gives a look-ahead window without a second video element, and requires no n
 YouTube Page
 │
 ├── MAIN world (document_start)
-│   └── mseInterceptor.js
+│   └── page-mse-interceptor.js
 │       Monkey-patches SourceBuffer.appendBuffer
 │       → postMessage → ISOLATED world
 │
@@ -65,7 +65,7 @@ YouTube Page
 
 ## 4. Component-by-Component Description
 
-### 4.1 `content/mseInterceptor.js` — MAIN world, `document_start`
+### 4.1 `content/page-mse-interceptor.js` — MAIN world, `document_start`
 
 **Role:** Observe all raw video bytes YouTube feeds into MSE before the ISOLATED world script is running.
 
@@ -452,7 +452,7 @@ The MIME type of the `SourceBuffer` is used by the interceptor to determine cont
 The extension operates across four JS execution contexts. All communication uses `window.postMessage` or `iframe.contentWindow.postMessage`.
 
 ```
-MAIN world (mseInterceptor.js)
+MAIN world (page-mse-interceptor.js)
   ↕  channel: "no-add-mse-intercept"
 ISOLATED world (content/*.js)
   ↕  channel: "no-add-decoder"
@@ -474,7 +474,7 @@ ocr-sandbox iframe (ocr-sandbox.js + Tesseract.js)
 
 On page load at `https://www.youtube.com/watch`:
 
-1. `mseInterceptor.js` installs patches synchronously at `document_start` (before any YouTube JS runs).
+1. `page-mse-interceptor.js` installs patches synchronously at `document_start` (before any YouTube JS runs).
 2. The ISOLATED-world modules run at `document_idle`, in manifest order. `content/main.js` comes last and:
    a. Checks for duplicate load (`window.__NO_ADD_EXTENSION_LOADED__`).
    b. Waits up to 20s for a `<video>` element to appear in the DOM.
@@ -540,7 +540,7 @@ All timing constants live in `CONFIG` too — sandbox timeouts, poll cadences an
 | AV1 codec string emitted by `parseAv1C` was malformed — `VideoDecoder.isConfigSupported` rejected every AV1 stream | ~~High~~ | **Fixed, then removed as a failure mode.** The codec string now comes from the SourceBuffer MIME type, which already carries a valid WebCodecs string; `parseAvcC`/`parseVpcC`/`parseAv1C` are gone and only the raw configuration-box bytes are still read from the container. |
 | `AheadScanner` re-attempted `configure` every 1.2 s indefinitely when the platform genuinely lacked a decoder, flooding the console | Medium | **Fixed.** The configure path (since split out as `DecoderSandbox`) tracks failures per init segment; after 3 failures on the same init it pins that init segment as failed, signals the scanner, which switches to the visible-player OCR fallback. Counters reset on every new init segment. |
 | WebM coded size returns (0, 0) from EBML parser | ~~High~~ | **Fixed.** Root cause was `iterateEbml` breaking on the streaming `Segment` element (size = -1). Replaced with `findEbml`, a flat-scan helper that descends past unknown-size containers. The `videoWidth/videoHeight` fallback remains as a safety net. |
-| Buffer copy in `mseInterceptor` happened after `origAppendBuffer` | High | **Fixed.** Copy is now performed before the original call, so the MSE implementation cannot detach a transferable buffer out from under us. |
+| Buffer copy in `page-mse-interceptor` happened after `origAppendBuffer` | High | **Fixed.** Copy is now performed before the original call, so the MSE implementation cannot detach a transferable buffer out from under us. |
 | Configure race: stale init bytes if quality switch happens during configure round-trip | Medium | **Fixed.** The configure path snapshots the init segment and re-checks identity after the await; if a fresher init arrived, `decoderConfigured` stays false and the next scan tick reconfigures. |
 | Tesseract worker fetched `fra.traineddata` from `tessdata.projectnaptha.com` | ~~Medium~~ | **Fixed.** The model ships in `libs/tesseract/lang-data/` and `langPath` points at `chrome.runtime.getURL`. This mattered more once OCR became the only detection path (§2.1): a failed download made the extension silently blind. |
 | Sandbox iframe disconnecting unexpectedly | ~~Medium~~ | **Fixed.** `SandboxBridge.ensureReady()` checks `iframe.isConnected` and rebuilds the sandbox instead of returning a cached promise. |
@@ -579,8 +579,8 @@ To make end-to-end pipeline failures debuggable from the DevTools console alone,
 
 | Source | Cadence | Log | What it tells you |
 |--------|---------|-----|-------------------|
-| `mseInterceptor` | every 5 s, throttled | `media-segments: N reçus, K KB cumulés` | YouTube is feeding fMP4/WebM data into MSE and we are observing it. Silence here means the MSE patch never engaged. |
-| `mseInterceptor` | once per stream | `Video SourceBuffer registered <mime>` | The MIME (and therefore codec/container) YouTube selected for this video. |
+| `page-mse-interceptor` | every 5 s, throttled | `media-segments: N reçus, K KB cumulés` | YouTube is feeding fMP4/WebM data into MSE and we are observing it. Silence here means the MSE patch never engaged. |
+| `page-mse-interceptor` | once per stream | `Video SourceBuffer registered <mime>` | The MIME (and therefore codec/container) YouTube selected for this video. |
 | `AheadScanner` | every 5 s | `AheadScanner heartbeat { currentTime, bufferedAhead, decoderConfigured, useFallback, capturedSegments, mediaSegmentsReceived, scansRun, framesDecoded, ocrMatches, storeSize, lastScannedTime }` | One-line snapshot of the entire pipeline state. The single most useful log for triage: it tells you whether segments are arriving, whether the decoder is configured, whether scans are running, and whether OCR has matched anything. |
 | `decoder-sandbox` | once per `scan-segment` | `scan-segment parse: { samples, keyframesTotal, keyframesKept, minTime, tsRange, container }` | Whether the demuxer found any samples at all, how many were keyframes, and how many survived the `minTime`/`sampleInterval` filter. `keyframesKept = 0` while `keyframesTotal > 0` means the filter is too aggressive for this segment. |
 | `decoder-sandbox` | per failed keyframe | `keyframe decode failed { ts, err }` + summary `N/M keyframes failed to decode` | WebCodecs decoder errors on specific frames (corrupt data, codec/profile mismatch). |
@@ -609,7 +609,7 @@ To make end-to-end pipeline failures debuggable from the DevTools console alone,
 ```
 YouTube player calls SourceBuffer.appendBuffer(mediaSegment)
   │
-  ├─ mseInterceptor copies data → postMessage("media-segment", data)
+  ├─ page-mse-interceptor copies data → postMessage("media-segment", data)
   │
   └─ AheadScanner receives "media-segment"
        └─ capturedSegments.push(...)
